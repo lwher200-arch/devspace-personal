@@ -1,61 +1,39 @@
-# Contributing
+# 参与维护
 
-## Read This First
+本仓库围绕个人 MCP 开发工作流维护。变更应改善真实能力、可验证性和维护成本，
+而不是增加重复的入口、状态或抽象。
 
-I'm not actively accepting contributions right now.
+## 提交前
 
-You can still open an issue or PR, but please do so knowing there is a high chance I close it, defer it forever, or never look at it.
+1. 检查分支和未提交改动，不覆盖其他人的工作。
+2. 阅读目标模块、调用方和已有测试，确认影响范围。
+3. 对异常尽可能先复现，再修复根因。
+4. 保持公开接口兼容；改变契约时说明迁移和恢复方式。
+5. 运行相关测试并检查差异，区分本机通过与远端 CI 通过。
 
-If that sounds annoying, that is because it is. This project is still early and me and users trying to keep it scoped, quality, and direction under control.
+文档修改至少检查链接、命令、示例和隐私。涉及权限、协议、持久化或进程
+生命周期时，需要额外检查失败路径、并发及恢复边界。
 
-## What I'm Most Likely To Accept
+## 文档要求
 
-Small, focused bug fixes.
+- 描述实际存在的能力，不把计划或模拟测试写成已部署能力。
+- 示例使用 `~/projects/workspace-a`、`https://devspace.example.com` 等占位值。
+- 不提交真实接入项目名称、目录树、业务代码、对话标识或部署地址。
+- 不提交凭据、数据库、原始会话记录或包含私人信息的截图。
+- 不声称全部数据不会离开本机；说明工具结果的实际传输边界。
+- 保留依法要求的许可证和版权声明。
 
-Small reliability fixes.
+参见 [公开文档隐私规范](docs/public-documentation.md)。
 
-Small performance improvements.
+## 验证与提交
 
-Tightly scoped maintenance work that clearly improves the project without changing its direction.
+```sh
+pnpm typecheck
+pnpm test
+```
 
-## What I Least Likely To Accept
+构建产物不应提交到源码仓库。涉及运行服务时，先确认不会覆盖正在使用的
+构建或中断活动任务。
 
-Large PRs.
-
-Drive-by feature work.
-
-Opinionated rewrites.
-
-Anything that expands product scope without discussing it in community or asking for it first.
-
-If you open a 1,000+ line PR full of new features, I will probably close it quickly and remember that you ignored the clearly written instructions.
-
-## If You Still Want To Open A PR
-
-Keep it small.
-
-Explain exactly what changed.
-
-Explain exactly why the change should exist.
-
-Do not mix unrelated fixes together.
-
-If the PR makes anything resembling a UI change, include clear before/after images.
-
-If the change depends on motion, timing, transitions, or interaction details, include a short video.
-
-If I have to guess what changed, I are much less likely to review it.
-
-## Issues First
-
-If you are thinking about a non-trivial change, open an issue first.
-
-That still does not mean I will want the PR, but it gives you a chance to avoid wasting your time.
-
-## Be Realistic
-
-Opening a PR does not create an obligation on our side.
-
-I may close it. I may ignore it. I may ask you to shrink it. I may reimplement the idea ourselves later.
-
-If you are fine with that, proceed.
+提交说明应包含需求、范围、验证结果及未覆盖场景。不要把无关重构、环境改动
+和功能修复合并为一个无法单独审查的大提交。

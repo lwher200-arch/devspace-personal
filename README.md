@@ -1,265 +1,140 @@
-<p align="center">
-  <picture>
-    <img src="https://raw.githubusercontent.com/Waishnav/devspace/main/docs/assets/devspace-logo-light.png" alt="DevSpace logo" width="140">
-  </picture>
-</p>
+# DevSpace Personal
 
-<h1 align="center">DevSpace</h1>
+**让对话中的开发意图，成为本机可检查、可验证的操作。**
 
-> **DevSpace Eterna:** this repository preserves the Eterna-oriented local
-> extensions to [Waishnav/devspace](https://github.com/Waishnav/devspace).
-> Start with [FORK.md](FORK.md) for the source-build workflow, scope and known
-> limitations. The npm package linked below belongs to upstream and does not
-> install this fork. Machine-specific deployment files are not published.
+DevSpace Personal 是个人维护的 MCP 本地开发服务。它将项目发现、文件读取、
+受保护修改、命令执行和代理任务协调组织为明确的工具接口，让支持 MCP 的
+客户端在授权范围内使用本地开发环境。
 
-<p align="center">Bring a Codex-style coding workflow to ChatGPT.</p>
+它负责连接、执行和返回证据，不替用户决定权限，也不是无人值守的聊天机器人。
 
-<p align="center">
-  <a href="https://www.npmjs.com/package/@waishnav/devspace"><img alt="npm" src="https://img.shields.io/npm/v/%40waishnav%2Fdevspace?style=flat-square" /></a>
-  <a href="https://github.com/Waishnav/devspace/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Waishnav/devspace/ci.yml?style=flat-square&branch=main" /></a>
-  <a href="https://github.com/Waishnav/devspace/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/npm/l/%40waishnav%2Fdevspace?style=flat-square" /></a>
-</p>
+## 核心能力
 
-[![DevSpace connected to ChatGPT](https://raw.githubusercontent.com/Waishnav/devspace/main/docs/assets/devspace-screenshot.png)](https://raw.githubusercontent.com/Waishnav/devspace/main/docs/assets/devspace-screenshot.png)
+### 项目发现与上下文读取
 
-**Give ChatGPT a secure connection to your own machine and Turn ChatGPT into Codex**
+- 以工作区为操作单位，复用明确的 `workspaceId`。
+- 分页列出项目文件，返回完成状态、游标和排除项。
+- 提供字面量搜索，以及带 SHA-256 的 UTF-8 分页读取。
+- 加载项目说明和已声明的技能，报告未完成的上下文扫描。
 
-DevSpace is a self-hosted MCP server that lets ChatGPT read, edit, search, and run code in your real local projects — your files, your tools, your terminal — without uploading anything to a third party. You run it on your machine, expose it through a tunnel you control, and approve the connection with a password only you have.
+“读取项目”意味着按范围逐页获取内容，不是把整个仓库自动上传或一次塞入模型。
 
-## Sponsors and Special Thanks
-<!-- 
+### 可预览、可核对的修改
 
-<table>
-  <thead>
-    <tr>
-      <th>Sponsor</th>
-      <th>About</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td align="center" width="220">
-        <a href="https://rebates.ai/">
-          <img
-            src="https://app.rebates.ai/brand/rebates-lockup.svg"
-            alt="Rebates"
-            width="170"
-          >
-        </a>
-      </td>
-      <td>
-        <strong>The ads in your terminal pay you.</strong><br><br>
-        <a href="https://rebates.ai/">Rebates</a> adds one optional
-        sponsored footer to your coding agent and pays you cash back for every
-        session in which it is shown. Turn it off at any time.
-      </td>
-    </tr>
-  </tbody>
-</table>
--->
-<p>
-  DevSpace is open to new sponsors.
-  <a href="https://x.com/wshxnv">Get in touch to become one.</a>
-</p>
+补丁支持 `dryRun` 预览和 `expectedHashes` 内容校验。调用方先确认影响范围，
+再针对刚读过的版本修改；内容变化时应重新读取，而不是移除校验强行覆盖。
 
-## Installation
+文本修改保留可支持的 BOM 和换行形式。哈希保护不是多文件原子事务，失败后
+仍需检查哪些文件已经落盘。
 
-DevSpace requires Node `>=22.19 <27`.
+### 命令与验证
 
-Install the DevSpace CLI:
+命令工具可运行测试、构建和项目脚本。短任务直接返回结果，长任务返回进程
+会话标识，调用方继续获取输出、退出码及截断状态。
 
-```bash
-npm install -g @waishnav/devspace
+命令以服务账户的权限执行。工作区路径校验不会将任意 Shell 命令变成沙箱。
+
+### 显式代理任务
+
+可选 Codex 桥接提供预检、新建任务、续接、状态查询和任务恢复入口。请求键
+用于处理重试与不确定交付，任务标识用于保持上下文；接受请求不等于任务完成。
+
+启用执行策略后，每轮要求显式模型，并校验客户端版本、权限回执和对应轮次的
+运行证据。普通文件工具不启动模型推理。
+
+### 状态与可观测性
+
+工作区、授权和代理任务的必要状态保存在本机；运行进程按生命周期管理。
+工具结果包含可供下一步判断的信息，日志用于定位失败层，差异汇总用于审查改动。
+
+## 工作原理
+
+```mermaid
+flowchart TD
+    Client["MCP 客户端 / 对话协调者"] --> Entry["HTTP 入口与 OAuth 校验"]
+    Entry --> Workspace["工作区与路径边界"]
+    Workspace --> Files["发现 / 搜索 / 读取 / 补丁"]
+    Workspace --> Commands["命令与进程会话"]
+    Workspace --> Bridge["可选代理桥接"]
+    Bridge --> Daemon["本地守护进程与任务管理"]
+    Daemon --> Provider["已配置的执行提供方"]
+    Workspace --> State["本机持久化状态"]
+    Daemon --> State
+    Files --> Result["结果 / 错误 / 哈希 / 差异"]
+    Commands --> Result
+    Provider --> Result
+    Result --> Client
 ```
 
-Then initialize DevSpace:
+- **直接操作路径：** 客户端调用文件或命令工具，DevSpace 执行并返回结果。
+- **代理委派路径：** 客户端明确提交任务，守护进程调用已配置提供方，再返回状态。
 
-```bash
-devspace init
-```
+两条路径共享工作区约束，但不能把文件读取说成模型编程，也不能把模型的
+口头回复说成真实文件修改。
 
-Or run it without a global install:
+## 核心设计
 
-```bash
-npx @waishnav/devspace init
-```
+- **客户端协调，服务执行。** 不在服务端隐藏无限对话循环。
+- **身份明确。** 工作区、逻辑任务、提供方会话和命令进程分别使用自己的标识。
+- **权限分层。** 文件边界、代理沙箱和操作系统账户权限分别校验。
+- **结果可验证。** 区分提交、运行、完成、失败、截断和扫描不完整。
+- **保留恢复路径。** 交付不确定时先核对，不自动重复写入。
+- **公开内容与运行数据分离。** 仓库描述产品，不展示实际接入项目。
 
-During setup, DevSpace asks for:
+详细说明见 [架构与请求流](docs/architecture.md) 和 [核心模块](docs/core-modules.md)。
 
-- where you will use it: ChatGPT, Coding Agents, or both
-- which Coding Agents DevSpace may use
+## 从源码开始
 
-If you select ChatGPT, setup also asks which local project folders it may open
-and for your public HTTPS base URL from Cloudflare Tunnel, ngrok, Pinggy,
-Tailscale Funnel, or another reverse proxy. A Coding Agents-only setup asks
-neither question: local commands use the current Git project, or the current
-directory outside a repository.
+使用 `package.json` 声明的 Node 与 pnpm 版本，并准备 Git 和兼容 Shell。
 
-Use the public origin without `/mcp` during setup:
-
-```text
-https://your-tunnel-host.example.com
-```
-
-You will configure your MCP client with the public `/mcp` URL after setup.
-Run `devspace serve` when using ChatGPT. For Coding Agents, setup prints a
-`skills` command and lets the Skills CLI handle installation.
-
-When the client connects, DevSpace opens an Owner password approval page. Enter
-the Owner password printed by `devspace init`. It is also stored in:
-
-```text
-~/.devspace/auth.json
-```
-
-Keep that password private.
-
-## Connect Your MCP Client
-
-The default local endpoint is:
-
-```text
-http://127.0.0.1:7676/mcp
-```
-
-Most users should connect through a public HTTPS tunnel:
-
-```text
-https://your-tunnel-host.example.com/mcp
-```
-
-> [!NOTE]
-> Using DevSpace as an MCP connector isn't against OpenAI's Usage Policies — it's
-> a standard custom App/connector setup, and writing or running code isn't a
-> restricted use case. But your account is governed by your usage, not by
-> DevSpace. Don't point it at anything that would violate your provider's terms.
-> Used normally, you're fine. (Based on OpenAI's Usage Policies and Service Terms
-> as of June 2026.)
-
-## What ChatGPT Can Do
-
-Once connected, ChatGPT can open one of your approved project folders as a
-workspace. From there, it can inspect the repo, make scoped edits, run commands,
-and show you what changed.
-
-DevSpace gives ChatGPT tools to:
-
-- read, write, and edit files inside the opened workspace
-- search code and inspect directories
-- run shell commands for tests, builds, git, and package scripts
-- use isolated Git worktrees for parallel coding sessions
-- follow project instructions from `AGENTS.md` and `CLAUDE.md`
-- discover local agent skills from your skill folders
-- show tool cards and optional change summaries in ChatGPT Apps-compatible hosts
-
-## Mental Model
-
-DevSpace is remote access to selected local folders.
-
-You decide which roots are allowed. The MCP client still has powerful local
-capabilities inside an opened workspace, including shell execution. Treat a
-connected client like a trusted coding partner with access to your machine.
-
-For a normal ChatGPT coding session:
-
-1. Start your tunnel.
-2. Run `devspace serve`.
-3. Connect the MCP client to your public `/mcp` URL.
-4. Approve the connection with the Owner password.
-5. Ask ChatGPT to open a project inside one of your allowed roots.
-
-## Platform Support
-
-DevSpace supports Linux, macOS, and Windows environments with a Bash-compatible
-shell.
-
-| Platform                                          | Status            | Notes                                          |
-| ------------------------------------------------- | ----------------- | ---------------------------------------------- |
-| Linux                                             | Supported         | Requires Node, npm, Git, and Bash.             |
-| macOS                                             | Supported         | Requires Node, npm, Git, and Bash.             |
-| Windows with Git Bash, WSL, MSYS2, or Cygwin Bash | Supported         | Git Bash is the simplest native Windows setup. |
-| Windows PowerShell or `cmd.exe` only              | Not supported yet | Install Git Bash or use WSL.                   |
-
-Run this to inspect your local setup:
-
-```bash
-devspace doctor
-```
-
-## Documentation
-
-- [Setup Guide](https://github.com/Waishnav/devspace/blob/main/docs/setup.md)
-- [ChatGPT Coding Workflow](https://github.com/Waishnav/devspace/blob/main/docs/chatgpt-coding-workflow.md)
-- [Configuration Reference](https://github.com/Waishnav/devspace/blob/main/docs/configuration.md)
-- [Native File Download](https://github.com/Waishnav/devspace/blob/main/docs/artifact-exchange.md)
-- [Security Model](https://github.com/Waishnav/devspace/blob/main/docs/security.md)
-- [Troubleshooting Gotchas](https://github.com/Waishnav/devspace/blob/main/docs/gotchas.md)
-
-## Philosophy
-
-Every piece of software is becoming conversational. Natural language is
-redefining how we interact with tools, workflows, and systems.
-
-My bet is that ChatGPT becomes the operating system for everything. Once we
-reach AGI, we will simply talk to ChatGPT, and it will prompt, coordinate, and
-orchestrate sub-agents that set up the right loops for us.
-
-We are not there yet.
-
-DevSpace is one attempt to fast-forward that future: a way for MCP-capable
-hosts like ChatGPT and Claude to work directly with local project files through
-explicit, inspectable tools.
-
-## Built by Waishnav
-
-I'm Waishnav. I like building opinionated products and tools, and Artifacts is one example.
-
-This year, I began my journey to build a one-person, multi-agent company capable of generating millions in revenue. If you want to follow the failures, wins, lessons, and everything in between, come hang out with me on [X](https://x.com/wshxnv).
-
-
-## More from me
-
-<table>
-  <thead>
-    <tr>
-      <th>Project</th>
-      <th>About</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td align="center" width="220">
-        <a href="https://gitcms.dev/">
-          <img
-            src="https://gitcms.dev/brand/gitcms-logo.svg"
-            alt="GitCMS"
-            width="48"
-          /><br />
-          <strong>GitCMS</strong>
-        </a>
-      </td>
-      <td>
-        <strong>Modern CMS and tooling for markdown based content sites — built for agents and humans.</strong><br><br>
-        Visual editing, editorial workflow, and ChatGPT/Claude content agents, with
-        every post and page stored as files in your repo.
-        <a href="https://gitcms.dev/">Learn more</a>.
-      </td>
-    </tr>
-  </tbody>
-</table>
-
-## Local Development
-
-For working on DevSpace itself:
-
-Install pnpm 11.25.0, the version pinned in `package.json`, with
-`npm install --global pnpm@11.25.0`, then:
-
-```bash
+```sh
+git clone https://github.com/lwher200-arch/devspace-personal.git
+cd devspace-personal
 pnpm install --frozen-lockfile
-pnpm dev
 pnpm typecheck
 pnpm test
 pnpm build
-pnpm start
+node bin/devspace.js init
+node bin/devspace.js serve
 ```
+
+生产配置在运行环境中单独创建，不随源码公开。需要远程访问时，自行配置 HTTPS
+入口；默认本机服务端口为 `7676`，MCP 路径为 `/mcp`。以上入口使用当前源码
+构建，不依赖另行安装同名发行包。完整步骤见 [部署与使用](docs/setup.md)。
+
+## 公开信息边界
+
+本仓库只使用虚构目录、示例域名和抽象工作区描述，不展示实际接入项目的名称、
+文件树、业务模块、账号、对话链接或部署拓扑。认证文件、数据库、日志、
+备份和专用部署脚本不纳入公开发布。
+
+源码保留在本机，并不意味着工具返回内容不会离开本机：客户端取得的文本、
+命令输出和任务结果会进入对应宿主的处理流程，应按需要授权和最小化传输。
+参见 [安全模型](docs/security.md) 与 [公开文档隐私规范](docs/public-documentation.md)。
+
+## 能力边界
+
+- 分页操作会报告排除项；完成某个范围不等于完成全仓分析。
+- 文本接口限制为不超过 8 MiB 的 UTF-8 常规文件。
+- 补丁保护不是操作系统级多文件事务或对所有并发路径替换的防御。
+- 单个桥接实例的目录串行控制不是跨进程分布式锁。
+- 模型证据由提供方产生，不是对模型内部执行的独立证明。
+- 网络、宿主权限、提供方可用性与工具元数据都可能独立影响使用。
+- 未实现无人值守的双向聊天接管或自动递归代理循环。
+
+## 文档导航
+
+- [架构与请求流](docs/architecture.md)
+- [核心模块与契约](docs/core-modules.md)
+- [部署与使用](docs/setup.md)
+- [文件操作与开发流程](docs/chatgpt-coding-workflow.md)
+- [配置参考](docs/configuration.md)
+- [代理桥接](docs/closed-loop.md)
+- [代理档案](docs/agent-profile-schema.md)
+- [本地守护进程](docs/local-agent-daemon.md)
+- [故障定位](docs/gotchas.md)
+- [参与维护](CONTRIBUTING.md)
+
+## 许可证
+
+按 [MIT License](LICENSE) 提供。版权和许可声明保留在许可证文件中。

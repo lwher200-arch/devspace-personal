@@ -64,7 +64,7 @@ containing the exact completed turn ID and model from the provider's `turn_conte
 rollout record. Evidence reads are confined to that Codex home's session roots,
 bounded to a 64 MiB regular file and five seconds per read. Unsupported/oversized
 records fail closed, rather than silently substituting session configuration.
-This is provider-reported evidence, not independent attestation of upstream model
+This is provider-reported evidence, not independent attestation of model
 internals. Historical results without matching evidence are withheld by the bridge.
 
 Protected turns close their app-server after completion and resume from durable
@@ -76,7 +76,7 @@ Failure after work begins can leave changed files; inspect them before retrying.
 
 Pin `CODEX_COMMAND` only in the DevSpace supervisor environment to select a
 verified binary. The ordinary shell `codex` command may still refer to another
-installation. The installer preserves an existing service pin. Do not change
+installation. Keep the pin in private runtime configuration. Do not change
 global PATH/model settings as a workaround for an unverified route.
 
 File tools validate logical and physical containment, including normalized paths
@@ -92,10 +92,10 @@ The public repository does not include the original machine-specific
 absolute paths and has not been promoted to a portable installer. Existing local
 copies are preserved; the ignore rule prevents accidentally publishing them.
 
-Build this fork from source as described in [FORK.md](../FORK.md), then configure
+Build the source as described in [Setup](setup.md), then configure
 your own approved roots, credentials, tunnel and verified Codex executable.
 Do not reuse another machine's owner credential or ChatGPT conversation binding.
-The runtime still requires the upstream-supported dependencies; these extensions
+The runtime still requires its declared dependencies; these tools
 do not claim support for a Windows installation without a compatible shell.
 
 If supervising the service, preserve the original environment and explicitly

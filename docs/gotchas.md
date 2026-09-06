@@ -1,271 +1,91 @@
-# Troubleshooting Gotchas
+# 故障定位
 
-This page collects the setup issues users are most likely to hit.
+先判断失败所在层，再决定是否修改。“请求已接受”“进程已启动”或“工具定义
+可见”都不能单独证明最终成功。本页命令从 DevSpace 仓库目录运行。
 
-## `devspace` Command Not Found
+## 入口与依赖
 
-Use `npx`:
-
-```bash
-npx @waishnav/devspace init
-npx @waishnav/devspace serve
-```
-
-If you installed globally, confirm npm's global bin directory is on `PATH`.
-
-## Unsupported Node Version
-
-DevSpace requires Node `>=22.19 <27`.
-
-Check:
-
-```bash
+```sh
 node --version
+node bin/devspace.js doctor
 ```
 
-Install Node 22 LTS with your preferred version manager such as `nvm`, `fnm`, or
-`mise`.
+确认 Node、Git、兼容 Shell 和原生依赖匹配。更换 Node 后原生模块可能需要
+重新安装或构建；不要默认删除环境或改变系统权限。
 
-## `better-sqlite3` Could Not Load
+## 本机正常，公网不可达
 
-This usually means native dependencies were installed under a different Node
-runtime.
+分别检查本机健康接口、HTTPS origin 和认证发现。DNS、隧道连接、代理映射
+和服务进程是不同层。
 
-Try:
+- A/AAAA 查询正常，不代表 SRV 等查询也正常。
+- 代理日志中的 `accepted` 不证明连接或解析成功。
+- 反向代理应转发整个服务，而不只是 MCP 路径。
+- 更换域名后更新 `publicBaseUrl`，不要删除授权数据来修复网络故障。
 
-```bash
-npm rebuild better-sqlite3
+```sh
+node bin/devspace.js config set publicBaseUrl https://devspace.example.com
 ```
 
-Then run:
+不要把其他机器的 DNS、节点地址或隧道标识当作通用修复配置。
 
-```bash
-npx @waishnav/devspace doctor
+## 账户连接失败
+
+保留原始错误、时间和阶段，再检查发现、注册、授权和令牌交换。可见工具
+schema 可能来自缓存，不能证明账户会话有效。
+
+确认网络正常之前，不重建连接器、重置密码或放开权限。分享诊断时只提供
+脱敏状态，不公开请求头、Cookie、令牌或完整认证链接。
+
+## Host 或回调被拒绝
+
+核对实际 hostname 和客户端回调，仅配置明确需要的域名，不把通配符加入
+生产环境作为默认修复。`config get` 输出可能包含本机路径，分享前需要脱敏。
+
+## 工作区标识失效
+
+优先复用 `workspaceId`。只有标识被拒绝、切换项目或明确创建工作树时才重新
+打开。旧记录缺少物理锚点，或根目录目标改变时，服务会拒绝恢复。
+
+重新打开前核对真实目录，不扩大授权范围或清空数据库规避拒绝。
+
+## 分页不完整
+
+继续使用同一操作返回的 `nextCursor` 或 `nextOffset`，并检查覆盖状态。
+搜索某页没有匹配，不代表后续页面没有结果。
+
+游标过期或哈希变化时重新读取。依赖、生成内容、链接和疑似凭据文件的排除
+是发现策略，不是数据丢失，也不是额外授权。
+
+## 补丁哈希不一致
+
+重新读取最新内容，再生成预览。不要删掉 `expectedHashes` 强行写入；
+写入中途失败时逐个检查受影响文件。
+
+## 命令或代理失败
+
+文件权限、Shell 权限和提供方沙箱分别检查。关注退出码、结构化错误、实际
+执行程序和任务状态，不默认提权或换模型。
+
+```sh
+node bin/devspace.js agents targets --json
+node bin/devspace.js agents daemon status --json
 ```
 
-Release starts run a native dependency check before launching.
+交付不确定时先恢复状态，不使用新请求键盲目重复任务。策略不匹配时停止；
+命令通道不能用于绕过宿主对同一动作的拒绝。
 
-## Public URL Includes `/mcp`
+## 工具、技能或卡片没有更新
 
-Use the origin for setup:
+源码更新、服务重启和宿主元数据刷新是独立步骤。通过正常管理流程刷新，
+再核对工具参数；刷新本身不是读写验收。
 
-```text
-https://your-tunnel-host.example.com
-```
+检查技能目录、档案和 UI 配置。有些客户端只展示文本，不渲染卡片。
+`show_changes` 的汇总可能包含同时发生的其他修改，不应全部算作本轮贡献。
 
-Use the MCP endpoint in the client:
+## 状态恢复
 
-```text
-https://your-tunnel-host.example.com/mcp
-```
+会话、请求回执和审查记录需要明确保留策略。恢复前停止相关写入者，并核对
+代码、配置与数据库版本。不要通过无边界清理来掩盖生命周期问题。
 
-If you saved the wrong value:
-
-```bash
-npx @waishnav/devspace config set publicBaseUrl https://your-tunnel-host.example.com
-```
-
-## Tailscale Funnel `/mcp` Returns 404
-
-Proxy the whole DevSpace server from the Funnel root:
-
-```bash
-tailscale funnel --bg 7676
-```
-
-Do not use `--set-path=/mcp`. Tailscale removes a configured mount path before
-proxying to the local service, so a public `/mcp` request can otherwise arrive
-at DevSpace as `/`. DevSpace also needs OAuth routes outside `/mcp`, so serving
-the whole local origin is the correct setup.
-
-## Tunnel URL Changed
-
-Temporary tunnels often change URLs between runs.
-
-Update the configured URL:
-
-```bash
-npx @waishnav/devspace config set publicBaseUrl https://new-tunnel.example.com
-```
-
-For a stable URL:
-
-```bash
-npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
-```
-
-## Host Header Or 403 Problems
-
-DevSpace derives allowed hosts from the configured public URL.
-
-Run:
-
-```bash
-npx @waishnav/devspace doctor
-```
-
-Confirm the public URL hostname appears in allowed hosts. If you changed tunnel
-URLs, update `publicBaseUrl`.
-
-For intentional local debugging only, set `server.allowedHosts` to `["*"]` in
-`~/.devspace/config.jsonc`.
-
-## OAuth Redirect Host Rejected
-
-By default, DevSpace allows redirects for:
-
-```text
-chatgpt.com
-localhost
-127.0.0.1
-```
-
-If another MCP client uses a different redirect host, add it to
-`oauth.allowedRedirectHosts` in `~/.devspace/config.jsonc`.
-
-## Owner Password Not Accepted
-
-Make sure you are entering the Owner password from:
-
-```text
-~/.devspace/auth.json
-```
-
-To regenerate setup:
-
-```bash
-npx @waishnav/devspace init --force
-```
-
-## Unknown `workspaceId`
-
-`workspaceId` values are session identifiers. If the server restarts and the
-client receives an unknown workspace error, call `open_workspace` again for that
-project.
-
-Workspace session metadata is persisted. ChatGPT may provide optional
-conversation metadata that lets DevSpace resume the same checkout workspace for
-the same project in that conversation; repeated opens reuse the `workspaceId`
-and do not repeat context already provided for that reused checkout. Worktree
-mode always creates a new isolated workspace with its own complete context.
-Hosts without supported conversation metadata receive a normal new workspace.
-In all cases, continue passing the `workspaceId` returned by `open_workspace` to
-later tools. Other MCP hosts use this explicit workspace workflow as well.
-
-To review work, call `show_changes` once after the final related file change. It
-shows the combined changes and advances the review point automatically.
-
-## Data Retention
-
-DevSpace does not currently prune workspace sessions, conversation bindings,
-or review refs. A future product retention policy will define safe cleanup for
-these records; no automatic deletion is performed today.
-
-## MCP Workspace Path Rejected
-
-The path passed to `open_workspace` must be inside one of the allowed roots
-configured during ChatGPT setup. Direct `devspace agents` commands instead use
-the current local project and are not gated by MCP allowed roots.
-
-Run:
-
-```bash
-npx @waishnav/devspace config get
-```
-
-Then either open a project under an allowed root or rerun setup:
-
-```bash
-npx @waishnav/devspace init --force
-```
-
-## Worktree Mode Fails
-
-Worktree mode requires:
-
-- Git installed
-- the path is inside a Git repository
-- the repository has at least one commit
-- the requested `baseRef` resolves to a commit
-
-For a new repository, create the first commit or use checkout mode.
-
-Uncommitted source checkout changes are not copied into the managed worktree.
-Commit, stash, or ask the model to work in checkout mode if those changes are
-needed.
-
-## Windows Shell Commands Fail
-
-DevSpace shell execution requires Bash. Native PowerShell and `cmd.exe` command
-execution are not supported yet.
-
-Install Git for Windows and use Git Bash, or use WSL, MSYS2, or Cygwin Bash.
-
-Run:
-
-```bash
-npx @waishnav/devspace doctor
-```
-
-Confirm Bash is detected.
-
-## Skills Do Not Appear
-
-Skills are enabled by default. Confirm `skills.enabled` is `true` in
-`~/.devspace/config.jsonc`.
-
-DevSpace looks in standard Agent Skills locations:
-
-- `~/.agents/skills`
-- project `.agents/skills`
-- `~/.devspace/skills`
-
-It also checks compatibility and custom paths:
-
-- the bundled `subagents` skill when Subagents are enabled, unless `~/.devspace/skills/subagents/SKILL.md` exists
-- `skills.agentDir/skills`, defaulting to `~/.codex/skills`
-- additional paths from `skills.paths`
-
-When Subagents are enabled, DevSpace loads agent profiles from
-`~/.devspace/agents/*.md` and project `.devspace/agents/*.md`, then exposes a
-compact profile catalog through `open_workspace`. The bundled
-`subagents` skill keeps the model-facing workflow to
-`devspace agents targets`, `devspace agents ls`, `devspace agents run`,
-`devspace agents continue`, and `devspace agents show`.
-Those commands automatically manage the internal local agent daemon; `devspace
-serve` is not a prerequisite.
-`devspace agents ls` lists existing subagent sessions, not profile
-definitions.
-
-For a Coding Agent, run the installation command printed by
-`devspace init`:
-
-```bash
-npx skills add Waishnav/devspace --skill subagents --global
-```
-
-The Skills CLI handles agent discovery and installation. DevSpace setup does
-not copy files into agent skill directories.
-
-Packaged agent profile examples under `examples/agents/` are starter templates.
-Copy or adapt them into one of the active profile directories before use.
-
-Legacy project paths such as `.pi/skills` can be added to `skills.paths` when needed.
-
-If a skill appears in `open_workspace`, the model must read that skill's
-`SKILL.md` before reading other files inside the skill directory.
-
-## Review Card Does Not Appear
-
-DevSpace attaches widget UI only to `open_workspace` and `show_changes`.
-Ordinary reads, edits, and commands intentionally render as normal tool results
-to avoid one iframe per call. Plain MCP clients may ignore ChatGPT Apps widget
-metadata and only show text results; `show_changes` remains available there.
-
-If both cards are missing in ChatGPT, confirm that `ui.enabled` is not `false`
-in `~/.devspace/config.jsonc` and reconnect the MCP server.
-
-Historical `show_changes` cards use the `reviewRef` in their structured result
-to recover the exact Git-backed review when a host reloads the app without its
-original result metadata. `open_workspace` can rebuild its card directly from
-its structured result.
+本页不是所有故障均已解决的声明；完成情况必须来自当前环境的实际验证。

@@ -21,6 +21,8 @@ import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import {
   parseLocalAgentContinueArgs,
   parseLocalAgentRunArgs,
+  resolveLocalAgentPrompt,
+  resolveLocalAgentTarget,
 } from "./local-agent-targets.js";
 import { createLocalAgentClient } from "./local-agent-client.js";
 import { toAgentErrorPayload, type LocalAgentError } from "./local-agent-errors.js";
@@ -49,7 +51,8 @@ import {
   setDevspaceConfigValues,
   writeDevspaceAuth,
 } from "./user-config.js";
-import { expandHomePath } from "./roots.js";
+import { assertAllowedPath, expandHomePath } from "./roots.js";
+import { runProjectCommand } from "./project-tools.js";
 import { readReviewRef } from "./review-checkpoints.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 
@@ -59,6 +62,7 @@ type Command =
   | "doctor"
   | "config"
   | "agents"
+  | "project"
   | "show-changes"
   | "help"
   | "version";
@@ -88,6 +92,13 @@ async function main(argv: string[]): Promise<void> {
     case "agents":
       await runAgentsCommand(args);
       return;
+    case "project": {
+      const config = loadConfig();
+      const context = resolveCliWorkspaceContext(config.allowedRoots);
+      const root = assertAllowedPath(context.workspaceRoot, config.allowedRoots);
+      console.log(JSON.stringify(await runProjectCommand(root, args)));
+      return;
+    }
     case "show-changes":
       await runShowChanges(args);
       return;
@@ -107,6 +118,7 @@ function normalizeCommand(command: string | undefined): Command {
     || command === "doctor"
     || command === "config"
     || command === "agents"
+    || command === "project"
     || command === "show-changes"
   ) return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
@@ -410,9 +422,10 @@ function printHelp(): void {
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
       "  devspace show-changes <review-ref> [--json]",
+      "  devspace project <files|search|read|patch> [--path path] [--query literal] [--cursor token] [--offset n] [--limit n] [--expected-sha256 hash] [--include-ignored] [--request-file path --dry-run] [--json]",
       "  devspace agents ls       List subagent sessions",
-      "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] <prompt>",
-      "  devspace agents continue <id> [--model <model>] [--effort <level>] <prompt>",
+      "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] (<prompt> | --prompt-file <path>)",
+      "  devspace agents continue <id> [--model <model>] [--effort <level>] (<prompt> | --prompt-file <path>)",
       "  devspace agents show <id>",
       "  devspace agents daemon <status|stop|logs>",
       "  devspace -v, --version   Print the installed version",
@@ -518,14 +531,20 @@ async function runAgentsRun(args: string[], json: boolean): Promise<void> {
   const parsed = parseLocalAgentRunArgs(args);
   const config = loadConfig();
   const scope = resolveCliWorkspaceContext(config.allowedRoots);
+  const prompt = await resolveLocalAgentPrompt(parsed, scope.workspaceRoot);
   const client = createLocalAgentClient(config);
+  const executionPolicy = scope.workspaceId && config.bridge?.enabled && config.bridge.executionPolicy &&
+    resolveLocalAgentTarget(parsed.target, await loadLocalAgentProfiles(config, scope.workspaceRoot, { includeDisabled: true }),
+      parsed.model, parsed.effort, config.subagents.providers)?.provider === "codex"
+    ? config.bridge.executionPolicy : undefined;
   const result = await client.start({
     target: parsed.target,
-    prompt: parsed.prompt,
+    prompt,
     workspaceRoot: scope.workspaceRoot,
     workspaceId: scope.workspaceId,
     model: parsed.model,
     effort: parsed.effort,
+    ...(executionPolicy ? { executionPolicy } : {}),
   });
   const record = presentAgentResult(result, json);
   if (!record) return;
@@ -540,11 +559,19 @@ async function runAgentsRun(args: string[], json: boolean): Promise<void> {
 async function runAgentsContinue(args: string[], json: boolean): Promise<void> {
   const parsed = parseLocalAgentContinueArgs(args);
   const config = loadConfig();
-  const client = createLocalAgentClient(config);
   const scope = resolveCliWorkspaceContext(config.allowedRoots);
-  const result = await client.continue(parsed.agentId, parsed.prompt, {
+  const prompt = await resolveLocalAgentPrompt(parsed, scope.workspaceRoot);
+  const client = createLocalAgentClient(config);
+  let executionPolicy;
+  if (scope.workspaceId && config.bridge?.enabled && config.bridge.executionPolicy) {
+    const existing = presentAgentResult(await client.get(parsed.agentId, scope), json);
+    if (!existing) return;
+    if (existing.provider === "codex") executionPolicy = config.bridge.executionPolicy;
+  }
+  const result = await client.continue(parsed.agentId, prompt, {
     model: parsed.model,
     effort: parsed.effort,
+    ...(executionPolicy ? { executionPolicy } : {}),
   }, scope);
   const record = presentAgentResult(result, json);
   if (!record) return;
@@ -658,8 +685,8 @@ function printAgentsHelp(): void {
       "",
       "Usage:",
       "  devspace agents ls [--json]",
-      "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] [--json] <prompt>",
-      "  devspace agents continue <id> [--model <model>] [--effort <level>] [--json] <prompt>",
+      "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] [--json] (<prompt> | --prompt-file <path>)",
+      "  devspace agents continue <id> [--model <model>] [--effort <level>] [--json] (<prompt> | --prompt-file <path>)",
       "  devspace agents show <id> [--json]",
       "  devspace agents targets [--json]",
       "  devspace agents daemon <status|stop|logs> [--json]",

@@ -9,6 +9,7 @@ import type {
 } from "./local-agent-manager.js";
 import type { LocalAgentWriteMode } from "./local-agent-runtime.js";
 import { LOCAL_AGENT_DAEMON_PROTOCOL_VERSION } from "./local-agent-daemon-lifecycle.js";
+import { executionPolicySchema, executionEvidenceSchema } from "./local-agent-execution.js";
 
 export type LocalAgentDaemonMethod =
   | "hello"
@@ -50,6 +51,7 @@ export interface LocalAgentDaemonStatus {
   activeTurns: number;
   runtimeCount: number;
   clientConnections: number;
+  executionPolicyVersion?: number;
 }
 
 export interface LocalAgentDaemonErrorPayload {
@@ -185,6 +187,8 @@ export function decodeAgentRecord(value: unknown): LocalAgentRecord {
     profileName: requiredString(record?.profileName, "profileName"),
     provider: requiredString(record?.provider, "provider"),
     model: optionalString(record?.model),
+    ...(record?.executionPolicy === undefined ? {} : { executionPolicy: decodeExecutionPolicy(record.executionPolicy) }),
+    ...(record?.executionEvidence === undefined ? {} : { executionEvidence: decodeExecutionEvidence(record.executionEvidence) }),
     effort: optionalString(record?.effort),
     providerSessionId: optionalString(record?.providerSessionId),
     status,
@@ -217,6 +221,7 @@ export function decodeDaemonStatus(value: unknown): LocalAgentDaemonStatus {
     activeTurns: requiredInteger(record?.activeTurns, "activeTurns"),
     runtimeCount: requiredInteger(record?.runtimeCount, "runtimeCount"),
     clientConnections: requiredInteger(record?.clientConnections, "clientConnections"),
+    ...(record?.executionPolicyVersion === undefined ? {} : { executionPolicyVersion: requiredInteger(record.executionPolicyVersion, "executionPolicyVersion") }),
   };
 }
 
@@ -251,6 +256,7 @@ function decodeStartInput(value: unknown): StartLocalAgentInput {
     model: optionalString(record?.model),
     effort: optionalString(record?.effort),
     writeMode: decodeWriteMode(record?.writeMode),
+    ...(record?.executionPolicy === undefined ? {} : { executionPolicy: decodeExecutionPolicy(record.executionPolicy) }),
   };
 }
 
@@ -265,6 +271,7 @@ function decodeContinueInput(value: unknown): { id: string; prompt: string; scop
       model: optionalString(overrides.model),
       effort: optionalString(overrides.effort),
       writeMode: decodeWriteMode(overrides.writeMode),
+      ...(overrides.executionPolicy === undefined ? {} : { executionPolicy: decodeExecutionPolicy(overrides.executionPolicy) }),
     } } : {}),
   };
 }
@@ -298,6 +305,18 @@ function decodeWriteMode(value: unknown): LocalAgentWriteMode | undefined {
   if (value === undefined) return undefined;
   if (value === "read_only" || value === "allowed" || value === "full_access") return value;
   throw new LocalAgentDaemonProtocolError("INVALID_PARAMS", "Invalid write mode.");
+}
+
+function decodeExecutionPolicy(value: unknown) {
+  const parsed = executionPolicySchema.safeParse(value);
+  if (!parsed.success) throw new LocalAgentDaemonProtocolError("INVALID_PARAMS", "Invalid execution policy.");
+  return parsed.data;
+}
+
+function decodeExecutionEvidence(value: unknown) {
+  const parsed = executionEvidenceSchema.safeParse(value);
+  if (!parsed.success) throw new LocalAgentDaemonProtocolError("INVALID_RESULT", "Invalid execution evidence.");
+  return parsed.data;
 }
 
 function isLocalAgentStatus(value: string): value is LocalAgentStatus {

@@ -8,8 +8,10 @@ import {
   AgentProviderUnavailableError,
   captureAgentProviderResult,
 } from "./local-agent-errors.js";
-import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
+import { normalizeCommandPathEnvironment, removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import { terminateProcessTree } from "./process-platform.js";
+import { assertExecutionSelection, readCodexTurnEvidence, type CodexExecutionPolicy } from "./local-agent-execution.js";
+import { assertAllowedPath, canonicalAllowedPath } from "./roots.js";
 import type {
   LocalAgentDriver,
   LocalAgentRunCallbacks,
@@ -28,7 +30,7 @@ export interface ResolvedCodexCommand {
 export type CodexCommandResolver = (env: NodeJS.ProcessEnv) => ResolvedCodexCommand | undefined;
 
 export function codexCommandEnvironment(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const next = { ...env };
+  const next = normalizeCommandPathEnvironment(env);
   delete next.CODEX_INTERNAL_ORIGINATOR_OVERRIDE;
   if (env.CODEX_COMMAND) return next;
   if (next.PATH) next.PATH = removeDevspaceNodeModulesBinFromPath(next.PATH);
@@ -77,6 +79,9 @@ export interface CodexAppServerRuntimeOptions {
   command: string;
   env: NodeJS.ProcessEnv;
   version?: string;
+  model?: string;
+  requestTimeoutMs?: number;
+  turnTimeoutMs?: number;
 }
 
 export class CodexAppServerRuntime implements LocalAgentRuntime {
@@ -85,16 +90,18 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
   private readonly rpc: CodexAppServerRpc;
   private alive = true;
   private closePromise?: Promise<void>;
+  private actualVersion?: string;
+  private actualHome?: string;
 
   constructor(private readonly options: CodexAppServerRuntimeOptions) {
-    this.child = spawn(options.command, ["app-server"], {
+    this.child = spawn(options.command, [...(options.model ? ["--model", options.model] : []), "app-server"], {
       env: options.env,
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true,
       shell: usesWindowsCommandShell(options.command),
     });
-    this.rpc = new CodexAppServerRpc(this.child, options.version);
+    this.rpc = new CodexAppServerRpc(this.child, options.version, options.requestTimeoutMs);
     this.child.once("exit", (code, signal) => {
       this.alive = false;
       this.rpc.fail(new Error(
@@ -108,11 +115,29 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
   }
 
   async initialize(): Promise<void> {
-    await this.rpc.request("initialize", {
+    const response = asRecord(await this.rpc.request("initialize", {
       clientInfo: { name: "devspace", title: "DevSpace", version: "1.0.7" },
       capabilities: {},
-    });
+    }));
+    this.actualVersion = parseCodexVersion(typeof response?.userAgent === "string" ? response.userAgent : undefined);
+    this.actualHome = typeof response?.codexHome === "string" ? response.codexHome : undefined;
     this.rpc.notify("initialized");
+  }
+
+  async preflight(policy: CodexExecutionPolicy, model: string | undefined): Promise<void> {
+    assertExecutionSelection(policy, model, this.options.version);
+    assertExecutionSelection(policy, model, this.actualVersion);
+    const home = resolve(this.options.env.CODEX_HOME ?? join(homedir(), ".codex"));
+    if (!this.actualHome || canonicalAllowedPath(this.actualHome) !== canonicalAllowedPath(home)) throw new Error("Codex app-server reported an unexpected or unavailable home directory.");
+    let cursor: string | undefined;
+    for (let page = 0; page < 10; page++) {
+      const result = asRecord(await this.rpc.request("model/list", { limit: 100, ...(cursor ? { cursor } : {}) }));
+      if (!Array.isArray(result?.data)) throw new Error("Codex model availability evidence is unavailable.");
+      if (result.data.some(value => asRecord(value)?.model === model)) return;
+      cursor = typeof result.nextCursor === "string" ? result.nextCursor : undefined;
+      if (!cursor) break;
+    }
+    throw new Error(`Required model ${model} is unavailable in this Codex account; no fallback is allowed.`);
   }
 
   async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks) {
@@ -120,6 +145,8 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
       provider: this.provider,
       operation: "run",
       run: async (): Promise<LocalAgentRunResult> => {
+        let completedSuccessfully = false;
+        try {
         if (!this.isAlive()) {
           throw new AgentProviderUnavailableError({
             code: "PROVIDER_UNAVAILABLE",
@@ -128,6 +155,10 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
             retryable: true,
             message: "Codex app-server is not running.",
           });
+        }
+        if (input.executionPolicy) {
+          if (input.writeMode === "full_access") throw new Error("Guarded Codex execution does not allow full-access mode.");
+          await this.preflight(input.executionPolicy, input.model);
         }
         const threadResponse = await this.rpc.request(
           input.providerSessionId ? "thread/resume" : "thread/start",
@@ -146,7 +177,21 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
         }
 
         await callbacks?.onSessionId?.(threadId);
-        const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId));
+        const sessionModel = readString(asRecord(threadResponse), "model");
+        const rolloutPath = readString(asRecord(threadResponse)?.thread, "path");
+        if (input.executionPolicy) {
+          if (sessionModel !== input.model) throw new Error("Codex reported a different or missing session model before execution.");
+          const actual = asRecord(threadResponse);
+          const expectedSandbox = input.writeMode === "allowed" ? "workspaceWrite" : "readOnly";
+          if (asRecord(actual?.sandbox)?.type !== expectedSandbox || actual?.approvalPolicy !== "never" ||
+            typeof actual?.cwd !== "string" || canonicalAllowedPath(actual.cwd) !== canonicalAllowedPath(input.workspaceRoot)) {
+            throw new Error("Codex reported an unexpected sandbox, approval policy or workspace before execution.");
+          }
+          if (!rolloutPath) throw new Error("Codex did not expose a rollout path for runtime model verification.");
+          assertAllowedPath(rolloutPath, [join(this.actualHome!, "sessions"), join(this.actualHome!, "archived_sessions")]);
+        }
+        const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId), input.executionPolicy?.requiredModel,
+          input.executionPolicy ? this.options.turnTimeoutMs ?? 600000 : undefined);
         const parsed = parseCompletedTurn(completed.event.params, completed.items);
         if (parsed.failure) {
           throw new AgentProviderExecutionError({
@@ -155,7 +200,7 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
             operation: "run",
             retryable: false,
             cause: completed.event.params,
-            message: "Codex agent turn failed.",
+            message: `Codex agent turn failed: ${parsed.failure}`,
           });
         }
         if (!parsed.finalResponse.trim()) {
@@ -168,12 +213,40 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
             message: "Codex did not return a final assistant response.",
           });
         }
+        let executionEvidence: LocalAgentRunResult["executionEvidence"];
+        if (input.executionPolicy) {
+          const turnId = readString(asRecord(completed.event.params)?.turn, "id");
+          if (!turnId) throw new Error("Codex completed turn has no identity for model verification.");
+          let runtimeModel: string | undefined;
+          let evidenceError: unknown;
+          for (let attempt = 0; attempt < 5; attempt++) {
+            try { runtimeModel = await readCodexTurnEvidence(this.actualHome!, rolloutPath!, turnId); break; }
+            catch (error) { evidenceError = error; if (attempt < 4) await new Promise(resolve => setTimeout(resolve, 100)); }
+          }
+          if (!runtimeModel) throw evidenceError ?? new Error("Codex runtime model evidence unavailable.");
+          assertExecutionSelection(input.executionPolicy, runtimeModel, this.actualVersion);
+          executionEvidence = { requestedModel: input.model!, sessionModel: sessionModel!, runtimeModel,
+            cliVersion: this.actualVersion!, executable: this.options.command, threadId, turnId, source: "codex-rollout/turn_context",
+            sandbox: input.writeMode === "allowed" ? "workspaceWrite" : "readOnly", approvalPolicy: "never" };
+        }
+        completedSuccessfully = true;
         return {
           provider: this.provider,
           providerSessionId: threadId,
           finalResponse: parsed.finalResponse.trim(),
           items: parsed.items,
+          ...(executionEvidence ? { executionEvidence } : {}),
         };
+        } catch (cause) {
+          if (!input.executionPolicy) throw cause;
+          throw new AgentProviderProtocolError({ code: "PROVIDER_PROTOCOL_ERROR", provider: this.provider,
+            operation: "verified_execution", retryable: false, cause,
+            message: `Codex guarded execution failed: ${errorMessage(cause)}` });
+        } finally {
+          // Loaded thread/resume can retain old permissions. Reopen guarded turns
+          // from persisted state instead of sharing stale in-memory authority/context.
+          if (input.executionPolicy) await this.close(completedSuccessfully);
+        }
       },
     });
   }
@@ -191,13 +264,14 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
     return this.alive && !this.child.killed && this.child.exitCode === null;
   }
 
-  async close(): Promise<void> {
+  async close(graceful = false): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closePromise = (async () => {
       this.alive = false;
       this.rpc.fail(new Error("codex app-server closed."));
       if (!this.child.stdin.destroyed) this.child.stdin.end();
       if (this.child.exitCode === null) {
+        if (graceful && await waitForProcessExit(this.child, 1000)) return;
         terminateProcessTree(this.child, "SIGTERM", process.platform !== "win32");
         if (!await waitForProcessExit(this.child, 1_000)) {
           terminateProcessTree(this.child, "SIGKILL", process.platform !== "win32");
@@ -239,14 +313,14 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
     private readonly commandResolver: CodexCommandResolver = resolveCodexCommand,
   ) {}
 
-  runtimeKey(_context: LocalAgentRuntimeContext): string {
+  runtimeKey(context: LocalAgentRuntimeContext): string {
     const command = this.resolveCommand();
     const executable = command?.executable ?? this.env.CODEX_COMMAND ?? "codex";
     const codexHome = resolve(this.env.CODEX_HOME ?? join(homedir(), ".codex"));
-    return `codex:${executable}:${codexHome}`;
+    return `codex:${executable}:${codexHome}${context.executionPolicy ? `:${context.agentId}:${JSON.stringify(context.executionPolicy)}` : ""}`;
   }
 
-  async createRuntime(_context: LocalAgentRuntimeContext) {
+  async createRuntime(context: LocalAgentRuntimeContext) {
     return captureAgentProviderResult({
       provider: this.provider,
       operation: "create_runtime",
@@ -261,6 +335,7 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
             message: "Codex executable was not found.",
           });
         }
+        if (context.executionPolicy) assertExecutionSelection(context.executionPolicy, context.model, command.version);
         if (!isCodexAppServerSupported(command.executable, this.env)) {
           throw new AgentProviderUnavailableError({
             code: "PROVIDER_UNAVAILABLE",
@@ -274,6 +349,7 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
           command: command.executable,
           env: codexCommandEnvironment(this.env),
           version: command.version,
+          model: context.executionPolicy?.requiredModel,
         });
         try {
           await runtime.initialize();
@@ -322,6 +398,8 @@ interface CodexTurnAccumulator {
   completed?: CodexEvent;
   resolve: (result: CodexTurnResult) => void;
   reject: (error: Error) => void;
+  requiredModel?: string;
+  policyError?: Error;
 }
 
 class CodexAppServerRpc {
@@ -338,6 +416,7 @@ class CodexAppServerRpc {
   constructor(
     private readonly child: ChildProcessWithoutNullStreams,
     private readonly version?: string,
+    private readonly requestTimeoutMs = 30000,
   ) {
     createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line", (line) => this.handleLine(line));
     child.stdin.on("error", (error) => this.fail(error));
@@ -350,7 +429,11 @@ class CodexAppServerRpc {
     if (this.fatalError) return Promise.reject(this.fatalError);
     const id = String(this.nextId++);
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Codex app-server ${method} timed out after ${this.requestTimeoutMs}ms.`));
+      }, this.requestTimeoutMs);
+      this.pending.set(id, { resolve: value => { clearTimeout(timer); resolve(value); }, reject: error => { clearTimeout(timer); reject(error); } });
       this.write({ id, method, ...(params === undefined ? {} : { params }) });
     });
   }
@@ -359,7 +442,7 @@ class CodexAppServerRpc {
     this.write({ method, ...(params === undefined ? {} : { params }) });
   }
 
-  async runTurn(threadId: string, params: unknown): Promise<CodexTurnResult> {
+  async runTurn(threadId: string, params: unknown, requiredModel?: string, timeoutMs?: number): Promise<CodexTurnResult> {
     if (this.fatalError) throw this.fatalError;
     if (this.turns.has(threadId)) throw new Error(`Codex thread ${threadId} already has an active turn.`);
     let resolveTurn!: (result: CodexTurnResult) => void;
@@ -368,19 +451,27 @@ class CodexAppServerRpc {
       resolveTurn = resolve;
       rejectTurn = reject;
     });
+    void completion.catch(() => undefined);
     const turn: CodexTurnAccumulator = {
       threadId,
       items: [],
       resolve: resolveTurn,
       reject: rejectTurn,
+      requiredModel,
     };
     this.turns.set(threadId, turn);
+    const timer = timeoutMs === undefined ? undefined : setTimeout(() => {
+      turn.policyError = new Error(`Codex guarded turn exceeded ${timeoutMs}ms; delivery must be reconciled before retry.`);
+      this.fail(turn.policyError);
+    }, timeoutMs);
     try {
       const response = await this.request("turn/start", params);
       turn.turnId = readString(asRecord(response)?.turn, "id");
+      if (turn.policyError) throw turn.policyError;
       if (turn.completed) return { event: turn.completed, items: turn.items };
       return await completion;
     } finally {
+      if (timer) clearTimeout(timer);
       if (this.turns.get(threadId) === turn) this.turns.delete(threadId);
     }
   }
@@ -430,6 +521,11 @@ class CodexAppServerRpc {
     const turn = this.findTurn(event);
     if (!turn) return;
     const params = asRecord(event.params);
+    if (method === "model/rerouted" && turn.requiredModel && params?.toModel !== turn.requiredModel && turnMatchesEvent(turn, event)) {
+      turn.policyError = new Error(`Codex model rerouted to ${String(params?.toModel ?? "unknown")}; required ${turn.requiredModel}.`);
+      this.fail(turn.policyError);
+      return;
+    }
     if (params?.item !== undefined) {
       turn.items.push(params.item);
       if (turn.items.length > MAX_TURN_ITEMS) turn.items.shift();
@@ -508,8 +604,8 @@ function parseCompletedTurn(params: unknown, items: unknown[]): {
   }
   const status = turn?.status;
   const error = asRecord(turn?.error);
-  const failure = status === "failed"
-    ? directString(error?.message) ?? "Codex turn failed."
+  const failure = status !== "completed"
+    ? directString(error?.message) ?? `Codex turn ended with status ${String(status ?? "unknown")}.`
     : undefined;
   return { finalResponse, items: completedItems, failure };
 }

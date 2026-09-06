@@ -27,11 +27,11 @@ test("tool modes expose the expected host-facing tool surface", async (t) => {
   }> = [
     {
       mode: "claude",
-      expected: ["open_workspace", "read", "write", "edit", "bash", "show_changes"],
+      expected: ["open_workspace", "read", "write", "edit", "bash", "show_changes", "project_files", "project_search", "project_read"],
     },
     {
       mode: "codex",
-      expected: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin", "show_changes"],
+      expected: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin", "show_changes", "project_files", "project_search", "project_read"],
     },
   ];
 
@@ -61,6 +61,39 @@ test("UI metadata is limited to workspace and aggregate review", async (t) => {
       assert.deepEqual(toolsWithUi, uiEnabled ? ["open_workspace", "show_changes"] : []);
     });
   }
+});
+
+test("project access and guarded patches work through the actual MCP schema", async (t) => {
+  const context = await fixture(t, { toolMode: "codex" });
+  await writeFile(join(context.project, "guarded.txt"), "old\nkeep\n");
+  const workspaceId = structuredContent(await callOpen(context.client, context.project, "project-access")).workspaceId;
+  const invoke = async (name: string, args: Record<string, unknown>) => context.client.callTool({ name, arguments: { workspaceId, ...args } });
+  const read = await invoke("project_read", { path: "guarded.txt" });
+  assert.notEqual(read.isError, true);
+  const page = JSON.parse((read.content as Array<{ text: string }>)[0].text);
+  assert.equal(page.text, "old\nkeep\n");
+  const tools = (await context.client.listTools()).tools;
+  const patchSchema = tools.find(tool => tool.name === "apply_patch")!.inputSchema.properties!;
+  assert.ok("expectedHashes" in patchSchema && "dryRun" in patchSchema);
+  const patch = "*** Begin Patch\n*** Update File: guarded.txt\n@@\n-old\n+new\n*** End Patch";
+  const args = { patch, expectedHashes: { "guarded.txt": page.sha256 } };
+  const preview = await invoke("apply_patch", { ...args, dryRun: true });
+  assert.notEqual(preview.isError, true);
+  assert.equal(structuredContent(preview).dryRun, true);
+  const applied = await invoke("apply_patch", args);
+  assert.notEqual(applied.isError, true);
+  assert.equal(structuredContent(applied).dryRun, false);
+  const stale = await invoke("apply_patch", { patch: patch.replace("-old", "-new"), expectedHashes: args.expectedHashes });
+  assert.equal(stale.isError, true);
+  const files = await invoke("project_files", { limit: 1 });
+  const first = JSON.parse((files.content as Array<{ text: string }>)[0].text);
+  assert.equal(first.files.length, 1);
+  assert.ok(first.nextCursor);
+  const search = await invoke("project_search", { query: "new" });
+  const found = JSON.parse((search.content as Array<{ text: string }>)[0].text);
+  assert.ok(found.matches.some((match: { path: string }) => match.path === "guarded.txt"));
+  const escaped = await invoke("project_read", { path: "../outside.txt" });
+  assert.equal(escaped.isError, true);
 });
 
 test("open_workspace reports aggregate review availability", async (t) => {

@@ -37,6 +37,11 @@ const migrations: Migration[] = [
     name: "local-agent-effort-rename",
     up: migrateLocalAgentEffortRename,
   },
+  {
+    version: 7,
+    name: "local-agent-execution-contract",
+    up: (sqlite) => addColumnIfMissing(sqlite, "local_agent_sessions", "execution_json", "text"),
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {

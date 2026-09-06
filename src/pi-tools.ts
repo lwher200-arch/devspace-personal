@@ -10,7 +10,23 @@ import {
   type WriteToolInput,
   type AgentToolResult,
 } from "@earendil-works/pi-coding-agent";
-import { resolveAllowedPath } from "./roots.js";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { AccessDeniedError, assertAllowedPath, canonicalAllowedPath, resolveAllowedPath } from "./roots.js";
+
+// Pi's detector is not exported publicly. Keep its pinned image behavior while
+// checking the final normalized path at each actual filesystem operation.
+const imageDetector = import(new URL("./utils/mime.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href) as
+  Promise<{ detectSupportedImageMimeTypeFromFile(path: string): Promise<string | null> }>;
+
+function pathGuard(roots: string[]): (path: string) => string {
+  const pinned = roots.map((root) => ({ root, physical: canonicalAllowedPath(root) }));
+  return (path) => {
+    const unchanged = pinned.filter(({ root, physical }) => canonicalAllowedPath(root) === physical);
+    if (!unchanged.length) throw new AccessDeniedError("Allowed root changed its filesystem target during the request.");
+    return canonicalAllowedPath(assertAllowedPath(path, unchanged.map(({ root }) => root)));
+  };
+}
 
 type McpContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 export type ToolResponse<TDetails = unknown> = {
@@ -62,7 +78,13 @@ async function runTool<TInput, TDetails = unknown>(
 
 export async function readFileTool(input: ReadToolInput, context: ToolContext): Promise<ToolResponse> {
   const path = resolveAllowedPath(input.path, context.cwd, context.readRoots ?? [context.root]);
-  const tool = createReadTool(context.cwd);
+  const roots = context.readRoots ?? [context.root];
+  const guardedPath = pathGuard(roots);
+  const tool = createReadTool(context.cwd, { operations: {
+    readFile: (file) => readFile(guardedPath(file)),
+    access: (file) => access(guardedPath(file), constants.R_OK),
+    detectImageMimeType: async (file) => (await imageDetector).detectSupportedImageMimeTypeFromFile(guardedPath(file)),
+  } });
 
   return runTool((params) => tool.execute("read_file", params), {
     path,
@@ -73,7 +95,11 @@ export async function readFileTool(input: ReadToolInput, context: ToolContext): 
 
 export async function writeFileTool(input: WriteToolInput, context: ToolContext): Promise<ToolResponse> {
   const path = resolveAllowedPath(input.path, context.cwd, [context.root]);
-  const tool = createWriteTool(context.cwd);
+  const guardedPath = pathGuard([context.root]);
+  const tool = createWriteTool(context.cwd, { operations: {
+    writeFile: (file, content) => writeFile(guardedPath(file), content, "utf8"),
+    mkdir: async (directory) => { await mkdir(guardedPath(directory), { recursive: true }); },
+  } });
 
   return runTool((params) => tool.execute("write_file", params), {
     path,
@@ -83,7 +109,12 @@ export async function writeFileTool(input: WriteToolInput, context: ToolContext)
 
 export async function editFileTool(input: EditToolInput, context: ToolContext): Promise<ToolResponse<EditToolDetails>> {
   const path = resolveAllowedPath(input.path, context.cwd, [context.root]);
-  const tool = createEditTool(context.cwd);
+  const guardedPath = pathGuard([context.root]);
+  const tool = createEditTool(context.cwd, { operations: {
+    readFile: (file) => readFile(guardedPath(file)),
+    writeFile: (file, content) => writeFile(guardedPath(file), content, "utf8"),
+    access: (file) => access(guardedPath(file), constants.R_OK | constants.W_OK),
+  } });
 
   return runTool((params) => tool.execute("edit_file", params), {
     path,

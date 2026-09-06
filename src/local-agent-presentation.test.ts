@@ -32,6 +32,9 @@ assert.deepEqual(presentAgentSummary({ ...record, status: "idle" }), {
   status: "completed",
   target: "reviewer",
 });
+assert.equal(presentAgentSummary({ ...record, profileName: "profile:codex" }).target, "codex");
+assert.equal(presentAgentSummary({ ...record, profileName: "provider:codex" }).target, "provider:codex");
+assert.equal(presentAgentSummary({ ...record, profileName: "codex" }).target, "codex");
 
 const completed = presentAgentObservation({
   ...record,

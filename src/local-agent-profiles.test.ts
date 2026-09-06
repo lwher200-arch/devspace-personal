@@ -37,6 +37,7 @@ try {
       "provider: claude",
       "model: sonnet",
       "effort: high",
+      "writeMode: read_only",
       "---",
       "",
       "Project body.",
@@ -70,6 +71,7 @@ try {
   assert.equal(profiles[0]?.provider, "claude");
   assert.equal(profiles[0]?.model, "sonnet");
   assert.equal(profiles[0]?.effort, "high");
+  assert.equal(profiles[0]?.writeMode, "read_only");
   assert.equal(profiles[0]?.body, "Project body.");
   await writeFile(
     join(workspaceRoot, ".devspace", "agents", "custom.md"),
@@ -86,6 +88,27 @@ try {
   );
   const profilesWithInvalid = await loadLocalAgentProfiles(enabledConfig, workspaceRoot);
   assert.deepEqual(profilesWithInvalid.map((profile) => profile.name), ["reviewer"]);
+
+  const policyPath = join(workspaceRoot, ".devspace", "agents", "policy.md");
+  for (const value of [undefined, "allowed", "read_only"] as const) {
+    await writeFile(policyPath, [
+      "---", "name: policy", "description: Authority policy.", "provider: codex",
+      ...(value === undefined ? [] : [`writeMode: ${value}`]), "---", "Inspect only.",
+    ].join("\n"));
+    const loaded = (await loadLocalAgentProfiles(enabledConfig, workspaceRoot))
+      .find((candidate) => candidate.name === "policy");
+    assert.ok(loaded, "valid policy is loaded");
+    assert.equal(loaded.writeMode, value);
+  }
+  for (const value of ["full_access", "read-only", "null", "true", "42", "[]", "{}", '""']) {
+    await writeFile(policyPath, [
+      "---", "name: policy", "description: Invalid authority.", "provider: codex",
+      `writeMode: ${value}`, "---", "Inspect only.",
+    ].join("\n"));
+    const loaded = await loadLocalAgentProfiles(enabledConfig, workspaceRoot);
+    assert.equal(loaded.some((candidate) => candidate.name === "policy"), false,
+      `invalid writeMode ${value} must reject the profile instead of enabling writes`);
+  }
 
   const disabledConfig = loadConfig(writeTestDevspaceConfig(configDir, {
     workspaces: { allowedRoots: [workspaceRoot] },

@@ -3,3 +3,17 @@ dist/
 releases/
 .env
 *.log
+
+# Private deployment files and generated acceptance artifacts are local only.
+/scripts/windows/
+/.runtime/
+/backups/
+.env.*
+!.env.example
+auth.json
+credentials.json
+*.sqlite
+*.sqlite-*
+*.db
+*.pem
+*.key

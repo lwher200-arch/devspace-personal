@@ -6,6 +6,12 @@
 
 <h1 align="center">DevSpace</h1>
 
+> **DevSpace Eterna:** this repository preserves the Eterna-oriented local
+> extensions to [Waishnav/devspace](https://github.com/Waishnav/devspace).
+> Start with [FORK.md](FORK.md) for the source-build workflow, scope and known
+> limitations. The npm package linked below belongs to upstream and does not
+> install this fork. Machine-specific deployment files are not published.
+
 <p align="center">Bring a Codex-style coding workflow to ChatGPT.</p>
 
 <p align="center">

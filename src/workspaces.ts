@@ -13,6 +13,7 @@ import { createManagedWorktree } from "./git-worktrees.js";
 import {
   AccessDeniedError,
   assertAllowedPath,
+  canonicalAllowedPath,
   isPathInsideRoot,
   resolveAllowedPath,
 } from "./roots.js";
@@ -62,6 +63,7 @@ export interface WorkspaceContext {
   workspace: Workspace;
   agentsFiles: LoadedAgentsFile[];
   availableAgentsFiles: AvailableAgentsFile[];
+  contextDiscoveryTruncated?: boolean;
   workspaceReused: boolean;
   includeBootstrapContext: boolean;
 }
@@ -90,6 +92,7 @@ type DirectoryOps = {
 
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
+  private readonly canonicalRoots = new Map<string, string>();
   private readonly pendingCheckoutOpens = new Map<string, Promise<WorkspaceContext>>();
 
   constructor(
@@ -214,7 +217,9 @@ export class WorkspaceRegistry {
       throw error;
     }
 
-    const workspace = this.getWorkspace(binding.workspaceSessionId);
+    let workspace: Workspace;
+    try { workspace = this.getWorkspace(binding.workspaceSessionId); }
+    catch (error) { if (error instanceof AccessDeniedError) return undefined; throw error; }
     if (workspace.mode !== "checkout" || workspace.root !== root) return undefined;
     return workspace;
   }
@@ -231,12 +236,13 @@ export class WorkspaceRegistry {
   private async reusedWorkspaceContext(workspace: Workspace): Promise<WorkspaceContext> {
     workspace.agentProfiles = await loadLocalAgentProfiles(this.config, workspace.root);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
-    const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
+    const discovery = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
 
     return {
       workspace,
       agentsFiles,
-      availableAgentsFiles,
+      availableAgentsFiles: discovery.files,
+      contextDiscoveryTruncated: discovery.truncated,
       workspaceReused: true,
       includeBootstrapContext: true,
     };
@@ -245,6 +251,10 @@ export class WorkspaceRegistry {
   getWorkspace(workspaceId: string): Workspace {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace) {
+      this.assertWorkspaceRootAllowed(workspace.root, workspace.mode, workspace.sourceRoot);
+      if (canonicalAllowedPath(workspace.root) !== this.canonicalRoots.get(workspaceId)) {
+        throw new AccessDeniedError("Workspace root changed its filesystem target. Reopen the workspace.");
+      }
       this.store?.touchSession(workspaceId);
       return workspace;
     }
@@ -257,6 +267,10 @@ export class WorkspaceRegistry {
     }
 
     const root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
+    const anchor = this.store?.getRootAnchor?.(session.id);
+    if (!anchor || canonicalAllowedPath(root) !== anchor) {
+      throw new AccessDeniedError("Stored workspace root has changed or has no verified anchor. Open the workspace again.");
+    }
     const restoredWorkspace: Workspace = {
       id: session.id,
       root,
@@ -279,6 +293,7 @@ export class WorkspaceRegistry {
     };
     this.store?.touchSession(workspaceId);
     this.workspaces.set(restoredWorkspace.id, restoredWorkspace);
+    this.canonicalRoots.set(restoredWorkspace.id, anchor);
 
     return restoredWorkspace;
   }
@@ -356,6 +371,7 @@ export class WorkspaceRegistry {
     sourceRoot?: string;
     worktree?: WorkspaceWorktree;
   }): Promise<WorkspaceContext> {
+    const canonicalRoot = canonicalAllowedPath(input.root);
     const workspace: Workspace = {
       id: `ws_${randomBytes(5).toString("hex")}`,
       root: input.root,
@@ -367,6 +383,9 @@ export class WorkspaceRegistry {
       activatedSkillDirs: new Set(),
     };
 
+    if (canonicalAllowedPath(input.root) !== canonicalRoot) {
+      throw new AccessDeniedError("Workspace root changed while opening it.");
+    }
     this.store?.createSession({
       id: workspace.id,
       root: workspace.root,
@@ -377,13 +396,16 @@ export class WorkspaceRegistry {
       managed: workspace.worktree?.managed,
     });
     this.workspaces.set(workspace.id, workspace);
+    this.canonicalRoots.set(workspace.id, canonicalRoot);
+    this.store?.setRootAnchor?.(workspace.id, canonicalRoot);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
-    const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
+    const discovery = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
 
     return {
       workspace,
       agentsFiles,
-      availableAgentsFiles,
+      availableAgentsFiles: discovery.files,
+      contextDiscoveryTruncated: discovery.truncated,
       workspaceReused: false,
       includeBootstrapContext: true,
     };
@@ -438,7 +460,7 @@ export class WorkspaceRegistry {
   private async findAvailableAgentsFiles(
     root: string,
     loadedFiles: LoadedAgentsFile[],
-  ): Promise<AvailableAgentsFile[]> {
+  ): Promise<{ files: AvailableAgentsFile[]; truncated: boolean }> {
     const loadedPaths = new Set(loadedFiles.map((file) => resolve(file.path)));
     const loadedRealPaths = new Set<string>();
     for (const file of loadedFiles) {
@@ -447,6 +469,7 @@ export class WorkspaceRegistry {
     }
     const discovered: AvailableAgentsFile[] = [];
 
+    const budget = { deadline: Date.now() + 2_000, remaining: 10_000, truncated: false };
     await walkWorkspace(root, async (path, entry) => {
       if (!entry.isFile()) return;
       if (!CONTEXT_FILE_NAMES.has(entry.name)) return;
@@ -455,9 +478,9 @@ export class WorkspaceRegistry {
       if (realPath && loadedRealPaths.has(realPath)) return;
 
       discovered.push({ path });
-    });
+    }, budget);
 
-    return discovered.sort((a, b) => a.path.localeCompare(b.path));
+    return { files: discovered.sort((a, b) => a.path.localeCompare(b.path)), truncated: budget.truncated };
   }
 }
 
@@ -509,6 +532,14 @@ const SKIPPED_CONTEXT_DIRS = new Set([
   ".next",
   ".turbo",
   ".cache",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".mypy_cache",
+  ".pytest_cache",
+  ".ruff_cache",
+  ".tox",
+  ".nox",
 ]);
 
 export function formatAgentsPath(path: string, workspaceRoot: string | undefined): string {
@@ -558,7 +589,9 @@ async function tryRealpath(path: string): Promise<string | undefined> {
 async function walkWorkspace(
   directory: string,
   visit: (path: string, entry: { name: string; isFile(): boolean; isDirectory(): boolean }) => Promise<void> | void,
+  budget: { deadline: number; remaining: number; truncated: boolean },
 ): Promise<void> {
+  if (budget.truncated) return;
   let entries;
   try {
     entries = await opendir(directory);
@@ -567,10 +600,15 @@ async function walkWorkspace(
   }
 
   for await (const entry of entries) {
+    if (Date.now() >= budget.deadline || --budget.remaining < 0) {
+      budget.truncated = true;
+      return;
+    }
     const path = join(directory, entry.name);
     if (entry.isDirectory()) {
-      if (!SKIPPED_CONTEXT_DIRS.has(entry.name)) {
-        await walkWorkspace(path, visit);
+      if (!SKIPPED_CONTEXT_DIRS.has(entry.name) && !entry.name.startsWith(".venv-")) {
+        await walkWorkspace(path, visit, budget);
+        if (budget.truncated) return;
       }
       continue;
     }

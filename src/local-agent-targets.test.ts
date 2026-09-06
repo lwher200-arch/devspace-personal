@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+  parseLocalAgentContinueArgs,
   parseLocalAgentRunArgs,
+  resolveLocalAgentPrompt,
   resolveLocalAgentTarget,
 } from "./local-agent-targets.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
@@ -26,6 +31,10 @@ const profiles: LocalAgentProfile[] = [
     disabled: false,
   },
 ];
+
+assert.equal(resolveLocalAgentTarget("provider:claude", profiles)?.provider, "claude");
+assert.equal(resolveLocalAgentTarget("provider:claude", profiles)?.kind, "provider");
+assert.equal(resolveLocalAgentTarget("provider:codex", [{ ...profiles[0]!, name: "codex", provider: "claude" }])?.provider, "codex");
 
 assert.deepEqual(parseLocalAgentRunArgs(["codex", "hello", "world"]), {
   target: "codex",
@@ -146,3 +155,62 @@ assert.deepEqual(parseLocalAgentRunArgs(["codex", "--", "--json", "literal"]), {
 }
 
 assert.equal(resolveLocalAgentTarget("missing", profiles), undefined);
+
+for (const parse of [parseLocalAgentRunArgs, parseLocalAgentContinueArgs]) {
+  const separate = parse(["target", "--prompt-file", "brief.txt"]);
+  assert.equal(separate.promptFile, "brief.txt");
+  assert.equal(separate.prompt, "");
+  assert.equal(parse(["target", "--prompt-file=brief.txt", "--effort", "high"]).effort, "high");
+  assert.equal(parse(["target", "--", "--prompt-file", "literal"]).prompt, "--prompt-file literal");
+  assert.throws(() => parse(["target", "--prompt-file"]), /Missing value for --prompt-file/);
+  assert.throws(() => parse(["target", "--prompt-file="]), /Missing value for --prompt-file/);
+  assert.throws(() => parse(["target", "--prompt-file", "--effort"]), /Unknown option/);
+  assert.throws(() => parse(["target", "--prompt-file=a", "--prompt-file", "b"]), /Duplicate option/);
+  assert.throws(() => parse(["target", "--prompt-file", "a", "--prompt-file=b"]), /Duplicate option/);
+  assert.throws(() => parse(["target", "inline", "--prompt-file=a"]), /either an inline prompt/);
+  assert.throws(() => parse(["target", "--prompt-file=a", "--", "literal"]), /either an inline prompt/);
+  assert.throws(() => parse(["target", "--prompt-file=a", " "]), /either an inline prompt/);
+}
+
+const promptRoot = mkdtempSync(join(tmpdir(), "devspace-prompt-file-test-"));
+try {
+  const workspace = join(promptRoot, "workspace");
+  const outside = join(promptRoot, "outside");
+  mkdirSync(workspace);
+  mkdirSync(outside);
+  const content = '\uFEFF  请审查 Eterna。\r\n保留 "双引号"、\'单引号\'、`反引号`。\nStability > Speed & echo no | no < no %PATH% $HOME $(no) ^ ! --json\n';
+  writeFileSync(join(workspace, "中文 brief.txt"), content, "utf8");
+  const readPrompt = (promptFile: string) => resolveLocalAgentPrompt({ prompt: "", promptFile }, workspace);
+  assert.equal(await readPrompt("中文 brief.txt"), content);
+  assert.equal(await readPrompt(join(workspace, "中文 brief.txt")), content);
+  assert.equal(await resolveLocalAgentPrompt({ prompt: "existing inline" }, workspace), "existing inline");
+
+  writeFileSync(join(workspace, "limit.txt"), Buffer.alloc(64 * 1024, 65));
+  assert.equal((await readPrompt("limit.txt")).length, 64 * 1024);
+  writeFileSync(join(workspace, "oversize.txt"), "中".repeat(22_000));
+  await assert.rejects(readPrompt("oversize.txt"), /64 KiB limit/);
+  writeFileSync(join(workspace, "blank.txt"), "\uFEFF \t\r\n");
+  writeFileSync(join(workspace, "empty.txt"), "");
+  await assert.rejects(readPrompt("blank.txt"), /empty or whitespace-only/);
+  await assert.rejects(readPrompt("empty.txt"), /empty or whitespace-only/);
+  writeFileSync(join(workspace, "invalid.txt"), Buffer.from([0xc3, 0x28]));
+  await assert.rejects(readPrompt("invalid.txt"), /valid UTF-8/);
+  await assert.rejects(readPrompt("missing.txt"), /Unable to open --prompt-file/);
+  await assert.rejects(readPrompt("."), /regular file|Unable to open --prompt-file/);
+
+  writeFileSync(join(outside, "private.txt"), "DO_NOT_DISCLOSE_PROMPT_CONTENT");
+  for (const candidate of ["../outside/private.txt", join(outside, "private.txt")]) {
+    await assert.rejects(readPrompt(candidate), (error: unknown) => {
+      assert.match(String(error), /outside allowed roots/);
+      assert.doesNotMatch(String(error), /DO_NOT_DISCLOSE_PROMPT_CONTENT/);
+      return true;
+    });
+  }
+  // Junctions exercise the same boundary on Windows without symlink privileges.
+  symlinkSync(outside, join(workspace, "escape"), process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(readPrompt("escape/private.txt"), /outside allowed roots/);
+  symlinkSync(workspace, join(workspace, "inside"), process.platform === "win32" ? "junction" : "dir");
+  assert.equal(await readPrompt("inside/中文 brief.txt"), content);
+} finally {
+  rmSync(promptRoot, { recursive: true, force: true });
+}

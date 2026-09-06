@@ -73,6 +73,26 @@ logical agent from a profile or provider; `agents continue <id>` continues an
 existing logical agent. Provider session IDs are never accepted as logical
 agent IDs, and the daemon does not resolve ambiguous prefixes.
 
+For multiline tasks, especially in Windows shells, save the brief as a UTF-8
+file inside the current workspace and pass its path instead of quoting its
+contents on the command line:
+
+```text
+devspace agents run reviewer --prompt-file ".devspace/briefs/review.txt" --json
+devspace agents continue <id> --prompt-file ".devspace/briefs/follow-up.txt" --json
+```
+
+`--prompt-file=<path>` is also accepted. File paths are relative to the resolved
+workspace root (or absolute paths inside it), not an unrelated process working
+directory. The CLI validates the workspace before opening the file and rejects
+paths that escape it, including symbolic links and Windows junctions. The file
+must be a regular, nonblank UTF-8 file of at most 64 KiB. Its whitespace, line
+endings, quotes, and shell characters are preserved; file contents never become
+shell arguments. Invalid input fails before starting or contacting the daemon.
+Use one prompt file or an inline prompt, not both. Repeating `--prompt-file` or
+omitting its value is an error. Existing inline prompts are unchanged, and `--`
+still ends option parsing, so subsequent `--prompt-file` text is literal.
+
 Shutdown gives active turns a bounded graceful window. If that window expires,
 the process exits with active records left durable; the next daemon startup
 reconciles stale `starting` and `running` records to `error` without discarding

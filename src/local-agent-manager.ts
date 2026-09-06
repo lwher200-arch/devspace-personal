@@ -31,6 +31,7 @@ import {
 } from "./local-agent-runtime.js";
 import { LocalAgentRuntimePool } from "./local-agent-runtime-pool.js";
 import { assertAllowedPath } from "./roots.js";
+import { assertExecutionSelection, executionEvidenceSchema, executionPolicySchema, type CodexExecutionPolicy } from "./local-agent-execution.js";
 import {
   isSubagentProviderEnabled,
   type SubagentsConfig,
@@ -44,12 +45,14 @@ export interface StartLocalAgentInput {
   model?: string;
   effort?: string;
   writeMode?: LocalAgentWriteMode;
+  executionPolicy?: CodexExecutionPolicy;
 }
 
 export interface RunOverrides {
   model?: string;
   effort?: string;
   writeMode?: LocalAgentWriteMode;
+  executionPolicy?: CodexExecutionPolicy;
 }
 
 export interface LocalAgentManagerLogger {
@@ -65,6 +68,7 @@ export interface LocalAgentManagerOptions {
   allowedRoots?: readonly string[];
   logger?: LocalAgentManagerLogger;
   subagents: SubagentsConfig;
+  codexExecutionPolicy?: CodexExecutionPolicy;
 }
 
 export type AgentStartError = AgentTargetError | AgentScopeError | AgentConflictError | AgentStoreError;
@@ -86,6 +90,7 @@ export class LocalAgentManager {
   private readonly allowedRoots?: readonly string[];
   private readonly logger?: LocalAgentManagerLogger;
   private readonly subagents: SubagentsConfig;
+  private readonly codexExecutionPolicy?: CodexExecutionPolicy;
   private readonly activeTurns = new Map<string, Promise<void>>();
   private accepting = true;
   private closePromise?: Promise<void>;
@@ -99,6 +104,7 @@ export class LocalAgentManager {
     this.allowedRoots = options.allowedRoots;
     this.logger = options.logger;
     this.subagents = options.subagents;
+    this.codexExecutionPolicy = options.codexExecutionPolicy;
   }
 
   reconcileActiveRuns(message?: string): BetterResult<number, AgentStoreError> {
@@ -140,19 +146,34 @@ export class LocalAgentManager {
         }));
       }
       yield* manager.providerEnabledResult(target.provider, target.name, "start");
+      const serverPolicy = target.provider === "codex" && input.workspaceId ? manager.codexExecutionPolicy : undefined;
+      const executionPolicy = serverPolicy ?? input.executionPolicy;
+      if (serverPolicy && input.executionPolicy && !samePolicy(serverPolicy, input.executionPolicy)) {
+        return Result.err(new AgentTargetError({ code: "TARGET_RESOLUTION_FAILED", target: input.target,
+          retryable: false, message: "The MCP Codex execution policy cannot be overridden." }));
+      }
+      yield* manager.executionPolicyResult(target.provider, executionPolicy, input.model);
       yield* manager.driverResult(target.provider, "start");
       const record = yield* manager.store.createResult({
         workspaceId: input.workspaceId,
         workspaceRoot,
-        profileName: target.name,
+        // Older records cannot distinguish a profile named after its provider.
+        // Only collisions need a tag; ordinary durable targets keep their shape.
+        profileName: target.kind === "profile" && target.name === target.provider
+          ? `profile:${target.name}`
+          : target.kind === "provider" && profiles.some((profile) => profile.name === target.provider)
+            ? `provider:${target.provider}`
+            : target.name,
         provider: target.provider,
         model: target.model,
         effort: target.effort,
+        executionPolicy,
       });
       return manager.begin(record, input.prompt, {
         model: target.model,
         effort: target.effort,
         writeMode: input.writeMode,
+        executionPolicy,
       }, input.workspaceId);
     });
   }
@@ -173,6 +194,19 @@ export class LocalAgentManager {
       yield* manager.profileForRecordResult(record, profiles);
       yield* manager.providerEnabledResult(record.provider, record.profileName, "continue");
       yield* manager.driverResult(record.provider, "continue", agentId);
+      const serverPolicy = record.provider === "codex" && scope.workspaceId ? manager.codexExecutionPolicy : undefined;
+      if (serverPolicy && overrides.executionPolicy && !samePolicy(serverPolicy, overrides.executionPolicy)) {
+        return Result.err(new AgentTargetError({ code: "TARGET_RESOLUTION_FAILED", target: record.profileName,
+          retryable: false, message: "The MCP Codex execution policy cannot be overridden." }));
+      }
+      overrides = { ...overrides, executionPolicy: serverPolicy ?? overrides.executionPolicy };
+      if (record.executionPolicy && overrides.executionPolicy &&
+        (record.executionPolicy.requiredModel !== overrides.executionPolicy.requiredModel ||
+         record.executionPolicy.minimumCliVersion !== overrides.executionPolicy.minimumCliVersion)) {
+        return Result.err(new AgentTargetError({ code: "TARGET_RESOLUTION_FAILED", target: record.profileName,
+          retryable: false, message: "A stored execution policy cannot be replaced or weakened." }));
+      }
+      yield* manager.executionPolicyResult(record.provider, record.executionPolicy ?? overrides.executionPolicy, overrides.model);
       return manager.begin(record, prompt, overrides, scope.workspaceId);
     });
   }
@@ -251,6 +285,8 @@ export class LocalAgentManager {
       model: overrides.model ?? record.model,
       effort: overrides.effort ?? record.effort,
       latestResponse: undefined,
+      executionPolicy: record.executionPolicy ?? overrides.executionPolicy,
+      executionEvidence: undefined,
       error: undefined,
       errorCode: undefined,
       errorRetryable: undefined,
@@ -314,6 +350,7 @@ export class LocalAgentManager {
         workspaceRoot,
         providerSessionId: record.providerSessionId,
         writeMode: input.value.writeMode,
+        executionPolicy: input.value.executionPolicy,
         model: input.value.model,
         effort: input.value.effort,
         agentDir: this.agentDir,
@@ -333,6 +370,20 @@ export class LocalAgentManager {
         return;
       }
       const runResult = result.value;
+      if (input.value.executionPolicy) {
+        try {
+          const evidence = executionEvidenceSchema.parse(runResult.executionEvidence);
+          assertExecutionSelection(input.value.executionPolicy, evidence.runtimeModel, evidence.cliVersion);
+          if (evidence.requestedModel !== input.value.model || evidence.sessionModel !== input.value.model ||
+            evidence.threadId !== runResult.providerSessionId || evidence.sandbox !== (input.value.writeMode === "allowed" ? "workspaceWrite" : "readOnly")) {
+            throw new Error("Execution evidence does not match the requested turn.");
+          }
+        } catch {
+          this.persistRunError(record, new AgentTargetError({ code: "TARGET_RESOLUTION_FAILED", target: record.profileName,
+            retryable: false, message: "Provider result has no matching verified model evidence; result rejected." }), startedAt);
+          return;
+        }
+      }
       const current = this.store.getByIdResult(record.id);
       if (current.isErr()) throw current.error;
       if (!current.value) return;
@@ -340,6 +391,7 @@ export class LocalAgentManager {
         providerSessionId: runResult.providerSessionId ?? current.value.providerSessionId,
         status: "idle",
         latestResponse: runResult.finalResponse,
+        executionEvidence: runResult.executionEvidence,
         error: undefined,
         errorCode: undefined,
         errorRetryable: undefined,
@@ -406,7 +458,8 @@ export class LocalAgentManager {
     prompt: string,
     overrides: RunOverrides,
   ): BetterResult<LocalAgentRunInput, AgentTargetError> {
-    const isRawProvider = record.profileName === record.provider;
+    const isRawProvider = record.profileName === record.provider
+      || record.profileName === `provider:${record.provider}`;
     if (!profile && !isRawProvider) {
       return Result.err(new AgentTargetError({
         code: "UNKNOWN_TARGET",
@@ -422,20 +475,50 @@ export class LocalAgentManager {
       prompt: fullPrompt,
       workspaceRoot: record.workspaceRoot,
       providerSessionId: record.providerSessionId,
-      writeMode: overrides.writeMode ?? "allowed",
+      // A profile is an authority ceiling, including on resumed provider sessions.
+      // Omitted profile policy retains the existing per-turn override behavior.
+      writeMode: profile?.writeMode === "read_only" || overrides.writeMode === "read_only"
+        ? "read_only"
+        : profile?.writeMode ?? overrides.writeMode ?? "allowed",
       model: record.model ?? profile?.model,
       effort: record.effort ?? profile?.effort,
       modelOverrideRequested: overrides.model !== undefined,
       effortOverrideRequested: overrides.effort !== undefined,
+      executionPolicy: record.executionPolicy ?? overrides.executionPolicy,
     });
+  }
+
+  private executionPolicyResult(provider: string, policy: CodexExecutionPolicy | undefined, model: string | undefined): BetterResult<void, AgentTargetError> {
+    if (!policy) return Result.ok(undefined);
+    try {
+      executionPolicySchema.parse(policy);
+      if (provider !== "codex" || model !== policy.requiredModel) throw new Error();
+      return Result.ok(undefined);
+    } catch {
+      return Result.err(new AgentTargetError({ code: "TARGET_RESOLUTION_FAILED", target: provider,
+        retryable: false, message: `Execution policy requires an explicit Codex model ${policy.requiredModel} on every start and continuation.` }));
+    }
   }
 
   private profileForRecordResult(
     record: LocalAgentRecord,
     profiles: readonly LocalAgentProfile[],
   ): BetterResult<LocalAgentProfile | undefined, AgentTargetError> {
+    if (record.profileName === `provider:${record.provider}`) return Result.ok(undefined);
+    const taggedProfile = record.profileName === `profile:${record.provider}`;
+    const profileName = taggedProfile ? record.provider : record.profileName;
+    const profile = profiles.find((candidate) => candidate.name === profileName);
+    if ((record.profileName === record.provider && profile)
+      || (taggedProfile && profiles.some((candidate) => candidate.name === record.profileName))) {
+      return Result.err(new AgentTargetError({
+        code: "TARGET_RESOLUTION_FAILED",
+        target: record.profileName,
+        provider: isLocalAgentProvider(record.provider) ? record.provider : undefined,
+        retryable: false,
+        message: `Subagent target is ambiguous: ${record.profileName}. Create a new agent using a uniquely named profile or an explicit provider target; the existing record is preserved.`,
+      }));
+    }
     if (record.profileName === record.provider) return Result.ok(undefined);
-    const profile = profiles.find((candidate) => candidate.name === record.profileName);
     if (!profile) {
       return Result.err(new AgentTargetError({
         code: "UNKNOWN_TARGET",
@@ -582,6 +665,10 @@ export class LocalAgentManager {
   ): void {
     this.logger?.(level, event, fields);
   }
+}
+
+function samePolicy(left: CodexExecutionPolicy, right: CodexExecutionPolicy): boolean {
+  return left.requiredModel === right.requiredModel && left.minimumCliVersion === right.minimumCliVersion;
 }
 
 export function createLocalAgentManager(options: LocalAgentManagerOptions): LocalAgentManager {

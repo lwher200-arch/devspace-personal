@@ -1,4 +1,5 @@
 import * as z from "zod/v4";
+import { executionPolicySchema } from "./local-agent-execution.js";
 import { subagentsConfigSchema } from "./local-agent-config.js";
 
 export const DEVSPACE_CONFIG_VERSION = 1 as const;
@@ -10,7 +11,7 @@ const serverConfigSchema = z.object({
   port: z.number().int().min(1).max(65_535).default(7676),
   publicBaseUrl: z.string().url().nullable().default(null),
   allowedHosts: z.array(z.string().trim().min(1)).default([]),
-  trustProxy: z.boolean().default(false),
+  trustProxy: z.union([z.boolean(), z.literal("loopback")]).default(false),
 }).strict().prefault({});
 
 const workspacesConfigSchema = z.object({
@@ -61,6 +62,12 @@ const oauthConfigSchema = z.object({
   ]),
 }).strict().prefault({});
 
+const bridgeConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  allowWorkspaceWrite: z.boolean().default(false),
+  executionPolicy: executionPolicySchema.optional(),
+}).strict().prefault({});
+
 export const devspaceConfigSchema = z.object({
   $schema: z.string().url().default(DEVSPACE_CONFIG_SCHEMA_URL),
   configVersion: z.literal(DEVSPACE_CONFIG_VERSION),
@@ -74,6 +81,7 @@ export const devspaceConfigSchema = z.object({
   subagents: subagentsConfigSchema.default({ enabled: false, providers: [] }),
   logging: loggingConfigSchema,
   oauth: oauthConfigSchema,
+  bridge: bridgeConfigSchema,
 }).strict();
 
 export type DevspaceConfig = z.output<typeof devspaceConfigSchema>;

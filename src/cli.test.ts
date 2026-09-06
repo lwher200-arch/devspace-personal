@@ -97,7 +97,7 @@ try {
         params?: Record<string, unknown>;
       };
       daemonRequests.push(request);
-      if (request.method === "agent.start") {
+      if (request.method === "agent.start" && request.params?.target === "missing") {
         socket.end(encodeLocalAgentDaemonResponse({
           requestId: request.requestId,
           protocolVersion: 3,
@@ -113,6 +113,8 @@ try {
       }
       const result = request.method === "agent.list"
         ? [current]
+        : request.method === "agent.start" || request.method === "agent.continue"
+          ? current
         : request.method === "hello"
           ? {
               state: "ready",
@@ -216,6 +218,47 @@ try {
     assert.equal(payload.error.code, "UNKNOWN_TARGET");
     assert.equal(payload.error.retryable, false);
     assert.equal(payload.error.target, "missing");
+
+    const filePrompt = '  请审查 Eterna。\r\n"quoted" \'literal\' > & | < %PATH% $HOME `no` $(no) ! ^ --json\n';
+    writeFileSync(join(projectRoot, "中文 brief.txt"), filePrompt, "utf8");
+    const runPromptCommand = (args: string[], workspaceRoot = projectRoot) => execFileAsync(
+      "node", ["--import", tsxLoader, cliPath, "agents", ...args], {
+        cwd: stateDir,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ...cliConfigEnv,
+          DEVSPACE_WORKSPACE_ID: "ws_current",
+          DEVSPACE_WORKSPACE_ROOT: workspaceRoot,
+        },
+      },
+    );
+    for (const [command, target, method] of [
+      ["run", "reviewer", "agent.start"],
+      ["continue", current.id, "agent.continue"],
+    ]) {
+      const { stdout } = await runPromptCommand([command, target, "--prompt-file", "中文 brief.txt", "--json"]);
+      assert.deepEqual(JSON.parse(stdout), { id: current.id, status: "completed" });
+      const request = [...daemonRequests].reverse().find((item) => item.method === method);
+      assert.equal(request?.params?.prompt, filePrompt);
+    }
+    const requestCount = daemonRequests.length;
+    writeFileSync(join(projectRoot, "invalid.txt"), Buffer.from([0xc3, 0x28]));
+    for (const [args, workspaceRoot, expected] of [
+      [["run", "reviewer", "--prompt-file", "invalid.txt"], projectRoot, /valid UTF-8/],
+      [["continue", current.id, "--prompt-file", "../.state/secret.txt"], projectRoot, /outside allowed roots/],
+      [["run", "reviewer", "--prompt-file", "missing.txt"], stateDir, /outside allowed roots/],
+    ] as const) {
+      await assert.rejects(runPromptCommand([...args], workspaceRoot), (error: unknown) => {
+        assert.match((error as { stderr?: string }).stderr ?? "", expected);
+        return true;
+      });
+    }
+    assert.equal(daemonRequests.length, requestCount, "invalid input or scope must fail before contacting the daemon");
+
+    await runPromptCommand(["run", "reviewer", "--", "--prompt-file", "literal", "--json"]);
+    const literalRequest = [...daemonRequests].reverse().find((item) => item.method === "agent.start");
+    assert.equal(literalRequest?.params?.prompt, "--prompt-file literal --json");
 
     await assert.rejects(
       execFileAsync(

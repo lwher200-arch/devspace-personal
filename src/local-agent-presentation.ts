@@ -38,11 +38,14 @@ export interface AgentFailureOutput {
   retryable: boolean;
 }
 
-export type AgentObservationOutput =
+export type AgentObservationOutput = (
   | { id: string; status: "running" }
   | { id: string; status: "completed"; response?: string }
   | { id: string; status: "failed"; error: AgentFailureOutput }
-  | { id: string; status: "stopped"; error?: AgentFailureOutput };
+  | { id: string; status: "stopped"; error?: AgentFailureOutput }) & {
+    requestedModel?: string;
+    executionEvidence?: LocalAgentRecord["executionEvidence"];
+  };
 
 export function presentAgentTargetCatalog(catalog: LocalAgentCatalog): AgentTargetCatalogOutput {
   return {
@@ -72,10 +75,17 @@ export function presentAgentReceipt(record: LocalAgentRecord): AgentReceiptOutpu
 }
 
 export function presentAgentSummary(record: LocalAgentRecord): AgentSummaryOutput {
-  return { ...presentAgentReceipt(record), target: record.profileName };
+  const target = record.profileName === `profile:${record.provider}` ? record.provider : record.profileName;
+  return { ...presentAgentReceipt(record), target };
 }
 
 export function presentAgentObservation(record: LocalAgentRecord): AgentObservationOutput {
+  const output = presentLegacyAgentObservation(record);
+  return record.executionPolicy ? { ...output, requestedModel: record.model,
+    ...(output.status === "completed" && record.executionEvidence ? { executionEvidence: record.executionEvidence } : {}) } : output;
+}
+
+function presentLegacyAgentObservation(record: LocalAgentRecord): AgentObservationOutput {
   const receipt = presentAgentReceipt(record);
   switch (receipt.status) {
     case "completed":

@@ -29,6 +29,7 @@ export interface ServerConfig {
   subagents: SubagentsConfig;
   agentDir: string;
   logging: LoggingConfig;
+  bridge?: { enabled: boolean; allowWorkspaceWrite: boolean; executionPolicy?: import("./local-agent-execution.js").CodexExecutionPolicy };
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
@@ -80,6 +81,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       ...stored.logging,
       trustProxy: stored.server.trustProxy,
     },
+    bridge: stored.bridge,
   };
 }
 

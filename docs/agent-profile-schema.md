@@ -28,6 +28,7 @@ description: Read-only reviewer for bugs, security risks, and missing tests.
 provider: codex
 model: gpt-5.4
 effort: high
+writeMode: read_only
 disabled: false
 ---
 
@@ -122,6 +123,38 @@ DevSpace passes this through to providers that expose a matching control:
 - `opencode`: model variant.
 - `cursor` and `copilot`: ACP thought-level config when supported.
 - `grok`: `--reasoning-effort` on startup and xAI's ACP model metadata for resumed sessions.
+
+### `writeMode`
+
+Optional execution authority ceiling. Supported values are `read_only` and
+`allowed` (workspace writes); other values, including `full_access`, reject the
+profile. Set `writeMode: read_only` for analysis and review roles. Instructions in
+the Markdown body alone do not restrict provider execution permissions.
+
+The manager applies this ceiling on every start and continuation before creating
+or reusing the provider runtime. A caller may request stricter `read_only` access,
+but cannot raise a profile's ceiling with `allowed` or `full_access`. Changes to
+the profile take effect on the next turn, including after a daemon restart.
+
+Omitting this field preserves existing behavior: the caller's per-turn mode is
+used, defaulting to `allowed`. No write mode is added to persisted agent state;
+each turn uses the current profile and its explicit caller override. Enforcement
+uses the existing provider permission adapters and is not an OS sandbox for the
+host's direct DevSpace shell tools.
+
+Use unique role names such as `project-reviewer`, rather than a provider name.
+New targets that collide with a provider use an explicit target tag in the
+existing `profileName` state field; a profile remains a profile on continuation,
+and `provider:codex` continues to select the raw provider. Avoid profile names
+using the reserved `profile:` or `provider:` target prefixes.
+
+Compatibility exception: an old untagged record whose name matches both its
+provider and a currently loaded profile cannot be resumed safely. DevSpace
+rejects that continuation and asks for a new agent with a uniquely named profile
+or explicit provider target. The old record and response are retained; no
+automatic migration or deletion occurs. A removed tagged profile also fails
+closed rather than becoming a raw provider. Ordinary names and old provider
+records without this collision retain their existing behavior.
 
 ### `disabled`
 

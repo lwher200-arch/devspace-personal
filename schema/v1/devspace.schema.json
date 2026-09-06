@@ -51,7 +51,15 @@
         },
         "trustProxy": {
           "default": false,
-          "type": "boolean"
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "string",
+              "const": "loopback"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -289,6 +297,41 @@
             "type": "string",
             "minLength": 1
           }
+        }
+      },
+      "additionalProperties": false
+    },
+    "bridge": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "allowWorkspaceWrite": {
+          "default": false,
+          "type": "boolean"
+        },
+        "executionPolicy": {
+          "type": "object",
+          "properties": {
+            "requiredModel": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$"
+            },
+            "minimumCliVersion": {
+              "type": "string",
+              "pattern": "^\\d+\\.\\d+\\.\\d+$"
+            }
+          },
+          "required": [
+            "requiredModel",
+            "minimumCliVersion"
+          ],
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

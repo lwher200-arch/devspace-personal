@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { Result, type Result as BetterResult } from "better-result";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { AgentStoreError, isProgrammerDefect } from "./local-agent-errors.js";
+import { executionPolicySchema, executionEvidenceSchema, type CodexExecutionPolicy, type CodexExecutionEvidence } from "./local-agent-execution.js";
 
 export type LocalAgentStatus = "starting" | "running" | "idle" | "error" | "stopped";
 
@@ -13,6 +14,8 @@ export interface LocalAgentRecord {
   profileName: string;
   provider: string;
   model?: string;
+  executionPolicy?: CodexExecutionPolicy;
+  executionEvidence?: CodexExecutionEvidence;
   effort?: string;
   providerSessionId?: string;
   status: LocalAgentStatus;
@@ -31,6 +34,7 @@ export interface CreateLocalAgentRecordInput {
   provider: string;
   model?: string;
   effort?: string;
+  executionPolicy?: CodexExecutionPolicy;
 }
 
 export interface LocalAgentWorkspaceScope {
@@ -50,6 +54,7 @@ interface LocalAgentRow {
   profile_name: string;
   provider: string;
   model: string | null;
+  execution_json: string | null;
   effort: string | null;
   provider_session_id: string | null;
   status: string;
@@ -116,6 +121,7 @@ export class LocalAgentStore {
       profileName: input.profileName,
       provider: input.provider,
       model: input.model,
+      executionPolicy: input.executionPolicy,
       effort: input.effort,
       status: "starting",
       createdAt: now,
@@ -132,10 +138,11 @@ export class LocalAgentStore {
           provider,
           model,
           effort,
+          execution_json,
           status,
           created_at,
           updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         record.id,
@@ -145,6 +152,7 @@ export class LocalAgentStore {
         record.provider,
         record.model ?? null,
         record.effort ?? null,
+        JSON.stringify({ policy: record.executionPolicy }),
         record.status,
         record.createdAt,
         record.updatedAt,
@@ -199,6 +207,7 @@ export class LocalAgentStore {
           provider = ?,
           model = ?,
           effort = ?,
+          execution_json = ?,
           provider_session_id = ?,
           status = ?,
           latest_response = ?,
@@ -215,6 +224,7 @@ export class LocalAgentStore {
         updated.provider,
         updated.model ?? null,
         updated.effort ?? null,
+        JSON.stringify({ policy: updated.executionPolicy, evidence: updated.executionEvidence }),
         updated.providerSessionId ?? null,
         updated.status,
         updated.latestResponse ?? null,
@@ -264,6 +274,7 @@ export function createLocalAgentStore(stateDir: string): LocalAgentStore {
 }
 
 function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
+  const execution = row.execution_json ? JSON.parse(row.execution_json) : {};
   return {
     id: row.id,
     workspaceId: row.workspace_id ?? undefined,
@@ -271,6 +282,8 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     profileName: row.profile_name,
     provider: row.provider,
     model: row.model ?? undefined,
+    executionPolicy: execution.policy === undefined ? undefined : executionPolicySchema.parse(execution.policy),
+    executionEvidence: execution.evidence === undefined ? undefined : executionEvidenceSchema.parse(execution.evidence),
     effort: row.effort ?? undefined,
     providerSessionId: row.provider_session_id ?? undefined,
     status: readStatus(row.status),

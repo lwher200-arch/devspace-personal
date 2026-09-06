@@ -1,5 +1,6 @@
+import { lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 export class AccessDeniedError extends Error {
   constructor(message: string) {
@@ -25,7 +26,7 @@ export function isPathInsideRoot(path: string, root: string): boolean {
   return (
     relationship === "" ||
     (!isAbsolute(relationship) &&
-      !relationship.startsWith("..") &&
+      !relationship.startsWith(`..${sep}`) &&
       relationship !== ".." &&
       !relationship.includes(`..${sep}`))
   );
@@ -33,11 +34,38 @@ export function isPathInsideRoot(path: string, root: string): boolean {
 
 export function assertAllowedPath(path: string, allowedRoots: string[]): string {
   const resolvedPath = resolve(expandHomePath(path));
-  if (allowedRoots.some((root) => isPathInsideRoot(resolvedPath, root))) {
+  const matchingRoots = allowedRoots.filter((root) => isPathInsideRoot(resolvedPath, root));
+  if (matchingRoots.length && matchingRoots.some((root) =>
+    isPathInsideRoot(canonicalAllowedPath(resolvedPath), canonicalAllowedPath(root)))) {
     return resolvedPath;
   }
 
   throw new AccessDeniedError(`Path is outside allowed roots: ${path}`);
+}
+
+// Resolve existing ancestors too, so a new file cannot escape through a junction.
+// lstat distinguishes a genuinely missing suffix from an existing dangling link.
+export function canonicalAllowedPath(path: string): string {
+  let candidate = resolve(expandHomePath(path));
+  const missing: string[] = [];
+  while (true) {
+    let entry;
+    try {
+      entry = lstatSync(candidate);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = dirname(candidate);
+      if (parent === candidate) throw error;
+      missing.unshift(basename(candidate));
+      candidate = parent;
+      continue;
+    }
+    const physical = realpathSync(candidate);
+    if (missing.length && !entry.isDirectory() && !entry.isSymbolicLink()) {
+      throw new AccessDeniedError(`Parent is not a directory: ${candidate}`);
+    }
+    return resolve(physical, ...missing);
+  }
 }
 
 export function resolveAllowedPath(inputPath: string, cwd: string, allowedRoots: string[]): string {

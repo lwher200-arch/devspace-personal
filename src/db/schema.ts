@@ -100,6 +100,7 @@ export const localAgentSessions = sqliteTable(
     provider: text("provider").notNull(),
     model: text("model"),
     effort: text("effort"),
+    executionJson: text("execution_json"),
     providerSessionId: text("provider_session_id"),
     status: text("status").notNull(),
     latestResponse: text("latest_response"),

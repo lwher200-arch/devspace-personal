@@ -1,6 +1,7 @@
 import type { Result } from "better-result";
 import type { AgentProviderError } from "./local-agent-errors.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
+import type { CodexExecutionPolicy, CodexExecutionEvidence } from "./local-agent-execution.js";
 
 export type LocalAgentWriteMode = "read_only" | "allowed" | "full_access";
 
@@ -13,6 +14,7 @@ export interface LocalAgentRunInput {
   effort?: string;
   modelOverrideRequested?: boolean;
   effortOverrideRequested?: boolean;
+  executionPolicy?: CodexExecutionPolicy;
 }
 
 export interface LocalAgentRunResult {
@@ -20,6 +22,7 @@ export interface LocalAgentRunResult {
   providerSessionId: string | null;
   finalResponse: string;
   items: unknown[];
+  executionEvidence?: CodexExecutionEvidence;
 }
 
 export interface LocalAgentRunCallbacks {
@@ -40,6 +43,7 @@ export interface LocalAgentRuntimeContext {
   model?: string;
   effort?: string;
   agentDir?: string;
+  executionPolicy?: CodexExecutionPolicy;
 }
 
 /**

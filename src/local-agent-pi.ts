@@ -14,13 +14,8 @@ import type {
   LocalAgentRuntime,
   LocalAgentRuntimeContext,
 } from "./local-agent-runtime.js";
-import {
-  createPiSandboxExtension,
-  createPiSandboxModeRef,
-  registerPiSandboxSession,
-  releasePiSandboxSession,
-  updatePiSandboxSession,
-} from "./local-agent-pi-sandbox.js";
+// Loading the sandbox also loads Pi's SDK. Defer it until a Pi session is
+// used so unrelated providers and daemon control can start independently.
 
 const PI_READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
 const PI_WORKSPACE_TOOLS = ["read", "grep", "find", "ls", "edit", "write", "bash"] as const;
@@ -133,6 +128,7 @@ export class PiSessionRuntime implements LocalAgentRuntime {
     this.alive = false;
     this.unsubscribe();
     try {
+      const { releasePiSandboxSession } = await import("./local-agent-pi-sandbox.js");
       await releasePiSandboxSession(this.session);
     } finally {
       this.session.dispose();
@@ -140,6 +136,7 @@ export class PiSessionRuntime implements LocalAgentRuntime {
   }
 
   private async applyOverrides(input: LocalAgentRunInput): Promise<void> {
+    const { updatePiSandboxSession } = await import("./local-agent-pi-sandbox.js");
     await updatePiSandboxSession(this.session, input.workspaceRoot, input.writeMode ?? "allowed");
     this.session.setActiveToolsByName([...piToolsForWriteMode(input.writeMode)]);
     if (input.model) {
@@ -196,6 +193,12 @@ async function defaultPiSessionFactory(
   context: LocalAgentRuntimeContext,
   input: LocalAgentRunInput,
 ): Promise<PiSessionLike> {
+  const {
+    createPiSandboxExtension,
+    createPiSandboxModeRef,
+    registerPiSandboxSession,
+    releasePiSandboxSession,
+  } = await import("./local-agent-pi-sandbox.js");
   const {
     AuthStorage,
     ModelRegistry,

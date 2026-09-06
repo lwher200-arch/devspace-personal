@@ -168,6 +168,7 @@ export class LocalAgentDaemon {
       activeTurns: this.manager.activeTurnCount,
       runtimeCount: this.manager.runtimeCount,
       clientConnections: this.sockets.size,
+      executionPolicyVersion: 1,
     };
   }
 

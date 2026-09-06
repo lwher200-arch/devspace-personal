@@ -29,6 +29,7 @@ const manager = new LocalAgentManager({
   allowedRoots: config.allowedRoots,
   logger: log,
   subagents: config.subagents,
+  codexExecutionPolicy: config.bridge?.enabled ? config.bridge.executionPolicy : undefined,
 });
 const daemon = new LocalAgentDaemon({
   stateDir: paths.stateDir,

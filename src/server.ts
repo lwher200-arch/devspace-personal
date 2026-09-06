@@ -22,6 +22,8 @@ import {
   registerArtifactTools,
 } from "./artifact-tools.js";
 import { loadConfig, type ServerConfig } from "./config.js";
+import { CodexBridge, registerCodexBridgeTools } from "./codex-bridge.js";
+import { registerProjectTools } from "./project-tools.js";
 import {
   createOpenAIIncomingArtifactAdapter,
   type IncomingArtifactAdapter,
@@ -285,6 +287,7 @@ export function createMcpServer(
   processSessions: ProcessSessionManager,
   resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
+  codexBridge?: CodexBridge,
 ): McpServer {
   const toolSurface = getToolSurface(config.toolMode);
   const server = new McpServer(
@@ -372,6 +375,7 @@ export function createMcpServer(
           .optional(),
         agentsFiles: z.array(workspaceAgentsFileOutputSchema).optional(),
         availableAgentsFiles: z.array(workspaceAvailableAgentsFileOutputSchema).optional(),
+        contextDiscoveryTruncated: z.boolean().optional(),
         skills: z.array(workspaceSkillOutputSchema).optional(),
         agentProviders: z.array(workspaceLocalAgentProviderOutputSchema).optional(),
         agents: z.array(workspaceLocalAgentOutputSchema).optional(),
@@ -394,6 +398,7 @@ export function createMcpServer(
         workspace,
         agentsFiles,
         availableAgentsFiles,
+        contextDiscoveryTruncated,
         workspaceReused,
         includeBootstrapContext,
       } = await workspaces.openWorkspace(
@@ -466,6 +471,9 @@ export function createMcpServer(
             availableAgentsFileOutputs.length > 0
               ? `Available nested instructions: ${availableAgentsFileOutputs.map((file) => file.path).join(", ")}`
               : undefined,
+            contextDiscoveryTruncated
+              ? "Nested instruction discovery reached its scan budget. Before editing a target directory, inspect its ancestor AGENTS.md and CLAUDE.md files; absence from this partial list is not proof that none exist."
+              : undefined,
             visibleSkills.length > 0
               ? `Available skills: ${visibleSkills.map((skill) => skill.name).join(", ")}`
               : undefined,
@@ -527,6 +535,7 @@ export function createMcpServer(
             ? {
                 agentsFiles: loadedAgentsFiles,
                 availableAgentsFiles: availableAgentsFileOutputs,
+                contextDiscoveryTruncated,
                 skills: visibleSkills,
                 agentProviders: visibleAgentProviders,
                 agents: visibleAgents,
@@ -626,6 +635,7 @@ export function createMcpServer(
     workspaces,
     processSessions,
   });
+  registerProjectTools({ server, config, workspaces, processSessions });
 
   registerAppTool(
     server,
@@ -699,6 +709,7 @@ export function createMcpServer(
     });
   }
 
+  if (codexBridge) registerCodexBridgeTools(server, workspaces, codexBridge);
   return server;
 }
 
@@ -732,6 +743,7 @@ export function createServer(
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
+  const codexBridge = config.bridge?.enabled ? new CodexBridge(config) : undefined;
   const localAgentProviders = buildLocalAgentProviderStatuses(
     config.subagents,
     getLocalAgentProviderAvailabilitySnapshot(),
@@ -773,7 +785,7 @@ export function createServer(
   sessionCleanupTimer.unref();
 
   if (config.logging.trustProxy) {
-    app.set("trust proxy", true);
+    app.set("trust proxy", config.logging.trustProxy);
   }
 
   app.use((req, res, next) => {
@@ -901,6 +913,7 @@ export function createServer(
           processSessions,
           resolveLocalAgentProviders,
           incomingArtifactAdapters,
+          codexBridge,
         );
         await server.connect(transport);
       } else {
@@ -933,6 +946,7 @@ export function createServer(
         processSessions.shutdown();
         oauthProvider.close();
         workspaceStore.close?.();
+        codexBridge?.close();
       })();
       return closePromise;
     },

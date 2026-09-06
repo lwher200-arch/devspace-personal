@@ -10,7 +10,7 @@ export interface LoggingConfig {
   assets: boolean;
   toolCalls: boolean;
   shellCommands: boolean;
-  trustProxy: boolean;
+  trustProxy: boolean | "loopback";
 }
 
 type LogFields = Record<string, unknown>;
@@ -52,7 +52,8 @@ export function logEvent(
   }
 }
 
-export function requestIp(req: Request, trustProxy: boolean): string | undefined {
+export function requestIp(req: Request, trustProxy: boolean | "loopback"): string | undefined {
+  if (trustProxy === "loopback") return req.ip ?? req.socket.remoteAddress;
   if (trustProxy) {
     const cfConnectingIp = firstHeaderValue(req.header("cf-connecting-ip"));
     if (cfConnectingIp) return cfConnectingIp;

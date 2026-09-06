@@ -77,6 +77,17 @@ test("opening a missing checkout creates its workspace root", async (t) => {
   assert.equal((await stat(missingRoot)).isDirectory(), true);
 });
 
+test("nested instruction discovery skips virtual environments and caches", async (t) => {
+  const context = await fixture(t);
+  for (const name of [".venv", ".venv-dependency-audit", "__pycache__", ".pytest_cache"]) {
+    await mkdir(join(context.root, name));
+    await writeFile(join(context.root, name, "AGENTS.md"), "generated environment instructions");
+  }
+  const result = await context.registry.openWorkspace(context.root);
+  assert.deepEqual(result.availableAgentsFiles.map(file => file.path), [join(context.root, "nested", "AGENTS.md")]);
+  assert.equal(result.contextDiscoveryTruncated, false);
+});
+
 test("worktree opens require Git and create an isolated managed workspace", async (t) => {
   const context = await fixture(t);
 

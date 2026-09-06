@@ -3,6 +3,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { ServerConfig } from "./config.js";
+import type { LocalAgentWriteMode } from "./local-agent-runtime.js";
 
 export type LocalAgentProvider = "codex" | "claude" | "opencode" | "pi" | "cursor" | "copilot" | "grok";
 
@@ -22,6 +23,7 @@ export interface LocalAgentProfile {
   provider: LocalAgentProvider;
   model?: string;
   effort?: string;
+  writeMode?: Exclude<LocalAgentWriteMode, "full_access">;
   filePath: string;
   body: string;
   disabled: boolean;
@@ -148,6 +150,7 @@ function profileFromFrontmatter(
     provider,
     model: readString(frontmatter, "model"),
     effort: readString(frontmatter, "effort"),
+    writeMode: readWriteMode(frontmatter, filePath),
     filePath,
     body,
     disabled: frontmatter.disabled === true,
@@ -165,6 +168,16 @@ function readProvider(frontmatter: Record<string, unknown>, filePath: string): L
     );
   }
   return provider as LocalAgentProvider;
+}
+
+function readWriteMode(
+  frontmatter: Record<string, unknown>,
+  filePath: string,
+): LocalAgentProfile["writeMode"] {
+  const value = frontmatter.writeMode;
+  if (value === undefined) return undefined;
+  if (value === "read_only" || value === "allowed") return value;
+  throw new Error(`Subagent profile writeMode must be read_only or allowed: ${filePath}`);
 }
 
 export function isLocalAgentProvider(value: string): value is LocalAgentProvider {

@@ -24,3 +24,22 @@ function isDevspaceNodeModulesBin(pathEntry: string): boolean {
     return false;
   }
 }
+
+export function normalizeCommandPathEnvironment(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  const next = { ...env };
+  if (platform !== "win32") return next;
+
+  // Cloning process.env loses Windows' case-insensitive lookup. Match the
+  // child-process environment so command discovery and execution use one PATH.
+  for (const name of ["PATH", "PATHEXT"]) {
+    const aliases = Object.keys(next).filter((key) => key.toUpperCase() === name).sort();
+    if (!aliases.length) continue;
+    const value = next[aliases[0]];
+    for (const alias of aliases) delete next[alias];
+    next[name] = value;
+  }
+  return next;
+}

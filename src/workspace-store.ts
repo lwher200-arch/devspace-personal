@@ -41,6 +41,8 @@ export interface WorkspaceStore {
     managed?: boolean;
   }): WorkspaceSession;
   getSession(id: string): WorkspaceSession | undefined;
+  getRootAnchor?(id: string): string | undefined;
+  setRootAnchor?(id: string, canonicalRoot: string): void;
   touchSession(id: string): void;
   getConversationBinding(
     conversationScopeId: string,
@@ -61,6 +63,19 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
 
   constructor(stateDir: string) {
     this.database = openDatabase(stateDir);
+    this.database.sqlite.exec(`CREATE TABLE IF NOT EXISTS workspace_root_anchors (
+      workspace_id TEXT PRIMARY KEY REFERENCES workspace_sessions(id) ON DELETE CASCADE,
+      canonical_root TEXT NOT NULL
+    )`);
+  }
+
+  getRootAnchor(id: string): string | undefined {
+    return (this.database.sqlite.prepare("SELECT canonical_root FROM workspace_root_anchors WHERE workspace_id = ?").get(id) as
+      { canonical_root: string } | undefined)?.canonical_root;
+  }
+
+  setRootAnchor(id: string, canonicalRoot: string): void {
+    this.database.sqlite.prepare("INSERT INTO workspace_root_anchors (workspace_id, canonical_root) VALUES (?, ?)").run(id, canonicalRoot);
   }
 
   createSession(input: {

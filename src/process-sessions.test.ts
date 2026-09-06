@@ -119,8 +119,12 @@ const defaultInputResult = await manager.write({
   sessionId: defaultInteractive.sessionId,
   chars: "hello\n",
 });
-assert.equal(defaultInputResult.running, false);
-assert.match(defaultInputResult.output, /default-input:hello/);
+// The default 250 ms interaction wait is bounded, not a process-exit guarantee.
+const defaultInputCompletion = defaultInputResult.running
+  ? await manager.write({ workspaceId: "workspace-a", sessionId: defaultInteractive.sessionId, yieldTimeMs: 2_000 })
+  : defaultInputResult;
+assert.equal(defaultInputCompletion.running, false);
+assert.match(defaultInputResult.output + defaultInputCompletion.output, /default-input:hello/);
 
 const noisyInteractive = await manager.start({
   workspaceId: "workspace-a",

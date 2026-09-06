@@ -17,7 +17,7 @@ import {
 
 type CodexRegistration = (context: ToolRegistrationContext) => void;
 
-const CODEX_INSTRUCTIONS = `Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Commands run with the local user's authority and are not sandboxed; workspace validation only selects their initial working directory. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.`;
+const CODEX_INSTRUCTIONS = `Use project_files and project_search for bounded project discovery, ${toolNames.read} for direct file reads, and project_read for exact paginated text with SHA-256. Follow continuation cursors and report coverage exclusions. Use apply_patch for all file modifications; prefer dryRun and expectedHashes covering every affected source and destination when editing shared files. Use exec_command for tests, builds, and other commands, and write_stdin to poll or interact with running processes. Commands run with the local user's authority and are not sandboxed; workspace validation only selects their initial working directory. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.`;
 
 export function codexInstructions(): string {
   return CODEX_INSTRUCTIONS;
@@ -81,7 +81,7 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
     {
       title: "Apply patch",
       description:
-        "Apply one Codex-style patch in a workspace. Supports adding, overwriting, updating, deleting, and moving files. Use this for all file modifications. Paths must be relative to the workspace.",
+        "Apply one Codex-style patch in a workspace. Supports adding, overwriting, updating, deleting, and moving files. Use this for all file modifications. Paths must be relative to the workspace. Prefer dryRun and expectedHashes to detect stale content before edits. Preflight is not an OS-atomic multi-file transaction; inspect state if a filesystem write fails.",
       inputSchema: {
         workspaceId: z.string().describe(workspaceIdDescription),
         patch: z
@@ -89,10 +89,14 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
           .describe(
             "Patch text enclosed by *** Begin Patch and *** End Patch markers.",
           ),
+        dryRun: z.boolean().optional().describe("Validate and preview the patch without writing. Defaults to false."),
+        expectedHashes: z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/).nullable()).optional()
+          .describe("If provided, cover every affected source and destination. Use SHA-256 from project_read, or null if the path must not exist. Any mismatch rejects before writes."),
       },
       outputSchema: resultOutputSchema({
         additions: z.number(),
         removals: z.number(),
+        dryRun: z.boolean(),
         files: z.array(
           z.object({
             path: z.string(),
@@ -103,7 +107,7 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
       }),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, patch }) => {
+    async ({ workspaceId, patch, dryRun, expectedHashes }) => {
       const startedAt = performance.now();
       const applied = await runLoggedToolOperation(
         config,
@@ -111,11 +115,11 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
         startedAt,
         async () => {
           const workspace = workspaces.getWorkspace(workspaceId);
-          return applyPatch(workspace.root, patch);
+          return applyPatch(workspace.root, patch, { dryRun, expectedHashes });
         },
       );
       const paths = applied.files.map((file) => file.path).join(", ");
-      const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
+      const result = `${applied.dryRun ? "Validated (not applied)" : "Applied"} patch to ${applied.files.length} file(s): ${paths}`;
       const content = [textBlock(result)];
 
       return {
@@ -124,6 +128,7 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
           result,
           additions: applied.additions,
           removals: applied.removals,
+          dryRun: applied.dryRun,
           files: applied.files,
         },
       };

@@ -311,6 +311,13 @@ export class LocalAgentClient {
   ): Promise<BetterResult<unknown, RequestError<M>>> {
     const ready = await this.ensureReady();
     if (ready.isErr()) return ready as BetterResult<unknown, RequestError<M>>;
+    const policy = method === "agent.start"
+      ? (params as StartLocalAgentInput).executionPolicy
+      : method === "agent.continue" ? (params as { overrides?: RunOverrides }).overrides?.executionPolicy : undefined;
+    if (policy && ready.value.executionPolicyVersion !== 1) {
+      return Result.err(new AgentDaemonProtocolMismatchError({ code: "DAEMON_PROTOCOL_MISMATCH", operation: method,
+        retryable: false, message: "The running daemon cannot enforce model execution policies. Stop it after active turns finish and restart the updated daemon." })) as BetterResult<unknown, RequestError<M>>;
+    }
     const authToken = this.authTokenResult(method);
     if (authToken.isErr()) return authToken as BetterResult<unknown, RequestError<M>>;
     const response = await sendRequest(this.endpoint, {

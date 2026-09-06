@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { access, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
@@ -18,6 +18,12 @@ export interface ApplyPatchResult {
   patch: string;
   additions: number;
   removals: number;
+  dryRun: boolean;
+}
+
+export interface ApplyPatchOptions {
+  dryRun?: boolean;
+  expectedHashes?: Record<string, string | null>;
 }
 
 interface HunkLine {
@@ -252,7 +258,8 @@ function findSequence(haystack: string[], needle: string[], from: number, endOfF
 }
 
 function applyHunks(path: string, content: string, hunks: UpdateHunk[]): string {
-  const file = splitFile(content);
+  const bom = content.startsWith("\ufeff") ? "\ufeff" : "";
+  const file = splitFile(bom ? content.slice(1) : content);
   const lines = [...file.lines];
   let cursor = 0;
 
@@ -285,7 +292,7 @@ function applyHunks(path: string, content: string, hunks: UpdateHunk[]): string 
   }
 
   const normalized = `${lines.join("\n")}\n`;
-  return file.eol === "\r\n" ? normalized.replace(/\n/g, "\r\n") : normalized;
+  return bom + (file.eol === "\r\n" ? normalized.replace(/\n/g, "\r\n") : normalized);
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -340,16 +347,22 @@ export async function isSamePatchFile(
   }
 }
 
-export async function applyPatch(root: string, patch: string): Promise<ApplyPatchResult> {
+export async function applyPatch(root: string, patch: string, options: ApplyPatchOptions = {}): Promise<ApplyPatchResult> {
+  const originalRoot = root;
+  root = await realpath(root);
+  const rootIdentity = await stat(root);
   const actions = parsePatch(patch);
   const results: AppliedPatchFile[] = [];
   const patches: string[] = [];
   const staged = new Map<string, StagedTextFile>();
+  const originals = new Map<string, string | null>();
+  const fingerprint = (file: StagedTextFile) => file === null ? null : createHash("sha256").update(file.content).digest("hex");
 
   const readStagedOptional = async (absolute: string, displayPath: string): Promise<StagedTextFile> => {
     if (staged.has(absolute)) return staged.get(absolute) ?? null;
     const file = await readOptionalTextFile(absolute, displayPath);
     staged.set(absolute, file);
+    originals.set(absolute, fingerprint(file));
     return file;
   };
 
@@ -396,17 +409,44 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
     }
   }
 
+  if (options.expectedHashes !== undefined) {
+    const expected = new Map<string, string | null>();
+    for (const [path, value] of Object.entries(options.expectedHashes)) {
+      if (value !== null && !/^[a-f0-9]{64}$/.test(value)) throw patchError(`invalid SHA-256 for ${path}`);
+      const absolute = await resolveConfinedPath(root, path);
+      if (!originals.has(absolute) || expected.has(absolute)) throw patchError(`hash path is duplicated or not affected: ${path}`);
+      expected.set(absolute, value);
+    }
+    for (const [absolute, observed] of originals) {
+      const path = relative(root, absolute);
+      if (!expected.has(absolute)) throw patchError(`missing expected hash for ${path}; cover every affected source and destination`);
+      if (expected.get(absolute) !== observed) throw patchError(`file hash changed: ${path}; read again before editing`);
+    }
+  }
+  const currentRoot = await stat(originalRoot);
+  if (await realpath(originalRoot) !== root || currentRoot.dev !== rootIdentity.dev || currentRoot.ino !== rootIdentity.ino) {
+    throw patchError("workspace root changed during patch preparation");
+  }
+  // Check all initial contents before any write; this is not an OS-atomic multi-file transaction.
+  for (const [absolute, observed] of originals) {
+    const path = relative(root, absolute);
+    await resolveConfinedPath(root, path);
+    if (fingerprint(await readOptionalTextFile(absolute, path)) !== observed) throw patchError(`file changed during patch preparation: ${path}`);
+  }
+  const unifiedPatch = patches.filter(Boolean).join("\n");
+  const result = { files: results, patch: unifiedPatch, ...countPatchStats(unifiedPatch), dryRun: options.dryRun === true };
+  if (options.dryRun) return result;
+
   for (const [absolute, file] of staged) {
+    await resolveConfinedPath(root, relative(root, absolute));
     if (file) await writeTextFile(absolute, file.content, file.mode);
   }
 
   for (const [absolute, file] of staged) {
+    await resolveConfinedPath(root, relative(root, absolute));
     if (!file) await rm(absolute, { force: true });
   }
-
-  const unifiedPatch = patches.filter(Boolean).join("\n");
-  const stats = countPatchStats(unifiedPatch);
-  return { files: results, patch: unifiedPatch, ...stats };
+  return result;
 }
 
 async function readOptionalTextFile(absolute: string, displayPath: string): Promise<TextFile | null> {
@@ -420,7 +460,7 @@ async function readUtf8Text(absolute: string, displayPath: string): Promise<stri
   const bytes = await readFile(absolute);
   let content: string;
   try {
-    content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
     throw patchError(`file is not valid UTF-8 text: ${displayPath}`);
   }

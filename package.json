@@ -35,6 +35,8 @@
     "schema:config": "tsx scripts/generate-config-schema.ts",
     "start": "node dist/cli.js serve",
     "test": "tsx --test --test-concurrency=1 \"src/**/*.test.ts\"",
+    "test:deploy": "node --test scripts/deploy.test.mjs",
+    "deploy:local": "node scripts/deploy.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "keywords": [],

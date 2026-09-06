@@ -83,24 +83,32 @@ flowchart TD
 
 详细说明见 [架构与请求流](docs/architecture.md) 和 [核心模块](docs/core-modules.md)。
 
-## 从源码开始
+## 一键本地部署
 
-使用 `package.json` 声明的 Node 与 pnpm 版本，并准备 Git 和兼容 Shell。
+先安装满足 `package.json` 要求的 Node.js（包含 npm）和 Git，再克隆或下载本仓库。
+
+- **Windows：** 解压后双击根目录的 `deploy.cmd`。
+- **macOS / Linux：** 在仓库目录运行 `sh deploy.sh`。
+- **通用命令：** 在仓库目录运行 `npm run deploy:local`。
+
+入口会按五个阶段显示进度：检查环境、安装依赖并构建、引导选择项目与端口、
+启动本地服务、核验健康状态。无需预先全局安装 pnpm，必要时会使用声明的固定版本。
+
+首次配置只面向本地 MCP，不要求先购买域名或创建隧道，也不会自动开启代理推理。
+已有配置和凭据默认复用；端口占用时拒绝覆盖；构建产物先暂存再替换，旧构建保留。
 
 ```sh
-git clone https://github.com/lwher200-arch/devspace-personal.git
-cd devspace-personal
-pnpm install --frozen-lockfile
-pnpm typecheck
-pnpm test
-pnpm build
-node bin/devspace.js init
-node bin/devspace.js serve
+# 只检查，不安装、不改配置、不启动
+node scripts/deploy.mjs --check
+
+# 安装/构建及配置完成后退出，不启动服务
+node scripts/deploy.mjs --no-start
 ```
 
-生产配置在运行环境中单独创建，不随源码公开。需要远程访问时，自行配置 HTTPS
-入口；默认本机服务端口为 `7676`，MCP 路径为 `/mcp`。以上入口使用当前源码
-构建，不依赖另行安装同名发行包。完整步骤见 [部署与使用](docs/setup.md)。
+服务在当前终端前台运行，按 `Ctrl+C` 停止。此入口不注册开机任务，不修改系统
+网络或全局模型配置。ChatGPT 网页的远程接入仍需要另行配置 HTTPS 和 OAuth。
+
+完整准备条件、每一步怎么选、重新构建及失败恢复见 [部署与步骤引导](docs/setup.md)。
 
 ## 公开信息边界
 

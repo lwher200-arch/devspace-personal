@@ -12,6 +12,18 @@
 工具 schema 更新、运行服务更新与宿主缓存刷新是不同步骤。接口是否可见，
 必须与一次实际调用的结果区分。
 
+## 本地部署入口
+
+位置：[deploy.mjs](../scripts/deploy.mjs)、[local-server.mjs](../scripts/local-server.mjs)、
+[deploy.cmd](../deploy.cmd)、[deploy.sh](../deploy.sh)。
+
+部署器在尚未安装依赖时只使用 Node 内置模块。它复用 `init --local` 和现有配置
+读写、应用创建与关闭模块，不另建认证或工作区状态。候选构建通过检查后才替换
+`dist`；前台子进程通过本机 IPC 报告就绪，随后执行 HTTP 健康验证。
+
+已有配置不自动重置，旧格式或不完整配置需要明确处理。就绪只证明本地服务
+启动，不代表公网、模型或项目全量读写都已验收。
+
 ## 配置与认证
 
 位置：[config-schema.ts](../src/config-schema.ts)、[config.ts](../src/config.ts)、

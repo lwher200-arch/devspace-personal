@@ -7,6 +7,7 @@ releases/
 # Private deployment files and generated acceptance artifacts are local only.
 /scripts/windows/
 /.runtime/
+/.devspace-deploy.lock
 /backups/
 .env.*
 !.env.example

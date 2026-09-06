@@ -5,12 +5,17 @@
 
 ## 入口与依赖
 
+使用一键入口时，先运行 `node scripts/deploy.mjs --check`，再按失败阶段处理。
+它不会自动安装系统软件、修改全局 PATH 或重置已有配置。更多步骤见
+[部署与使用](setup.md)。
+
 ```sh
 node --version
 node bin/devspace.js doctor
 ```
 
-确认 Node、Git、兼容 Shell 和原生依赖匹配。更换 Node 后原生模块可能需要
+确认 Node、Git、实际命令执行器和原生依赖匹配。Windows 命令通道使用系统
+命令处理器；可选提供方可能另外要求 Bash。更换 Node 后原生模块可能需要
 重新安装或构建；不要默认删除环境或改变系统权限。
 
 ## 本机正常，公网不可达

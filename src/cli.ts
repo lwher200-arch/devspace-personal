@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
 import { stdin as input, stdout as output } from "node:process";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import type { Result as BetterResult } from "better-result";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
@@ -43,6 +43,8 @@ import {
   updateOnboardingSubagentsConfig,
   usesChatGpt,
   usesCodingAgents,
+  parseLocalSetupPort,
+  parseLocalSetupRoots,
 } from "./onboarding.js";
 import {
   generateOwnerToken,
@@ -81,7 +83,8 @@ async function main(argv: string[]): Promise<void> {
       await serve();
       return;
     case "init":
-      await runInit({ force: args.includes("--force") });
+      if (args.some(arg => arg !== "--force" && arg !== "--local")) throw new Error("Usage: devspace init [--local] [--force]");
+      await runInit({ force: args.includes("--force"), local: args.includes("--local") });
       return;
     case "doctor":
       await runDoctor();
@@ -150,18 +153,22 @@ async function ensureConfigured(): Promise<void> {
   await runInit({ force: false });
 }
 
-async function runInit({ force }: { force: boolean }): Promise<void> {
+async function runInit({ force, local = false }: { force: boolean; local?: boolean }): Promise<void> {
   const files = loadDevspaceFiles();
   if (!force && files.configExists && files.authExists) {
     prompts.log.info(`DevSpace is already configured at ${files.dir}`);
     prompts.log.info("Run `devspace init --force` to update it.");
     return;
   }
+  if (local && !force && (files.configExists || files.authExists)) {
+    throw new Error("Local setup found incomplete existing configuration. Inspect it explicitly; no files were reset.");
+  }
 
   try {
-    prompts.intro("DevSpace setup");
+    prompts.intro(local ? "DevSpace local setup (no public tunnel required)" : "DevSpace setup");
+    if (local) prompts.note("File tools can read and modify approved projects. Commands run with your OS account's authority. Only authorize trusted MCP clients.", "Local access boundary");
 
-    const destinationAnswer = await prompts.multiselect({
+    const destinationAnswer = local ? ["chatgpt"] : await prompts.multiselect({
       message: "Where will you use DevSpace?",
       options: [
         {
@@ -190,18 +197,30 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
         message: `Which project folders can DevSpace access? Press Enter to use ${defaultRoots}`,
         placeholder: defaultRoots,
         defaultValue: defaultRoots,
-        validate: (value) => value?.trim() ? undefined : "Enter at least one project root.",
+        validate: (value) => {
+          if (!local) return value?.trim() ? undefined : "Enter at least one project root.";
+          try { parseLocalSetupRoots(value ?? ""); return undefined; }
+          catch { return "Choose existing project directories, separated by commas."; }
+        },
       });
-      allowedRoots = rootsAnswer
+      allowedRoots = local ? parseLocalSetupRoots(rootsAnswer) : rootsAnswer
         .split(",")
         .map((root) => resolve(expandHomePath(root.trim())))
         .filter(Boolean);
     }
 
-    const port = files.config.server.port;
+    const port = local ? parseLocalSetupPort(await textPrompt({
+      message: "Local HTTP port (1-65535)",
+      defaultValue: String(files.config.server.port),
+      placeholder: String(files.config.server.port),
+      validate: value => {
+        try { parseLocalSetupPort(value ?? ""); return undefined; }
+        catch (error) { return error instanceof Error ? error.message : "Invalid port."; }
+      },
+    })) : files.config.server.port;
 
     let publicBaseUrl: string | null = null;
-    if (useChatGpt) {
+    if (useChatGpt && !local) {
       prompts.note(
         [
           `Point your HTTPS tunnel or reverse proxy to http://127.0.0.1:${port}.`,
@@ -222,7 +241,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     }
 
     const currentSubagents = files.config.subagents;
-    const availability = getLocalAgentProviderAvailabilitySnapshot();
+    const availability = local ? [] : getLocalAgentProviderAvailabilitySnapshot();
     const configuredProviders = currentSubagents.providers
       .filter((provider) => provider.enabled)
       .map((provider) => provider.id);
@@ -231,7 +250,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       : availability
           .filter((provider) => provider.available)
           .map((provider) => provider.name);
-    const providerAnswer = await prompts.multiselect({
+    const providerAnswer = local ? [] : await prompts.multiselect({
       message: "Which Coding Agents should be available?",
       options: availability.map((provider) => ({
         value: provider.name,
@@ -245,17 +264,24 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     });
     if (prompts.isCancel(providerAnswer)) throw new SetupCancelledError();
     const selectedProviders = providerAnswer as LocalAgentProvider[];
-    const subagents = updateOnboardingSubagentsConfig(
+    const subagents = local ? currentSubagents : updateOnboardingSubagentsConfig(
       currentSubagents,
       selectedProviders,
     );
 
     const auth = {
-      ownerToken: files.auth.ownerToken ?? generateOwnerToken(),
+      ...files.auth,
+      ownerToken: files.auth.ownerToken ?? (local ? process.env.DEVSPACE_OAUTH_OWNER_TOKEN : undefined) ?? generateOwnerToken(),
     };
+    if (local) loadConfig({ ...process.env, DEVSPACE_OAUTH_OWNER_TOKEN: auth.ownerToken });
 
     setDevspaceConfigValues([
       { path: ["server", "port"], value: port },
+      ...(local ? [{ path: ["server", "host"], value: "127.0.0.1" }] : []),
+      ...(local && !files.configExists ? [
+        { path: ["storage", "stateDir"], value: join(files.dir, "state") },
+        { path: ["workspaces", "worktreeRoot"], value: join(files.dir, "worktrees") },
+      ] : []),
       ...(useChatGpt
         ? [{ path: ["server", "publicBaseUrl"], value: publicBaseUrl }]
         : []),
@@ -268,7 +294,8 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
 
     const lines = [
       ...(allowedRoots ? [`Project folders: ${allowedRoots.join(", ")}`] : []),
-      `Coding Agents: ${selectedProviders.join(", ")}`,
+      local ? "Existing provider and bridge permissions were preserved; new local setup does not enable agents." : `Coding Agents: ${selectedProviders.join(", ")}`,
+      ...(local ? [`Local MCP URL: http://127.0.0.1:${port}/mcp`, "Remote ChatGPT access requires a separate HTTPS endpoint."] : []),
       ...(publicBaseUrl ? [`ChatGPT connection URL: ${publicBaseUrl}/mcp`] : []),
     ];
     prompts.note(lines.join("\n"), "DevSpace is ready");
@@ -292,7 +319,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       );
     }
     const nextSteps = [
-      useChatGpt ? "Run `devspace serve`, then connect ChatGPT." : undefined,
+      local ? "Run `devspace serve` for local MCP. Configure HTTPS separately when needed." : useChatGpt ? "Run `devspace serve`, then connect ChatGPT." : undefined,
       useCodingAgents ? "Run the skill command above before delegating from your Coding Agents." : undefined,
     ].filter(Boolean).join(" ");
     prompts.outro(nextSteps);
@@ -417,7 +444,7 @@ function printHelp(): void {
       "Usage:",
       "  devspace                 Run first-time setup if needed, then start the server",
       "  devspace serve           Start the server",
-      "  devspace init            Create or update ~/.devspace/config.jsonc and auth.json",
+      "  devspace init [--local] [--force]  Configure access; --local needs no tunnel and enables no agents",
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",

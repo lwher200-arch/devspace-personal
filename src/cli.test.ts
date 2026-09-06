@@ -219,7 +219,7 @@ try {
     assert.equal(payload.error.retryable, false);
     assert.equal(payload.error.target, "missing");
 
-    const filePrompt = '  请审查 Eterna。\r\n"quoted" \'literal\' > & | < %PATH% $HOME `no` $(no) ! ^ --json\n';
+    const filePrompt = '  请审查示例项目。\r\n"quoted" \'literal\' > & | < %PATH% $HOME `no` $(no) ! ^ --json\n';
     writeFileSync(join(projectRoot, "中文 brief.txt"), filePrompt, "utf8");
     const runPromptCommand = (args: string[], workspaceRoot = projectRoot) => execFileAsync(
       "node", ["--import", tsxLoader, cliPath, "agents", ...args], {

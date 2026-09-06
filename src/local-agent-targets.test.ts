@@ -178,7 +178,7 @@ try {
   const outside = join(promptRoot, "outside");
   mkdirSync(workspace);
   mkdirSync(outside);
-  const content = '\uFEFF  请审查 Eterna。\r\n保留 "双引号"、\'单引号\'、`反引号`。\nStability > Speed & echo no | no < no %PATH% $HOME $(no) ^ ! --json\n';
+  const content = '\uFEFF  请审查示例项目。\r\n保留 "双引号"、\'单引号\'、`反引号`。\nStability > Speed & echo no | no < no %PATH% $HOME $(no) ^ ! --json\n';
   writeFileSync(join(workspace, "中文 brief.txt"), content, "utf8");
   const readPrompt = (promptFile: string) => resolveLocalAgentPrompt({ prompt: "", promptFile }, workspace);
   assert.equal(await readPrompt("中文 brief.txt"), content);

@@ -39,6 +39,7 @@ Run `devspace init` to create both files. `devspace config set publicBaseUrl
   },
   "tools": {
     "mode": "codex",
+    "authorization": "owner_approval",
   },
   "ui": {
     "enabled": true,

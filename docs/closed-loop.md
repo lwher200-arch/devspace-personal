@@ -26,6 +26,18 @@ connector tools refreshed after deploying the extension.
 
 ## Permissions
 
+For per-operation Owner confirmation and opt-in Astra/Sol routing, see
+[Authorization and routing](authorization.md). OAuth connection consent alone
+does not approve each high-risk operation when `tools.authorization` is
+`owner_approval`.
+
+For Codex start/continue, the reviewed approval page submits exactly one turn
+when the user approves. It then shows a task receipt; no Chat retry is needed to
+start execution. Use `codex_tasks` to recover the ID and `codex_task_status` for
+the result. Older clients retrying the identical request receive the receipt,
+not a second execution. This does not wake a stopped Chat host or create a new
+conversation turn. Other high-risk tools keep their exact-retry approval flow.
+
 Default `writeMode` is `read_only`. `allowed` requires both a user-requested edit
 and `bridge.allowWorkspaceWrite` enabled by the local administrator. The bridge
 never accepts `full_access`. Existing OAuth, allowed roots, and Codex sandbox
@@ -49,8 +61,15 @@ Pass `model` explicitly on every protected MCP start and continuation. MCP-launc
 `devspace agents run/continue` commands also receive this policy and must specify
 `--model`. A protected durable task retains its policy; it cannot be removed or
 replaced on continuation. Existing unprotected calls keep their legacy defaults.
-An older daemon without `executionPolicyVersion: 1` is rejected before delivery;
+An older daemon without `executionPolicyVersion >= 1` is rejected before delivery;
 stop an idle old daemon explicitly before deploying the updated implementation.
+
+The single-model form above remains supported. An `allowedModels` list plus
+`routing` enables explicit selection or deterministic `auto` routing and requires
+daemon policy capability version 2. The exact selected model must match runtime
+evidence even when another model is also allowed. Routing never retries an
+executed/failed turn on a different model. Existing pinned tasks retain their
+policy; start a new task after changing the allowed-model policy.
 
 `codex_preflight` reports the actual resolver output, policy and informational
 provider default. It does not start inference or prove account model access.

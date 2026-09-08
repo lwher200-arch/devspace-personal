@@ -314,7 +314,8 @@ export class LocalAgentClient {
     const policy = method === "agent.start"
       ? (params as StartLocalAgentInput).executionPolicy
       : method === "agent.continue" ? (params as { overrides?: RunOverrides }).overrides?.executionPolicy : undefined;
-    if (policy && ready.value.executionPolicyVersion !== 1) {
+    const requiredPolicyVersion = policy?.allowedModels || policy?.routing ? 2 : 1;
+    if (policy && (ready.value.executionPolicyVersion ?? 0) < requiredPolicyVersion) {
       return Result.err(new AgentDaemonProtocolMismatchError({ code: "DAEMON_PROTOCOL_MISMATCH", operation: method,
         retryable: false, message: "The running daemon cannot enforce model execution policies. Stop it after active turns finish and restart the updated daemon." })) as BetterResult<unknown, RequestError<M>>;
     }

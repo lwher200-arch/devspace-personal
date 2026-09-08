@@ -52,6 +52,7 @@ import {
   setDevspaceConfigValue,
   setDevspaceConfigValues,
   writeDevspaceAuth,
+  acquireInitializationLock,
 } from "./user-config.js";
 import { assertAllowedPath, expandHomePath } from "./roots.js";
 import { runProjectCommand } from "./project-tools.js";
@@ -154,6 +155,12 @@ async function ensureConfigured(): Promise<void> {
 }
 
 async function runInit({ force, local = false }: { force: boolean; local?: boolean }): Promise<void> {
+  const release = acquireInitializationLock();
+  try { await runLockedInit({ force, local }); }
+  finally { release(); }
+}
+
+async function runLockedInit({ force, local }: { force: boolean; local: boolean }): Promise<void> {
   const files = loadDevspaceFiles();
   if (!force && files.configExists && files.authExists) {
     prompts.log.info(`DevSpace is already configured at ${files.dir}`);
@@ -275,10 +282,16 @@ async function runInit({ force, local = false }: { force: boolean; local?: boole
     };
     if (local) loadConfig({ ...process.env, DEVSPACE_OAUTH_OWNER_TOKEN: auth.ownerToken });
 
+    const latest = loadDevspaceFiles();
+    if (JSON.stringify([latest.config, latest.auth, latest.configExists, latest.authExists]) !==
+        JSON.stringify([files.config, files.auth, files.configExists, files.authExists])) {
+      throw new Error('Configuration changed while setup was open; no setup values were written. Restart setup.');
+    }
     setDevspaceConfigValues([
       { path: ["server", "port"], value: port },
       ...(local ? [{ path: ["server", "host"], value: "127.0.0.1" }] : []),
       ...(local && !files.configExists ? [
+        { path: ['tools', 'authorization'], value: 'owner_approval' },
         { path: ["storage", "stateDir"], value: join(files.dir, "state") },
         { path: ["workspaces", "worktreeRoot"], value: join(files.dir, "worktrees") },
       ] : []),

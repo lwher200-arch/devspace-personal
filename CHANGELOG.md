@@ -1,0 +1,12 @@
+# Development Log
+
+## 2026-09-08 - Owner-approved Codex submission (L3)
+
+- Current State: The Owner form only issued a grant. Codex work remained unsubmitted until the host retried the request. Related authorization, routing and deployment protections were present locally but not yet published.
+- Changes: Owner approval now submits one reviewed Codex start/continue operation, then redirects to a status page. Exact legacy retries return the scoped receipt, not another execution. Shared schema validation and existing durable bridge deduplication are reused. Added browser, lifecycle and authenticated MCP regression coverage and updated usage documentation.
+- Root Cause: The approval state transition was not connected to the existing Codex submission path. A regression test reproduced zero submissions after a valid decision before the fix.
+- Impact: Only Owner-gated Codex start/continue automatically dispatch. Original OAuth validity and workspace/model context are rechecked. Shell and other high-risk operations retain their exact-retry flow. No autonomous chat loop or permission expansion was added.
+- Tests: Relevant baseline 9 passed. Full source regression 156 passed, 0 failed, 5 skipped; the two browser cases were separately enabled with installed Chrome and both passed. Deployment/package tests 17 passed. Typecheck, candidate build, deployed health/discovery and native-plugin hash read passed. Unit/MCP dispatch tests use a fixture provider; browser tests use inert callbacks, not production Owner credentials.
+- Compatibility: Tool names, inputs, legacy authorization mode and provider sandbox limits are retained. Owner-gated Codex approval intentionally changes from grant-only to submit-on-approval, visibly disclosed before confirmation. Older host retries receive a receipt. Pending grants expire on restart; durable tasks do not replay.
+- Known Risks: A stopped Chat host cannot be automatically awakened. Final results still need task-status retrieval. New live human-approved model execution, reboot, non-Chromium browsers and long-duration reliability were not exercised for this version. Platform-specific cases remained skipped; Pi sandbox integration self-skipped for missing platform dependencies. Build warnings about large UI chunks remain. Hosted CI must be checked independently of local tests.
+- Next Highest-Leverage Step: Validate a separately scoped human-approved write-and-test task through the real host, checking exact runtime model, sandbox, file diff and test output.

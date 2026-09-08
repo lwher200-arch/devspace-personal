@@ -3,11 +3,22 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { assertExecutionSelection, readCodexTurnEvidence } from "./local-agent-execution.js";
+import { assertExecutionSelection, readCodexTurnEvidence, selectExecutionModel, executionPolicySchema, sameExecutionPolicy } from "./local-agent-execution.js";
 import { loadConfig } from "./config.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 
 const policy = { requiredModel: "gpt-6-astra", minimumCliVersion: "0.153.0" };
+test('dual-model routing is explicit, deterministic and cannot expand its allowlist', () => {
+  const routed = { ...policy, allowedModels:['gpt-6-astra','gpt-5.6-sol'], routing:{routineModel:'gpt-5.6-sol',complexModel:'gpt-6-astra'} };
+  assert.equal(selectExecutionModel(routed,'auto','Fix a typo').model,'gpt-5.6-sol');
+  assert.equal(selectExecutionModel(routed,undefined,'Security architecture review').model,'gpt-6-astra');
+  assert.equal(selectExecutionModel(routed,'gpt-5.6-sol','Security review').reason,'explicit');
+  assert.throws(()=>selectExecutionModel(routed,'gpt-5.5','test'),/explicit model/);
+  assert.throws(()=>selectExecutionModel(policy,'auto','test'),/explicit model/);
+  for(const model of routed.allowedModels) assert.doesNotThrow(()=>assertExecutionSelection(routed,model,'0.153.4'));
+  assert.equal(sameExecutionPolicy(policy,routed),false);
+  assert.throws(()=>executionPolicySchema.parse({...routed,routing:{routineModel:'unapproved',complexModel:'gpt-6-astra'}}),/allowlist/);
+});
 test("persisted configuration carries the bridge execution policy without changing provider defaults", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-policy-config-"));
   t.after(() => rm(root, { recursive: true, force: true }));

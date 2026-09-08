@@ -31,7 +31,7 @@ import {
 } from "./local-agent-runtime.js";
 import { LocalAgentRuntimePool } from "./local-agent-runtime-pool.js";
 import { assertAllowedPath } from "./roots.js";
-import { assertExecutionSelection, executionEvidenceSchema, executionPolicySchema, type CodexExecutionPolicy } from "./local-agent-execution.js";
+import { assertExecutionSelection, executionEvidenceSchema, executionPolicySchema, approvedModels, selectExecutionModel, sameExecutionPolicy, type CodexExecutionPolicy } from "./local-agent-execution.js";
 import {
   isSubagentProviderEnabled,
   type SubagentsConfig,
@@ -152,6 +152,8 @@ export class LocalAgentManager {
         return Result.err(new AgentTargetError({ code: "TARGET_RESOLUTION_FAILED", target: input.target,
           retryable: false, message: "The MCP Codex execution policy cannot be overridden." }));
       }
+      const selected = yield* manager.modelSelectionResult(executionPolicy, input.model, input.prompt);
+      if (selected) { input = { ...input, model: selected }; target.model = selected; }
       yield* manager.executionPolicyResult(target.provider, executionPolicy, input.model);
       yield* manager.driverResult(target.provider, "start");
       const record = yield* manager.store.createResult({
@@ -201,11 +203,12 @@ export class LocalAgentManager {
       }
       overrides = { ...overrides, executionPolicy: serverPolicy ?? overrides.executionPolicy };
       if (record.executionPolicy && overrides.executionPolicy &&
-        (record.executionPolicy.requiredModel !== overrides.executionPolicy.requiredModel ||
-         record.executionPolicy.minimumCliVersion !== overrides.executionPolicy.minimumCliVersion)) {
+        !samePolicy(record.executionPolicy, overrides.executionPolicy)) {
         return Result.err(new AgentTargetError({ code: "TARGET_RESOLUTION_FAILED", target: record.profileName,
           retryable: false, message: "A stored execution policy cannot be replaced or weakened." }));
       }
+      const selected = yield* manager.modelSelectionResult(record.executionPolicy ?? overrides.executionPolicy, overrides.model, prompt);
+      if (selected) overrides = { ...overrides, model: selected };
       yield* manager.executionPolicyResult(record.provider, record.executionPolicy ?? overrides.executionPolicy, overrides.model);
       return manager.begin(record, prompt, overrides, scope.workspaceId);
     });
@@ -374,7 +377,7 @@ export class LocalAgentManager {
         try {
           const evidence = executionEvidenceSchema.parse(runResult.executionEvidence);
           assertExecutionSelection(input.value.executionPolicy, evidence.runtimeModel, evidence.cliVersion);
-          if (evidence.requestedModel !== input.value.model || evidence.sessionModel !== input.value.model ||
+          if (evidence.requestedModel !== input.value.model || evidence.sessionModel !== input.value.model || evidence.runtimeModel !== input.value.model ||
             evidence.threadId !== runResult.providerSessionId || evidence.sandbox !== (input.value.writeMode === "allowed" ? "workspaceWrite" : "readOnly")) {
             throw new Error("Execution evidence does not match the requested turn.");
           }
@@ -492,12 +495,18 @@ export class LocalAgentManager {
     if (!policy) return Result.ok(undefined);
     try {
       executionPolicySchema.parse(policy);
-      if (provider !== "codex" || model !== policy.requiredModel) throw new Error();
+      if (provider !== "codex" || !model || !approvedModels(policy).includes(model)) throw new Error();
       return Result.ok(undefined);
     } catch {
       return Result.err(new AgentTargetError({ code: "TARGET_RESOLUTION_FAILED", target: provider,
         retryable: false, message: `Execution policy requires an explicit Codex model ${policy.requiredModel} on every start and continuation.` }));
     }
+  }
+
+  private modelSelectionResult(policy: CodexExecutionPolicy | undefined, model: string | undefined, prompt: string): BetterResult<string | undefined, AgentTargetError> {
+    try { return Result.ok(policy ? selectExecutionModel(policy, model, prompt).model : model); }
+    catch (error) { return Result.err(new AgentTargetError({ code: 'TARGET_RESOLUTION_FAILED', target: 'codex', retryable: false,
+      message: error instanceof Error ? error.message : 'Model selection failed.' })); }
   }
 
   private profileForRecordResult(
@@ -668,7 +677,7 @@ export class LocalAgentManager {
 }
 
 function samePolicy(left: CodexExecutionPolicy, right: CodexExecutionPolicy): boolean {
-  return left.requiredModel === right.requiredModel && left.minimumCliVersion === right.minimumCliVersion;
+  return sameExecutionPolicy(left, right);
 }
 
 export function createLocalAgentManager(options: LocalAgentManagerOptions): LocalAgentManager {

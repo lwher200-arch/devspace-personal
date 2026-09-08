@@ -7,6 +7,18 @@ import test from "node:test";
 import { promisify } from "node:util";
 import { projectFiles, projectRead, projectSearch } from "./project-access.js";
 
+test('credential directories cannot leak through ordinary Git or filesystem search', async t => {
+  const root=await mkdtemp(join(tmpdir(),'devspace-credential-search-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  await promisify(execFile)('git',['init'],{cwd:root,windowsHide:true});
+  for(const dir of ['.ssh','.AWS','.codex-api']) {await mkdir(join(root,dir));await writeFile(join(root,dir,'config'),'PRIVATE_CREDENTIAL_FIXTURE');}
+  await writeFile(join(root,'ordinary.txt'),'ordinary');
+  for(const includeIgnored of [false,true]) {
+    const files=await projectFiles(root,{includeIgnored});assert.deepEqual(files.files,['ordinary.txt']);
+    assert.equal((await projectSearch(root,{includeIgnored,query:'PRIVATE_CREDENTIAL_FIXTURE'})).matches.length,0);
+  }
+});
+
 test("Git discovery includes tracked and new code, exposes ignored-file policy, and skips deleted paths", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-project-git-"));
   t.after(() => rm(root, { recursive: true, force: true }));

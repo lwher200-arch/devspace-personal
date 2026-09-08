@@ -11,7 +11,7 @@ import type { LocalAgentRecord, LocalAgentWorkspaceScope } from "./local-agent-s
 import type { WorkspaceRegistry } from "./workspaces.js";
 import { canonicalAllowedPath } from "./roots.js";
 import { resolveCodexCommand, type CodexCommandResolver } from "./local-agent-codex.js";
-import { assertExecutionSelection, executionEvidenceSchema, type CodexExecutionPolicy } from "./local-agent-execution.js";
+import { assertExecutionSelection, executionEvidenceSchema, approvedModels, selectExecutionModel, type CodexExecutionPolicy } from "./local-agent-execution.js";
 
 type AgentClient = Pick<LocalAgentClient, "start" | "continue" | "get" | "list">;
 type WriteMode = "read_only" | "allowed";
@@ -42,9 +42,9 @@ export class CodexBridge {
     const policy = this.config.bridge?.executionPolicy;
     if (policy) assertExecutionSelection(policy, policy.requiredModel, command?.version);
     if (!command?.version) throw new Error("Codex executable/version evidence is unavailable.");
-    return { command, executionPolicy: policy, configuredProviderModel: this.config.subagents.providers.find(provider => provider.id === "codex")?.model,
+    return { command, executionPolicy: policy, approvedModels: policy ? approvedModels(policy) : undefined, configuredProviderModel: this.config.subagents.providers.find(provider => provider.id === "codex")?.model,
       modelAvailabilityChecked: false, inferenceStarted: false,
-      instruction: "This is executable/configuration preflight only. Use executionPolicy.requiredModel when present, not the informational provider default. Supply model explicitly on start/continue; the worker verifies its actual runtime, model availability and completed-turn evidence." };
+      instruction: "Executable/configuration preflight only. Choose an approved model, or auto when routing is configured. The worker verifies actual model availability and exact completed-turn evidence. Routing never changes permissions or retries a failed task on another model." };
   }
 
   async submit(scope: LocalAgentWorkspaceScope, input: {
@@ -55,7 +55,8 @@ export class CodexBridge {
     model?: string;
   }) {
     const policy = this.config.bridge?.executionPolicy;
-    if (policy && input.model !== policy.requiredModel) throw new Error(`Supply explicit model ${policy.requiredModel}; no inherited or fallback model is allowed.`);
+    const routing = policy ? selectExecutionModel(policy, input.model, input.prompt) : undefined;
+    if (routing) input = { ...input, model: routing.model };
     if (input.writeMode === "allowed" && !this.config.bridge?.allowWorkspaceWrite) {
       throw new Error("Workspace writes are disabled in the local bridge configuration.");
     }
@@ -100,7 +101,7 @@ export class CodexBridge {
         this.database.sqlite.prepare(
           "UPDATE bridge_requests SET agent_id = ?, state = 'accepted' WHERE request_hash = ?",
         ).run(result.value.id, key);
-        return observation(result.value, policy);
+        return { ...observation(result.value, policy), ...(routing ? { routing } : {}) };
       } catch (error) {
         this.database.sqlite.prepare("UPDATE bridge_requests SET state = 'uncertain' WHERE request_hash = ?").run(key);
         throw new Error(`Task delivery could not be confirmed. Use codex_tasks to reconcile before retrying. ${error instanceof Error ? error.message : "Unknown error"}`);
@@ -148,8 +149,8 @@ function observation(record: LocalAgentRecord, policy?: CodexExecutionPolicy) {
     try {
       const evidence = executionEvidenceSchema.parse(record.executionEvidence);
       assertExecutionSelection(policy, evidence.runtimeModel, evidence.cliVersion);
-      if (evidence.requestedModel !== policy.requiredModel || evidence.sessionModel !== policy.requiredModel ||
-        evidence.threadId !== record.providerSessionId || record.model !== policy.requiredModel) throw new Error();
+      if (evidence.requestedModel !== record.model || evidence.sessionModel !== record.model || evidence.runtimeModel !== record.model ||
+        evidence.threadId !== record.providerSessionId) throw new Error();
     } catch {
       return { id: record.id, status: "failed" as const, requestedModel: record.model,
         error: { code: "MODEL_EVIDENCE_UNAVAILABLE", message: "Stored result has no matching approved runtime model evidence; historical/unverified output is withheld.", retryable: false },
@@ -168,19 +169,34 @@ function observation(record: LocalAgentRecord, policy?: CodexExecutionPolicy) {
   };
 }
 
-export function registerCodexBridgeTools(server: McpServer, workspaces: WorkspaceRegistry, bridge: CodexBridge): void {
-  const scope = (workspaceId: string): LocalAgentWorkspaceScope => {
-    const workspace = workspaces.getWorkspace(workspaceId);
-    return { workspaceId: workspace.id, workspaceRoot: workspace.root };
-  };
-  const submission = {
+const submission = {
     workspaceId: z.string().min(1),
     requestKey: z.string().min(1).max(160).describe("Unique key for this user-requested task or follow-up; reuse exactly on transport retries."),
     prompt: z.string().trim().min(1).max(16000),
     model: z.string().trim().min(1).max(128).optional()
-      .describe("Explicit Codex model for this turn. Required when the server has an execution policy, including continuations. Never infer it from the Chat model or a historical session."),
+      .describe("Explicit approved Codex model, or auto for configured routine/complex routing. Omission routes only when routing is enabled. Selection is independent of Chat model and grants no extra permissions."),
     writeMode: z.enum(["read_only", "allowed"]).default("read_only")
       .describe("Default read_only. Use allowed only when the user asked Codex to modify this workspace. Full-access is never available."),
+};
+const startSubmission = z.object(submission);
+const continueSubmission = z.object({ ...submission, agentId: z.string().min(1).max(160) });
+
+// Both MCP dispatch and Owner-approved dispatch share validation and delivery.
+export function parseCodexSubmission(tool: string, args: unknown) {
+  if (tool === 'codex_task_start') return startSubmission.parse(args);
+  if (tool === 'codex_task_continue') return continueSubmission.parse(args);
+  throw new Error('Not a Codex submission tool.');
+}
+export function submitCodexTool(bridge: CodexBridge, workspaces: WorkspaceRegistry, tool: string, args: unknown) {
+  const { workspaceId, ...input } = parseCodexSubmission(tool, args);
+  const workspace = workspaces.getWorkspace(workspaceId);
+  return bridge.submit({ workspaceId: workspace.id, workspaceRoot: workspace.root }, input);
+}
+
+export function registerCodexBridgeTools(server: McpServer, workspaces: WorkspaceRegistry, bridge: CodexBridge): void {
+  const scope = (workspaceId: string): LocalAgentWorkspaceScope => {
+    const workspace = workspaces.getWorkspace(workspaceId);
+    return { workspaceId: workspace.id, workspaceRoot: workspace.root };
   };
   const respond = async (run: () => Promise<unknown>) => {
     try {
@@ -196,17 +212,17 @@ export function registerCodexBridgeTools(server: McpServer, workspaces: Workspac
     inputSchema: { workspaceId: z.string() }, outputSchema: { result: z.string() }, annotations: { readOnlyHint: true, openWorldHint: false },
   }, ({ workspaceId }) => respond(async () => { scope(workspaceId); return bridge.preflight(); }));
   server.registerTool("codex_task_start", {
-    description: "Start one user-requested task in local Codex. Returns a durable task ID immediately. Then use codex_task_status to obtain the result and return it to this conversation. Never start an autonomous conversation loop.",
+    description: "Start one user-requested task in local Codex. With Owner approval enabled, show approvalUrl: the user's approval automatically submits exactly this turn. Use the returned task ID with codex_task_status, or recover it with codex_tasks. Do not create another request after approval. Never start an autonomous conversation loop.",
     inputSchema: submission,
     outputSchema: { result: z.string() },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-  }, ({ workspaceId, ...input }) => respond(() => bridge.submit(scope(workspaceId), input)));
+  }, (input) => respond(() => submitCodexTool(bridge, workspaces, 'codex_task_start', input)));
   server.registerTool("codex_task_continue", {
-    description: "Give an existing Codex task one explicit follow-up, preserving its context. Wait for the previous turn to complete. Use a new requestKey for each new follow-up, not for transport retries.",
-    inputSchema: { ...submission, agentId: z.string().min(1).max(160) },
+    description: "Give an existing Codex task one explicit follow-up, preserving its context. Owner approval automatically submits this turn when enabled; then query status, not another submission. Wait for the previous turn to complete. Use a new requestKey for each new follow-up, not for transport retries.",
+    inputSchema: continueSubmission.shape,
     outputSchema: { result: z.string() },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-  }, ({ workspaceId, ...input }) => respond(() => bridge.submit(scope(workspaceId), input)));
+  }, (input) => respond(() => submitCodexTool(bridge, workspaces, 'codex_task_continue', input)));
   server.registerTool("codex_task_status", {
     description: "Read a Codex task result. Bounded wait up to 20 seconds. Report failed/stopped states honestly; do not treat an accepted task as completed work.",
     inputSchema: { workspaceId: z.string(), agentId: z.string(), waitSeconds: z.number().int().min(0).max(20).default(0) },

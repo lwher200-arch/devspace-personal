@@ -4,13 +4,14 @@ import { lstatSync } from "node:fs";
 import { opendir, open, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
-import { assertAllowedPath, canonicalAllowedPath } from "./roots.js";
+import { assertAllowedPath, canonicalAllowedPath, PRIVATE_CREDENTIAL_DIRECTORIES } from "./roots.js";
 
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const SKIP_DIRS = new Set([
   ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
   ".pytest_cache", ".mypy_cache", ".ruff_cache", ".next", ".vs", ".claude",
   ".codex_tmp", ".runtime", "uv_cache", "dist", "build", "target",
+  ...PRIVATE_CREDENTIAL_DIRECTORIES,
 ]);
 const SKIP_ROOT_DIRS = new Set(["SystemLogs", "logs", "output", "outputs"]);
 type Skip = { path: string; reason: string };
@@ -49,7 +50,7 @@ async function inventory(root: string, path = ".", includeIgnored = false) {
   const coverage: Coverage = { complete: true, source: "filesystem", visited: 0, skippedCount: 0, skipped: [],
     exclusions: [...SKIP_DIRS, "root logs/outputs", "likely credential filenames", "symlinks/junctions"] };
   const prefix = relative(canonicalAllowedPath(root), scope).replace(/\\/g, "/");
-  const explicitlyExcludedScope = prefix.split("/").some(part => SKIP_DIRS.has(part) || SKIP_ROOT_DIRS.has(part));
+  const explicitlyExcludedScope = prefix.split("/").some(part => SKIP_DIRS.has(part.toLowerCase()) || SKIP_ROOT_DIRS.has(part));
   if (!includeIgnored && !explicitlyExcludedScope) {
     let candidates: string[] | undefined;
     try {
@@ -72,7 +73,7 @@ async function inventory(root: string, path = ".", includeIgnored = false) {
         if (prefix && !name.startsWith(`${prefix}/`)) continue;
         if (++coverage.visited > 100000 || Date.now() >= deadline) { coverage.complete = false; break; }
         const parts = name.split("/");
-        if (parts.slice(0, -1).some((part, index) => SKIP_DIRS.has(part) || /^\.venv[-_]/i.test(part) || (index === 0 && SKIP_ROOT_DIRS.has(part)))) {
+        if (parts.slice(0, -1).some((part, index) => SKIP_DIRS.has(part.toLowerCase()) || /^\.venv[-_]/i.test(part) || (index === 0 && SKIP_ROOT_DIRS.has(part)))) {
           skip(coverage, name, "excluded directory"); continue;
         }
         if (sensitive(parts.at(-1)!)) { skip(coverage, name, "likely credential filename"); continue; }
@@ -112,7 +113,7 @@ async function inventory(root: string, path = ".", includeIgnored = false) {
         const name = relative(resolve(root), resolve(root, directory, entry.name)).replace(/\\/g, "/");
         if (entry.isSymbolicLink()) { skip(coverage, name, "symlink"); continue; }
         if (entry.isDirectory()) {
-          if (SKIP_DIRS.has(entry.name) || /^\.venv[-_]/i.test(entry.name) ||
+          if (SKIP_DIRS.has(entry.name.toLowerCase()) || /^\.venv[-_]/i.test(entry.name) ||
             (directory === "." && SKIP_ROOT_DIRS.has(entry.name))) { skip(coverage, name, "excluded directory"); continue; }
           pending.push(name);
         } else if (entry.isFile()) {

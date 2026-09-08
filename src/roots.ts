@@ -2,6 +2,10 @@ import { lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
+export const PRIVATE_CREDENTIAL_DIRECTORIES: readonly string[] = Object.freeze([
+  '.ssh', '.aws', '.azure', '.gnupg', '.kube', '.codex', '.codex-api',
+]);
+
 export class AccessDeniedError extends Error {
   constructor(message: string) {
     super(message);

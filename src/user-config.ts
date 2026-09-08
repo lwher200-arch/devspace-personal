@@ -1,12 +1,17 @@
 import { randomBytes } from "node:crypto";
 import {
   existsSync,
+  closeSync,
+  openSync,
+  lstatSync,
+  fstatSync,
   linkSync,
   mkdirSync,
   readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
+  unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -152,6 +157,25 @@ export function generateOwnerToken(): string {
   return randomBytes(32).toString("base64url");
 }
 
+export function acquireInitializationLock(env: NodeJS.ProcessEnv = process.env): () => void {
+  const dir = devspaceConfigDir(env);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, '.init.lock');
+  let fd: number;
+  try { fd = openSync(path, 'wx', 0o600); }
+  catch { throw new Error('Configuration initialization is locked. Finish the other setup first; inspect a stale lock before removing it.'); }
+  const identity = fstatSync(fd);
+  try { writeFileSync(fd, String(process.pid)); }
+  catch (error) { closeSync(fd); unlinkSync(path); throw error; }
+  return () => {
+    closeSync(fd);
+    if (existsSync(path)) {
+      const current = lstatSync(path);
+      if (current.dev === identity.dev && current.ino === identity.ino) unlinkSync(path);
+    }
+  };
+}
+
 function migrateLegacyConfigFile(
   legacyPath: string,
   configPath: string,
@@ -256,7 +280,7 @@ function readJsonFile<T>(filePath: string, schema: z.ZodType<T>): T {
 }
 
 function writeJsonFile(filePath: string, value: unknown, mode: number): void {
-  writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, { mode });
+  atomicWrite(filePath, `${JSON.stringify(value, null, 2)}\n`, mode);
 }
 
 function fileError(action: "read" | "migrate", filePath: string, error: unknown): Error {

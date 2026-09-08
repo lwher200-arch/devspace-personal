@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 import { parseLocalSetupPort, parseLocalSetupRoots } from "./onboarding.js";
 import { loadConfig } from "./config.js";
-import { writeDevspaceConfig, writeDevspaceAuth } from "./user-config.js";
+import { writeDevspaceConfig, writeDevspaceAuth, acquireInitializationLock } from "./user-config.js";
 
 const exec = promisify(execFile);
 const cli = fileURLToPath(new URL("./cli.ts", import.meta.url));
@@ -24,7 +24,7 @@ test("local setup validates explicit roots and ports", t => {
   assert.equal(parseLocalSetupPort(" 8787 "), 8787);
 });
 
-for (const mode of ["fresh", "environment", "invalid-environment", "existing", "cancelled", "partial"] as const) {
+for (const mode of ["fresh", "environment", "invalid-environment", "existing", "cancelled", "partial", "locked"] as const) {
   test(`real CLI local initialization: ${mode}`, async t => {
     const root = mkdtempSync(join(tmpdir(), "devspace-local-init-"));
     t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -48,7 +48,13 @@ export const text=async options=>{const value=answers.shift();if(value!=='CANCEL
     }
     const before = mode === "existing" || mode === "partial" ? readFileSync(join(configDir, "config.jsonc"), "utf8") : undefined;
     const action = () => exec(process.execPath, ["--import", tsx, "--import", pathToFileURL(hook).href, cli, "init", "--local"], { cwd: project, env, timeout: 30000, windowsHide: true });
-    if (mode === "partial" || mode === "invalid-environment") {
+    if (mode === 'locked') {
+      const release = acquireInitializationLock(env);
+      try { await assert.rejects(action,/initialization is locked/); assert.equal(existsSync(join(configDir,'auth.json')),false); }
+      finally { release(); }
+      await action();
+      assert.equal(loadConfig(env).toolAuthorization,'owner_approval');
+    } else if (mode === "partial" || mode === "invalid-environment") {
       await assert.rejects(action, mode === "partial" ? /incomplete existing configuration/ : /owner token/i);
       if (mode === "partial") assert.equal(readFileSync(join(configDir, "config.jsonc"), "utf8"), before);
       else assert.equal(existsSync(join(configDir, "config.jsonc")), false);

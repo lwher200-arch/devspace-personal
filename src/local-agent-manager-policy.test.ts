@@ -12,6 +12,29 @@ import { LocalAgentDaemon } from "./local-agent-daemon.js";
 import type { LocalAgentRunInput } from "./local-agent-runtime.js";
 
 const policy = { requiredModel: "gpt-6-astra", minimumCliVersion: "0.153.0" };
+test('manager routes new and continued turns while retaining a read-only profile ceiling', async t => {
+  const root=await mkdtemp(join(tmpdir(),'devspace-routed-manager-'));
+  const store=new LocalAgentStore(join(root,'state'));
+  const routed={...policy,allowedModels:['gpt-6-astra','gpt-5.6-sol'],routing:{routineModel:'gpt-5.6-sol',complexModel:'gpt-6-astra'}};
+  const inputs:LocalAgentRunInput[]=[];
+  const manager=new LocalAgentManager({store,pool:new LocalAgentRuntimePool(),codexExecutionPolicy:routed,
+    subagents:{enabled:true,providers:[{id:'codex',enabled:true}]},
+    loadProfiles:async()=>[{name:'reviewer',description:'fixture',provider:'codex',body:'Read only.',writeMode:'read_only',filePath:join(root,'reviewer.md'),disabled:false}],
+    drivers:[{provider:'codex',runtimeKey:c=>c.agentId,createRuntime:async()=>Result.ok({provider:'codex',isAlive:()=>true,close:async()=>{},releaseSession:async()=>{},
+      run:async input=>{inputs.push(input);return Result.ok({provider:'codex',providerSessionId:'fixture-thread',finalResponse:'done',items:[],executionEvidence:{
+        requestedModel:input.model!,sessionModel:input.model!,runtimeModel:input.model!,cliVersion:'0.153.4',executable:'fixture',threadId:'fixture-thread',turnId:String(inputs.length),
+        source:'codex-rollout/turn_context',sandbox:'readOnly',approvalPolicy:'never'}});}})}]});
+  t.after(async()=>{await manager.close();await rm(root,{recursive:true,force:true});});
+  const scope={workspaceId:'fixture-workspace',workspaceRoot:root};
+  const wait=async(id:string)=>{for(let i=0;i<200&&store.get(id)?.status==='running';i++)await new Promise(r=>setTimeout(r,5));return store.get(id)!;};
+  const start=await manager.start({...scope,target:'reviewer',prompt:'Correct a typo',model:'auto',writeMode:'allowed'});
+  assert.ok(start.isOk());if(start.isErr())return;
+  assert.equal((await wait(start.value.id)).executionEvidence?.runtimeModel,'gpt-5.6-sol');
+  assert.ok((await manager.continue(start.value.id,'Architecture review',{model:'auto',writeMode:'allowed'},scope)).isOk());
+  assert.equal((await wait(start.value.id)).executionEvidence?.runtimeModel,'gpt-6-astra');
+  assert.ok(inputs.every(input=>input.writeMode==='read_only'));
+  assert.ok((await manager.continue(start.value.id,'test',{model:'gpt-5.5'},scope)).isErr());
+});
 test("manager retains policy and evidence across persistence, protects reviewers, and rejects inherited resume models", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-manager-policy-"));
   const store = new LocalAgentStore(join(root, "state"));

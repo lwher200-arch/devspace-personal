@@ -107,6 +107,14 @@
             "claude",
             "codex"
           ]
+        },
+        "authorization": {
+          "default": "legacy",
+          "type": "string",
+          "enum": [
+            "legacy",
+            "owner_approval"
+          ]
         }
       },
       "additionalProperties": false
@@ -325,6 +333,35 @@
             "minimumCliVersion": {
               "type": "string",
               "pattern": "^\\d+\\.\\d+\\.\\d+$"
+            },
+            "allowedModels": {
+              "minItems": 1,
+              "maxItems": 8,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$"
+              }
+            },
+            "routing": {
+              "type": "object",
+              "properties": {
+                "routineModel": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "complexModel": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "routineModel",
+                "complexModel"
+              ],
+              "additionalProperties": false
             }
           },
           "required": [

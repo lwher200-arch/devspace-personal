@@ -18,14 +18,15 @@ import {appendFileSync,readFileSync,existsSync} from 'node:fs';
 import {join} from 'node:path';
 const scenario=process.env.SCENARIO;
 const home=process.env.CODEX_HOME;
+const selected=scenario==='sol'?'gpt-5.6-sol':'gpt-6-astra';
 const output=value=>process.stdout.write(JSON.stringify(value)+'\\n');
 let n=existsSync(join(home,'sessions','rollout.jsonl'))?readFileSync(join(home,'sessions','rollout.jsonl'),'utf8').trim().split('\\n').length:0;
 createInterface({input:process.stdin}).on('line',line=>{
  const message=JSON.parse(line);
  appendFileSync(join(home,'audit.jsonl'),JSON.stringify(message)+'\\n');
  if(message.method==='initialize') { if(scenario==='init_hang')return; output({id:message.id,result:{userAgent:'devspace/'+(scenario==='old_actual'?'0.152.0':'0.153.4'),codexHome:home}}); }
- if(message.method==='model/list')output({id:message.id,result:{data:scenario==='unavailable'?[]:[{model:'gpt-6-astra'}]}});
- if(message.method==='thread/start'||message.method==='thread/resume')output({id:message.id,result:{model:scenario==='wrong_session'?'gpt-5.6-sol':'gpt-6-astra',cwd:message.params.cwd,approvalPolicy:'never',sandbox:{type:scenario==='wrong_sandbox'?'dangerFullAccess':message.params.sandbox==='read-only'?'readOnly':'workspaceWrite'},thread:{id:'thread-fixture',path:join(home,'sessions','rollout.jsonl')}}});
+ if(message.method==='model/list')output({id:message.id,result:{data:scenario==='unavailable'?[]:[{model:selected}]}});
+ if(message.method==='thread/start'||message.method==='thread/resume')output({id:message.id,result:{model:scenario==='wrong_session'?'gpt-5.6-sol':selected,cwd:message.params.cwd,approvalPolicy:'never',sandbox:{type:scenario==='wrong_sandbox'?'dangerFullAccess':message.params.sandbox==='read-only'?'readOnly':'workspaceWrite'},thread:{id:'thread-fixture',path:join(home,'sessions','rollout.jsonl')}}});
  if(message.method==='turn/start'){
    const turnId='turn-'+(++n);
    if(scenario==='reroute_before_reply') {output({method:'model/rerouted',params:{threadId:'thread-fixture',turnId,fromModel:'gpt-6-astra',toModel:'gpt-5.6-sol',reason:'test'}});return;}
@@ -33,7 +34,7 @@ createInterface({input:process.stdin}).on('line',line=>{
    if(scenario==='turn_hang')return;
    setImmediate(()=>{
      if(scenario==='reroute')output({method:'model/rerouted',params:{threadId:'thread-fixture',turnId,fromModel:'gpt-6-astra',toModel:'gpt-5.6-sol',reason:'test'}});
-     if(scenario!=='missing_evidence')appendFileSync(join(home,'sessions','rollout.jsonl'),JSON.stringify({type:'turn_context',payload:{turn_id:turnId,model:scenario==='wrong_runtime'?'gpt-5.6-sol':'gpt-6-astra'}})+'\\n');
+     if(scenario!=='missing_evidence')appendFileSync(join(home,'sessions','rollout.jsonl'),JSON.stringify({type:'turn_context',payload:{turn_id:turnId,model:scenario==='wrong_runtime'?'gpt-5.6-sol':selected}})+'\\n');
      const item={type:'agentMessage',text:'I am gpt-6-astra. done'};
      output({method:'item/completed',params:{threadId:'thread-fixture',turnId,item}});
      output({method:'turn/completed',params:{threadId:'thread-fixture',turn:{id:turnId,status:scenario==='turn_failed'?'failed':'completed',items:[item]}}});
@@ -56,6 +57,17 @@ createInterface({input:process.stdin}).on('line',line=>{
   };
   return { root, home, command, runtime: createRuntime(), createRuntime };
 }
+
+test('dual-model policy verifies Sol execution but rejects an unrequested allowed model', async t => {
+  const routed = {...policy,allowedModels:['gpt-6-astra','gpt-5.6-sol']};
+  const sol = await fixture(t,'sol'); await sol.runtime.initialize();
+  const result = await sol.runtime.run({workspaceRoot:sol.root,prompt:'test',model:'gpt-5.6-sol',executionPolicy:routed,writeMode:'read_only'});
+  assert.ok(result.isOk(),result.isErr()?result.error.message:'');
+  if(result.isOk()) assert.equal(result.value.executionEvidence?.runtimeModel,'gpt-5.6-sol');
+  const mismatch = await fixture(t,'wrong_runtime'); await mismatch.runtime.initialize();
+  const wrong = await mismatch.runtime.run({workspaceRoot:mismatch.root,prompt:'test',model:'gpt-6-astra',executionPolicy:routed,writeMode:'read_only'});
+  assert.ok(wrong.isErr(),'an allowed but unrequested runtime model must still be rejected');
+});
 
 test("guarded Codex start and continuation carry the exact model and persisted turn evidence", async (t) => {
   const { runtime, root, home, createRuntime } = await fixture(t);

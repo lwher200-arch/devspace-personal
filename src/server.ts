@@ -22,8 +22,9 @@ import {
   registerArtifactTools,
 } from "./artifact-tools.js";
 import { loadConfig, type ServerConfig } from "./config.js";
-import { CodexBridge, registerCodexBridgeTools } from "./codex-bridge.js";
+import { CodexBridge, parseCodexSubmission, registerCodexBridgeTools, submitCodexTool } from "./codex-bridge.js";
 import { registerProjectTools } from "./project-tools.js";
+import { OwnerApprovals, classifyMcpOperation, installOwnerApprovalRoutes } from './mcp-authorization.js';
 import {
   createOpenAIIncomingArtifactAdapter,
   type IncomingArtifactAdapter,
@@ -111,7 +112,9 @@ function serverInstructions(
   const agents = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
   const common = `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected.`;
 
-  return `${common} ${toolSurface.instructions({ agents, skills })}${artifactInstruction}${showChangesInstruction}`;
+  const authorization = config.toolAuthorization === 'owner_approval'
+    ? ' High-risk operations require independent Owner approval. On OWNER_APPROVAL_REQUIRED, show approvalUrl to the user and stop; never ask for their password, approve on their behalf, disguise the operation, or switch tools to evade approval. Codex submissions execute once on user approval: recover the task with codex_tasks and query codex_task_status, rather than creating another request. Other operations require the exact retry after approval. Routine guarded patches remain available.' : '';
+  return `${common} ${toolSurface.instructions({ agents, skills })}${artifactInstruction}${showChangesInstruction}${authorization}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -715,6 +718,7 @@ export function createMcpServer(
 
 export interface CreateServerOptions {
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
+  codexBridgeFactory?: (config: ServerConfig) => CodexBridge;
 }
 
 export function createServer(
@@ -743,7 +747,9 @@ export function createServer(
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
-  const codexBridge = config.bridge?.enabled ? new CodexBridge(config) : undefined;
+  const approvals = config.toolAuthorization === 'owner_approval' ? new OwnerApprovals() : undefined;
+  if (approvals) installOwnerApprovalRoutes(app, config, approvals);
+  const codexBridge = config.bridge?.enabled ? (options.codexBridgeFactory?.(config) ?? new CodexBridge(config)) : undefined;
   const localAgentProviders = buildLocalAgentProviderStatuses(
     config.subagents,
     getLocalAgentProviderAvailabilitySnapshot(),
@@ -877,6 +883,57 @@ export function createServer(
     try {
       let transport: Transport | undefined;
 
+      if (approvals && Array.isArray(req.body)) { sendJsonRpcError(res, 400, -32600, 'Batch requests are not supported by the approval boundary.'); return; }
+      if (approvals && req.method === 'POST' && req.body?.method === 'tools/call') {
+        if (!sessionId || !transports.get(sessionId)) { sendJsonRpcError(res, 404, -32000, 'Unknown MCP session'); return; }
+        const tool = req.body.params?.name, args = req.body.params?.arguments ?? {};
+        if (typeof tool !== 'string' || !args || typeof args !== 'object' || Array.isArray(args) || req.body.id === undefined) { sendJsonRpcError(res, 400, -32600, 'Invalid tool request'); return; }
+        const automatic = codexBridge && ['codex_task_start', 'codex_task_continue'].includes(tool);
+        // Review the same normalized inputs the MCP schema will execute (for
+        // example, whitespace must not route the reviewed and actual models differently).
+        const executionArgs = automatic ? parseCodexSubmission(tool, args) : args;
+        const assessment = classifyMcpOperation(config, workspaces, tool, executionArgs);
+        if (assessment.reason) {
+          // Transport sessions can reconnect while the user approves in a browser.
+          // Retain the authenticated client and optional logical conversation scope.
+          const principal = JSON.stringify([req.auth!.clientId, openAiConversationScopeId(req.body.params?._meta) ?? null]);
+          const snapshot = structuredClone(executionArgs), originalAssessment = JSON.stringify(assessment);
+          const accessToken = req.auth!.token;
+          const decision = approvals.require({ principal, tool, args, ...assessment, reason: assessment.reason }, automatic ? async () => {
+            // The browser grants exactly the captured request, not a fresh request
+            // under a stale token, changed root, changed file or rerouted model.
+            try {
+              await oauthProvider.verifyAccessToken(accessToken);
+              if (JSON.stringify(classifyMcpOperation(config, workspaces, tool, snapshot)) !== originalAssessment) {
+                throw new Error('Approval context changed before dispatch.');
+              }
+              const result = await submitCodexTool(codexBridge, workspaces, tool, snapshot);
+              logEvent(config.logging, 'info', 'owner_approval_submitted', { tool, requestId, agentId: result.id });
+              return { agentId: result.id, workspaceId: String(snapshot.workspaceId) };
+            } catch (error) {
+              logEvent(config.logging, 'warn', 'owner_approval_submission_failed', { tool, requestId });
+              throw error;
+            }
+          } : undefined);
+          if (!decision.allowed) {
+            const entry = decision.approval;
+            if (['submitting', 'submitted', 'failed'].includes(entry.state)) {
+              const detail = { code: entry.state === 'submitted' ? 'OWNER_OPERATION_SUBMITTED' : entry.state === 'submitting' ? 'OWNER_OPERATION_SUBMITTING' : 'OWNER_SUBMISSION_UNCONFIRMED',
+                approvalId: entry.id, ...entry.submission,
+                instruction: entry.submission ? 'Already submitted once. Use codex_task_status with this workspaceId and agentId; do not create another request.' : 'Use codex_tasks for this workspace to reconcile submission; do not automatically resubmit.' };
+              res.json({ jsonrpc: '2.0', id: req.body.id, result: { ...(entry.state === 'failed' ? { isError: true } : {}),
+                content: [textBlock(JSON.stringify(detail))], structuredContent: { result: JSON.stringify(detail) } } }); return;
+            }
+            const detail = { code: entry.state === 'denied' ? 'OWNER_DENIED' : 'OWNER_APPROVAL_REQUIRED', approvalId: entry.id,
+              approvalUrl: new URL(`/owner/approvals/${entry.id}`, config.publicBaseUrl).href, expiresAt: new Date(entry.expires).toISOString(),
+              reason: entry.reason, executionMode: automatic ? 'submit_on_approval' : 'retry_after_approval',
+              instruction: `Ask the user to open this URL and approve with their Owner password. Never ask for the password in Chat or approve on their behalf. ${automatic ? 'Approval automatically submits exactly this Codex turn. Afterwards use codex_tasks and codex_task_status; an identical retry only recovers the submission receipt. Do not create a new request.' : 'Retry only the exact operation after approval.'} Approval grants no additional sandbox or directory access.` };
+            res.json({ jsonrpc: '2.0', id: req.body.id, result: { isError: true, content: [textBlock(JSON.stringify(detail))] } }); return;
+          }
+          logEvent(config.logging, 'info', 'owner_approval_consumed', { tool, requestId });
+        }
+      }
+
       if (sessionId) {
         transport = transports.get(sessionId);
         if (!transport) {
@@ -944,6 +1001,7 @@ export function createServer(
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
         processSessions.shutdown();
+        await approvals?.close();
         oauthProvider.close();
         workspaceStore.close?.();
         codexBridge?.close();

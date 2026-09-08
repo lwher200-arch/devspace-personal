@@ -135,6 +135,37 @@ test('stale builds require explicit rebuild and deployment is single-flight',asy
   release();assert.equal((await first).status,'prepared');
 });
 
+test('check and launch agree on Node freshness and corrupt markers support explicit rebuild',async t=>{
+  const root=fixture(t);built(root);const configDir=configured(root);
+  const marker=join(root,'dist/.deploy-manifest.json');
+  const value=JSON.parse(readFileSync(marker,'utf8'));value.node='0.0.0';writeFileSync(marker,JSON.stringify(value));
+  assert.equal((await deploy(parseOptions(['--check','--config-dir',configDir]),effects(root))).build,'stale');
+  writeFileSync(marker,'{"version":');
+  assert.equal((await deploy(parseOptions(['--check','--config-dir',configDir]),effects(root))).build,'invalid');
+  await assert.rejects(deploy(parseOptions(['--prepare-only','--config-dir',configDir]),effects(root)),/stale/);
+  let prepared=false;
+  await deploy(parseOptions(['--rebuild','--yes','--prepare-only','--config-dir',configDir]),effects(root,{prepare:async()=>{prepared=true;built(root);return {};}}));
+  assert.ok(prepared);
+});
+
+test('a listener appearing during build prevents actual dist promotion',async t=>{
+  const root=fixture(t);built(root);const configDir=configured(root);writeFileSync(join(root,'dist/old.txt'),'old');
+  const listener=createServer(socket=>socket.end());await new Promise(r=>listener.listen(0,'127.0.0.1',r));
+  const config={host:'127.0.0.1',port:listener.address().port};await new Promise(r=>listener.close(r));
+  let calls=0;
+  const run=async(_cmd,args)=>{
+    if(++calls===1)await new Promise(r=>listener.listen(config.port,config.host,r));
+    if(args.includes('--outDir')){const output=args[args.indexOf('--outDir')+1];
+      if(args.includes('build')){mkdirSync(join(output,'.vite'),{recursive:true});writeFileSync(join(output,'.vite/manifest.json'),'{}');}
+      else for(const file of required.filter(f=>!f.startsWith('ui/')))writeFileSync(join(output,file),'// new');}
+  };
+  try {
+    await assert.rejects(deploy(parseOptions(['--rebuild','--yes','--config-dir',configDir]),effects(root,{load:async()=>config,busy:portBusy,run,
+      prepare:(r,p,e,run,_verify,before)=>buildCandidate(r,p,e,run,async()=>{},before)})),/became occupied/);
+    assert.equal(readFileSync(join(root,'dist/old.txt'),'utf8'),'old');assert.equal(await portBusy(config),true);
+  } finally {if(listener.listening)await new Promise(r=>listener.close(r));}
+});
+
 test('failed build retains old dist, successful candidate has a rollback directory',async t=>{
   const root=fixture(t);built(root);writeFileSync(join(root,'dist/old.txt'),'old-build');
   await assert.rejects(buildCandidate(root,'pnpm@11.25.0',{},async()=>{throw Error('install failed')},async()=>{}),/install failed/);

@@ -66,6 +66,24 @@ export function configState(configDir) {
   return config && auth ? 'existing' : config || auth ? 'partial' : 'new';
 }
 
+export function buildState(root, fingerprint, node, packageManager) {
+  if (!requiredBuild.every(path => existsSync(join(root, 'dist', path)))) return 'missing';
+  const path = join(root, 'dist/.deploy-manifest.json');
+  if (!existsSync(path)) return 'unmanaged';
+  let manifest;
+  try { manifest = JSON.parse(readFileSync(path, 'utf8')); } catch { return 'invalid'; }
+  if (manifest?.version !== 1 || !/^[a-f0-9]{64}$/.test(manifest.fingerprint ?? '') ||
+      typeof manifest.node !== 'string' || typeof manifest.packageManager !== 'string') return 'invalid';
+  return manifest.fingerprint === fingerprint && manifest.node === node && manifest.packageManager === packageManager ? 'current' : 'stale';
+}
+
+function configurationFingerprint(configDir) {
+  return ['config.jsonc', 'auth.json', 'config.json'].map(name => {
+    const path = join(configDir, name);
+    return existsSync(path) ? createHash('sha256').update(readFileSync(path)).digest('hex') : null;
+  }).join(':');
+}
+
 export function localOrigin(config) {
   const host = config.host === '0.0.0.0' ? '127.0.0.1' : config.host === '::' ? '::1' : config.host;
   return `http://${host.includes(':') ? `[${host}]` : host}:${config.port}`;
@@ -114,7 +132,7 @@ async function confirmPreparation() {
   finally { prompt.close(); }
 }
 
-export async function buildCandidate(root, packageManager, env, run = runCommand, verify = checkDependencies) {
+export async function buildCandidate(root, packageManager, env, run = runCommand, verify = checkDependencies, beforePromote = async () => {}) {
   const fingerprint = sourceFingerprint(root);
   const runtime = join(root, '.runtime');
   if (existsSync(runtime) && lstatSync(runtime).isSymbolicLink()) throw new Error('Build staging directory must not be a link.');
@@ -135,6 +153,8 @@ export async function buildCandidate(root, packageManager, env, run = runCommand
   writeFileSync(join(stage, '.deploy-manifest.json'), JSON.stringify({ version: 1, fingerprint, node: process.versions.node, packageManager }), { mode: 0o600 });
   const dist = join(root, 'dist');
   if (existsSync(dist) && lstatSync(dist).isSymbolicLink()) throw new Error('Existing dist must not be a link.');
+  await beforePromote();
+  if (sourceFingerprint(root) !== fingerprint) throw new Error('Sources changed before promotion; candidate was not promoted.');
   const backup = existsSync(dist) ? join(runtime, `deploy-backup-${randomUUID()}`) : undefined;
   if (backup) renameSync(dist, backup);
   try { renameSync(stage, dist); }
@@ -207,13 +227,11 @@ export async function deploy(options, { root = repository, env = process.env, sa
   if (!/^pnpm@\d+\.\d+\.\d+$/.test(pkg.packageManager)) throw new Error('Expected an exact pnpm version in package.json.');
   const effectiveEnv = { ...env, DEVSPACE_CONFIG_DIR: options.configDir };
   const state = configState(options.configDir);
-  const built = requiredBuild.every(path => existsSync(join(root, 'dist', path)));
-  const manifestPath = join(root, 'dist/.deploy-manifest.json');
   const fingerprint = sourceFingerprint(root);
-  const manifest = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, 'utf8')) : undefined;
+  const build = buildState(root, fingerprint, process.versions.node, pkg.packageManager);
   if (options.check) {
     const report = { node: process.versions.node, packageManager: pkg.packageManager, configState: state,
-      build: !built ? 'missing' : !manifest ? 'unmanaged' : manifest.fingerprint === fingerprint ? 'current' : 'stale',
+      build,
       writesPerformed: false };
     say(JSON.stringify(report, null, 2)); return report;
   }
@@ -221,6 +239,7 @@ export async function deploy(options, { root = repository, env = process.env, sa
   if (!options.prepareOnly && state === 'new' && !interactive) throw new Error('First configuration needs an interactive terminal. --yes does not authorize project access.');
   say('[1/5] Checking environment and existing configuration.');
   let config;
+  const configurationBefore = configurationFingerprint(options.configDir);
   const canInspect = existsSync(join(root, 'dist/config.js'));
   if (state === 'existing' && !canInspect) {
     throw new Error('This unbuilt checkout cannot safely inspect existing configuration. Prepare a separate checkout with --prepare-only and an unused --config-dir first.');
@@ -239,14 +258,19 @@ export async function deploy(options, { root = repository, env = process.env, sa
   const identity = statSync(lockPath);
   try {
     writeFileSync(lock, String(process.pid));
-    const shouldBuild = !built || !manifest || options.rebuild;
-    if (!shouldBuild && manifest && (manifest.fingerprint !== fingerprint || manifest.node !== process.versions.node)) {
+    const shouldBuild = build === 'missing' || build === 'unmanaged' || options.rebuild;
+    if (!shouldBuild && build !== 'current') {
       throw new Error('Build is stale for these sources/Node. Stop active services, then use --rebuild.');
     }
     if (shouldBuild) {
       if (!options.yes && !await confirm()) throw new Error('Preparation cancelled; no build was changed.');
       say('[2/5] Installing locked dependencies and preparing a candidate build.');
-      const result = await prepare(root, pkg.packageManager, effectiveEnv, run);
+      const beforePromote = async () => {
+        if (configurationFingerprint(options.configDir) !== configurationBefore) throw new Error('Configuration changed during preparation; candidate was not promoted.');
+        if (config && await busy(await load(root, effectiveEnv))) throw new Error('Configured port became occupied; candidate was not promoted.');
+        if (configurationFingerprint(options.configDir) !== configurationBefore) throw new Error('Configuration changed before promotion; candidate was not promoted.');
+      };
+      const result = await prepare(root, pkg.packageManager, effectiveEnv, run, checkDependencies, beforePromote);
       if (result.backup) say(`Previous build retained at ${result.backup}`);
     } else say('[2/5] Reusing the existing build; no dependency or build files changed.');
     if (options.prepareOnly) return { status: 'prepared' };

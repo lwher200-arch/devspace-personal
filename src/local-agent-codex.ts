@@ -190,7 +190,7 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
           if (!rolloutPath) throw new Error("Codex did not expose a rollout path for runtime model verification.");
           assertAllowedPath(rolloutPath, [join(this.actualHome!, "sessions"), join(this.actualHome!, "archived_sessions")]);
         }
-        const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId), input.executionPolicy?.requiredModel,
+        const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId), input.executionPolicy ? input.model : undefined,
           input.executionPolicy ? this.options.turnTimeoutMs ?? 600000 : undefined);
         const parsed = parseCompletedTurn(completed.event.params, completed.items);
         if (parsed.failure) {
@@ -225,6 +225,7 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
           }
           if (!runtimeModel) throw evidenceError ?? new Error("Codex runtime model evidence unavailable.");
           assertExecutionSelection(input.executionPolicy, runtimeModel, this.actualVersion);
+          if (runtimeModel !== input.model) throw new Error('Codex runtime model differs from the selected model for this turn.');
           executionEvidence = { requestedModel: input.model!, sessionModel: sessionModel!, runtimeModel,
             cliVersion: this.actualVersion!, executable: this.options.command, threadId, turnId, source: "codex-rollout/turn_context",
             sandbox: input.writeMode === "allowed" ? "workspaceWrite" : "readOnly", approvalPolicy: "never" };

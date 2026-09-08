@@ -9,13 +9,17 @@ import { assertAllowedPath, canonicalAllowedPath, PRIVATE_CREDENTIAL_DIRECTORIES
 import { parsePatch } from './apply-patch.js';
 import { selectExecutionModel } from './local-agent-execution.js';
 import { logEvent } from './logger.js';
+import { openAiConversationScopeId } from './request-meta.js';
+import type { ApprovalState, ApprovalView } from './approval-protocol.js';
+import { readOwnerSession, establishOwnerSession } from './owner-session.js';
 
 type Arguments = Record<string, unknown>;
 export interface ApprovalOperation { principal: string; tool: string; args: Arguments; context: unknown; reason: string }
 interface SubmissionReceipt { agentId: string; workspaceId: string }
 interface Approval extends ApprovalOperation {
   id: string; key: string; bytes: number; expires: number;
-  state: 'pending' | 'approved' | 'denied' | 'submitting' | 'submitted' | 'failed';
+  state: ApprovalState;
+  uiToken?: string;
   nonce?: string; submit?: () => Promise<SubmissionReceipt>; submission?: SubmissionReceipt;
 }
 const token = () => randomBytes(32).toString('base64url');
@@ -25,6 +29,14 @@ function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
   if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${canonical((value as Arguments)[k])}`).join(',')}}`;
   return JSON.stringify(value) ?? 'null';
+}
+
+export function approvalPrincipal(clientId: string, metadata: unknown): string {
+  return JSON.stringify([clientId, openAiConversationScopeId(metadata) ?? null]);
+}
+
+export function approvalContextMatches(view: Pick<ApprovalView, 'reason' | 'context'>, current: { reason?: string; context: unknown }): boolean {
+  return canonical([view.reason, view.context]) === canonical([current.reason, current.context]);
 }
 
 // Grants deliberately expire on restart. Losing a pending approval is fail-closed.
@@ -60,12 +72,46 @@ export class OwnerApprovals {
     if (!entry || entry.state !== 'pending') throw new Error('Approval is absent, expired or already decided.');
     return entry.nonce = token();
   }
-  decide(id: string, nonce: string, suppliedOwner: string, owner: string, approve: boolean): boolean {
+  reviewUi(id: string, principal: string): ApprovalView {
+    const entry = this.forPrincipal(id, principal);
+    // This capability is sent only in component-only result metadata. It must
+    // never enter model-visible content, structuredContent, URLs or logs.
+    if (entry.state === 'pending') entry.uiToken ??= token();
+    return this.uiView(entry);
+  }
+  decideUi(id: string, principal: string, capability: string, approve: boolean, validate?: (view: ApprovalView) => void): ApprovalView {
+    const entry = this.forPrincipal(id, principal);
+    if (!entry.uiToken || !equal(entry.uiToken, capability)) throw new Error('Approval unavailable or not authorized.');
+    if (entry.state === 'pending') {
+      if (approve) validate?.(this.uiView(entry));
+      this.transition(entry, approve);
+    }
+    return this.uiView(entry);
+  }
+  private forPrincipal(id: string, principal: string): Approval {
+    const entry = this.inspect(id);
+    if (!entry || this.closed || entry.principal !== principal) throw new Error('Approval unavailable or not authorized.');
+    return entry;
+  }
+  private uiView(entry: Approval): ApprovalView {
+    return structuredClone({ version: 1 as const, id: entry.id, state: entry.state,
+      tool: entry.tool, reason: entry.reason, args: entry.args, context: entry.context,
+      expiresAt: new Date(entry.expires).toISOString(), automatic: Boolean(entry.submit || entry.submission || ['submitting', 'failed'].includes(entry.state)),
+      ...(entry.state === 'pending' ? { decisionToken: entry.uiToken } : {}),
+      ...(entry.submission ? { submission: entry.submission } : {}) });
+  }
+  decide(id: string, nonce: string, suppliedOwner: string, owner: string, approve: boolean, verifiedSession = false): boolean {
     const entry = this.inspect(id);
     if (!entry || entry.state !== 'pending' || !entry.nonce || !equal(entry.nonce, nonce)) return false;
     const failures = this.failures.get(id) ?? 0;
     if (failures >= 5) return false;
-    if (!equal(suppliedOwner, owner)) { this.failures.set(id, failures + 1); return false; }
+    // verifiedSession is derived from the signed HttpOnly cookie by our route,
+    // never from a request-body flag or a model's claim of prior approval.
+    if (!verifiedSession && !equal(suppliedOwner, owner)) { this.failures.set(id, failures + 1); return false; }
+    this.transition(entry, approve);
+    return true;
+  }
+  private transition(entry: Approval, approve: boolean): void {
     entry.state = approve ? 'approved' : 'denied'; entry.nonce = undefined;
     if (approve && entry.submit) {
       // Claim synchronously before yielding: form replays and MCP retries cannot
@@ -81,7 +127,6 @@ export class OwnerApprovals {
       }).finally(() => { entry.expires = this.now() + this.ttl; this.inFlight.delete(pending); });
       this.inFlight.add(pending);
     } else if (!approve) entry.submit = undefined;
-    return true;
   }
   clear() { this.entries.clear(); this.failures.clear(); }
   async close() { this.closed = true; this.clear(); await Promise.allSettled([...this.inFlight]); }
@@ -104,6 +149,7 @@ export function classifyMcpOperation(config: ServerConfig, workspaces: Pick<Work
   const root = workspace ? canonicalAllowedPath(workspace.root) : undefined;
   const paths: string[] = [];
   let reason: string | undefined;
+  const highRiskOnly = config.approvalProfile === 'high_risk_only';
   let mutation = false;
   if (tool === 'exec_command' || tool === 'bash') reason = 'Arbitrary shell executes with the service OS account authority.';
   else if (tool === 'write_stdin') { if (args.chars !== undefined && args.chars !== '') reason = 'Interactive process input can execute additional commands.'; }
@@ -117,9 +163,9 @@ export function classifyMcpOperation(config: ServerConfig, workspaces: Pick<Work
     mutation = args.dryRun !== true;
     for (const action of actions) { paths.push(action.path); if (action.kind === 'update' && action.moveTo) paths.push(action.moveTo); }
     if (mutation && (actions.length > 20 || actions.some(action => action.kind === 'delete' || action.kind === 'update' && action.moveTo))) reason = 'Deletion, move or large batch mutation requires owner approval.';
-    if (mutation && (!args.expectedHashes || typeof args.expectedHashes !== 'object' || Array.isArray(args.expectedHashes))) reason = 'Unguarded patch requires approval; prefer expectedHashes and dryRun.';
-  } else if (tool === 'write' || tool === 'edit') { mutation = true; reason = 'Legacy mutation has no SHA-256 contract; prefer a guarded apply_patch.'; }
-  else if (tool === 'open_workspace') { if (args.mode === 'worktree') reason = 'Creating a worktree changes repository state.'; }
+    if (!highRiskOnly && mutation && (!args.expectedHashes || typeof args.expectedHashes !== 'object' || Array.isArray(args.expectedHashes))) reason = 'Unguarded patch requires approval; prefer expectedHashes and dryRun.';
+  } else if (tool === 'write' || tool === 'edit') { mutation = true; if (!highRiskOnly) reason = 'Legacy mutation has no SHA-256 contract; prefer a guarded apply_patch.'; }
+  else if (tool === 'open_workspace') { if (args.mode === 'worktree' && !highRiskOnly) reason = 'Creating a worktree changes repository state.'; }
   else if (!['read', 'project_read', 'project_files', 'project_search', 'show_changes', 'codex_preflight', 'codex_task_status', 'codex_tasks'].includes(tool)) reason = 'This capability has not been classified as routine; explicit approval is required.';
   if (typeof args.path === 'string') paths.push(args.path);
   const absolutePaths = paths.map(path => {
@@ -128,6 +174,7 @@ export function classifyMcpOperation(config: ServerConfig, workspaces: Pick<Work
     if (sensitive(absolute, config, mutation)) reason = 'Credentials, service state or execution/security configuration requires owner approval.';
     return absolute;
   });
+  if (mutation && [args.content, args.newText, args.patch].some(value => typeof value === 'string' && Buffer.byteLength(value) > 8 * 1024 * 1024)) reason = 'Large file mutation requires explicit approval.';
   const targets = absolutePaths.map(absolute => {
     let fingerprint: string | null = null;
     if (reason && existsSync(absolute)) {
@@ -163,13 +210,14 @@ ${entry.submission ? `<pre>${escape(JSON.stringify(entry.submission, null, 2))}<
     }
     if (!entry || entry.state !== 'pending') { res.status(404).send('Request unavailable, expired or already decided.'); return; }
     const nonce = approvals.challenge(entry.id);
+    const ownerSession = readOwnerSession(req, config.oauth, origin);
     res.cookie(`devspace_approval_${entry.id}`, nonce, { httpOnly: true, sameSite: 'strict', secure: origin.startsWith('https:'), path: `${base}/${entry.id}`, maxAge: 300_000 });
     res.type('html').send(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Approve one DevSpace operation</title>
 <style>body{font-family:Georgia,serif;max-width:780px;margin:40px auto;padding:20px;background:#f5f2ec;color:#25231f}pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:16px;background:#fff}input,button{font:inherit;padding:10px;margin:8px 0}button{cursor:pointer}label{display:block}</style>
 <h1>Approve one operation</h1><p>${escape(entry.reason)}</p><p>One-use grant, expiring in five minutes. Workspace and provider sandbox restrictions remain. Shell commands may access the service account's files and network. Review the exact operation before approving.</p>
 <p>${entry.submit ? 'Approving will automatically submit exactly this Codex turn. No return-to-Chat retry is needed to start it. Chat still needs to query the result.' : 'Approving grants one exact retry from Chat; this page does not execute the operation.'}</p>
 <pre>${escape(JSON.stringify({ tool: entry.tool, arguments: entry.args, context: entry.context }, null, 2))}</pre>
-<form method="post" action="${base}/${entry.id}"><input type="hidden" name="nonce" value="${nonce}"><label>Owner password (never send this to Chat)<br><input name="owner_token" type="password" autocomplete="current-password" required maxlength="1024"></label><button name="decision" value="approve">Approve once</button> <button name="decision" value="deny">Deny</button></form></html>`);
+<form method="post" action="${base}/${entry.id}"><input type="hidden" name="nonce" value="${nonce}">${ownerSession ? `<p>Owner login verified until ${escape(new Date(ownerSession.expiresAt * 1000).toISOString())}. This still requires your decision for this one operation.</p>` : '<label>Owner password (never send this to Chat)<br><input name="owner_token" type="password" autocomplete="current-password" required maxlength="1024"></label>'}<button name="decision" value="approve">Approve once</button> <button name="decision" value="deny">Deny</button></form></html>`);
   });
   app.post(`${base}/:id`, express.urlencoded({ extended: false, limit: '4kb' }), (req, res) => {
     const requestOrigin = req.header('origin');
@@ -180,11 +228,14 @@ ${entry.submission ? `<pre>${escape(JSON.stringify(entry.submission, null, 2))}<
       res.status(403).send('Origin rejected.'); return;
     }
     const id = String(req.params.id), nonce = String(req.body?.nonce ?? '');
+    const suppliedOwner = String(req.body?.owner_token ?? '');
+    const verifiedSession = !suppliedOwner && Boolean(readOwnerSession(req, config.oauth, origin));
     const cookie = (req.header('cookie') ?? '').split(';').map(part => part.trim()).find(part => part.startsWith(`devspace_approval_${id}=`))?.split('=')[1];
     if (!cookie || !equal(cookie, nonce) || !['approve', 'deny'].includes(req.body?.decision) ||
-        !approvals.decide(id, nonce, String(req.body?.owner_token ?? ''), config.oauth.ownerToken, req.body.decision === 'approve')) {
+        !approvals.decide(id, nonce, suppliedOwner, config.oauth.ownerToken, req.body.decision === 'approve', verifiedSession)) {
       res.status(403).send('Approval rejected or expired.'); return;
     }
+    if (suppliedOwner) establishOwnerSession(res, config.oauth, origin);
     logEvent(config.logging, 'info', 'owner_approval_decided', { approvalId: id, approved: req.body.decision === 'approve' });
     if (approvals.inspect(id)?.state === 'submitting') { res.redirect(303, `${base}/${id}`); return; }
     res.send(req.body.decision === 'approve' ? 'Approved once. Return to Chat and retry the exact same operation. Nothing has executed yet.' : 'Denied. Nothing has executed.');

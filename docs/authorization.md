@@ -6,6 +6,36 @@ DevSpace 继续使用已有 HTTP/MCP 与 OAuth 入口。
 
 ## Chat 入口
 
+### 高危确认与 12 小时登录
+
+可显式配置：
+
+```json
+{"tools":{"authorization":"owner_approval","approvalProfile":"high_risk_only"},"oauth":{"ownerSessionTtlSeconds":43200}}
+```
+
+`high_risk_only` 让普通文件读写、编辑、小批量非敏感补丁及工作区创建按原文件
+边界自动通过；仍建议使用 SHA-256 保护共享文件。删除、移动、大批量/大文件修改、
+凭据与安全/执行配置访问，以及权限范围无法可靠收窄的能力继续逐次申请。
+**任意 Shell、进程输入、聚合敏感差异和通用 Codex 委派目前仍属于这类高危能力。**
+现有委派不能逐项拦截内部动作；不能只凭“运行测试”“普通编程”等描述就放行。
+这不是完整实现的代理内部风险审批，后续需单独接通该执行边界。
+
+登录验证与操作批准分离。Owner 密码验证有效期固定为 12 小时，不因使用、
+刷新令牌或服务重启滚动延长。新的访问/刷新令牌保留原验证时间并受同一截止时间
+限制；它们仍作为不透明凭据进行整串哈希存储，不增加数据库迁移。浏览器通过
+带签名、HttpOnly、SameSite 和 HTTPS Secure 属性的会话 Cookie 记住已验证身份，
+Owner 兼容页面在有效期内只需点击批准，不必再次输入密码。Cookie 自身不批准操作。
+OAuth 使用 Cookie 重复确认连接时还校验 Origin 和绑定表单的 CSRF 证明。
+
+启用固定验证期限后，无法证明验证时间的旧令牌会要求重新登录一次；客户端注册
+及 Owner 密码不删除、不重置。到期后新的调用/刷新需重新验证，已启动任务不会
+被伪装成取消。回滚应恢复原配置及构建，不必删除 OAuth 数据库。
+这些是 DevSpace 的规则，不能关闭 ChatGPT 宿主自己的必要确认。
+
+默认 `approvalProfile` 为 `conservative`，未配置 `ownerSessionTtlSeconds` 的旧
+部署保持原登录策略。不要仅调大访问令牌 TTL 来替代固定密码验证期限。
+
 在 `config.jsonc` 中启用：
 
 ```json
@@ -24,8 +54,9 @@ DevSpace 继续使用已有 HTTP/MCP 与 OAuth 入口。
 仍需批准。
 
 1. Chat 收到 `OWNER_APPROVAL_REQUIRED` 和 `approvalUrl`，此时操作尚未执行。
-2. 用户自己打开地址，核对工具、完整参数、路径/文件指纹和选定模型。
-3. 在该页面输入 Owner 密码，选择单次同意或拒绝。不要把密码交给 Chat。
+2. 已启用 Chat 审批的客户端调用 `review_approval` 展示卡片；否则用户自己打开
+   Owner 地址。核对工具、完整参数、路径/文件指纹和选定模型。
+3. 在卡片中选择单次批准或拒绝。Owner 兼容页面仍需输入密码，不要把密码交给 Chat。
 4. 对 `codex_task_start` / `codex_task_continue`，批准会自动提交刚刚展示的
    一个轮次，无需回 Chat 重试才能启动。审批页会跳转到提交状态，显示任务编号；
    提交不等于完成，Chat 用 `codex_task_status` 查询结果，编号遗失时用
@@ -34,10 +65,65 @@ DevSpace 继续使用已有 HTTP/MCP 与 OAuth 入口。
    修改参数、文件内容、工作区、OAuth 客户端或宿主提供的逻辑会话后需要新授权。
    MCP 传输连接重建不改变审批身份。一次同意仅允许执行一次，不形成永久提权。
 
+### 在 Chat 内人工确认
+
+可以为明确受信任的 OAuth 客户端启用审批卡片，减少每次输入 Owner 密码的操作：
+
+```json
+{"tools":{"authorization":"owner_approval","chatApprovalClientIds":["your-approved-chatgpt-client-id"]},"ui":{"enabled":true}}
+```
+
+列表默认为空，旧部署仍使用 Owner 页面。`OWNER_APPROVAL_REQUIRED` 中的
+`chatApproval.clientId` 是服务端从已验证 OAuth 请求得到的客户端标识，不是密码。
+仅在本机配置中加入你明确授权、能够将工具结果 `_meta` 与模型隔离的客户端，
+不要按自报的 `clientInfo` 或 User-Agent 自动信任客户端。重新注册连接可能生成
+新的客户端标识，此时需重新核对，不能自动扩展允许列表。
+
+启用后，Chat 调用 `review_approval` 展示同一请求的完整参数和范围。你在卡片内
+选择“批准一次”或“拒绝”，不需要把 Owner 密码交给 Chat。批准 Codex 请求会
+复用已有的单轮自动提交；其他高风险操作仍只批准精确的一次重试。卡片会尝试
+通过宿主消息桥通知聊天继续，不支持该桥时可以手动发送“继续”。这不是后台唤醒
+任意聊天，也不会让新任务自动继承授权。
+
+Chat 网页适配优先使用 MCP Apps 标准桥。标准能力不可用时，支持文档化的
+`window.openai.callTool` / `sendFollowUpMessage` 兼容接口。桥接方式在调用前选定；
+一次决定或通知交付不明时，不会换通道重发。恢复历史卡片不会自动发消息；用户
+可点击“通知 Chat 继续”，先重新核验收据，再恢复结果查询，不重新批准或执行。
+
+### 审批模式与失败状态
+
+- 普通操作沿用已有规则直接处理，不增加权限。
+- `chat_card` 要求被允许的 OAuth 客户端以及非空 `openai/session`。会话标识仅用于绑定，不取代 OAuth 和私有卡片凭据校验。
+- 缺少可信客户端或聊天会话时使用 `owner_page`，不能把不同对话降级到一个空会话后共享卡片审批。
+
+卡片读取及点击批准时都会重新核验当前工作区、目标文件指纹和选定模型。
+上下文发生变化时返回 `APPROVAL_CONTEXT_CHANGED`，不先显示“已批准”再等待执行
+失败；拒绝旧请求仍然可用。真正执行时的原有检查继续保留。
+
+错误返回稳定代码：`CHAT_CLIENT_NOT_ENABLED`、`CHAT_CONTEXT_REQUIRED`、
+`APPROVAL_UNAVAILABLE`、`APPROVAL_CONTEXT_CHANGED`。不存在、已过期、已使用或
+不属于调用方的请求统一按不可用处理，不泄露别人的审批状态。日志仅记录请求
+编号和错误码，不记录界面凭据、密码、完整参数或原始错误。网页会区分策略拒绝
+与交付不明，禁止继续使用已失效的批准按钮。
+
+服务端在组件专用 `_meta` 内发送单次界面凭据，`content` 和 `structuredContent`
+不包含它。`decide_approval` 仅向 app 界面暴露，并额外验证凭据、OAuth 客户端、
+原逻辑会话、请求和有效期；仅隐藏工具名称或传入 `approved: true` 都不构成授权。
+卡片凭据不得进入日志、URL、聊天消息、模型上下文或持久化 widgetState。
+
+**信任边界：** 这项功能信任所选 MCP 宿主隔离私有元数据并承载用户交互，不是
+独立于宿主的硬件签名或密码验证。能够控制受信任客户端、读取原始 MCP `_meta`
+的程序也可能使用该凭据；不要为不可信宿主启用。移除客户端列表或关闭 UI 即撤销
+卡片审批入口，原 Owner 页面仍然可用。刷新插件工具清单后再验收真实宿主行为。
+
+普通读取、搜索和符合已有约束的小补丁继续按原规则执行。本功能没有新增自动
+审批 Codex/Shell 的风险分类器，也没有开启任务级、会话级或永久授权。
+
 ### Codex 批准后的状态
 
 `pending -> submitting -> submitted | failed`；拒绝为 `pending -> denied`。
-只有通过 Owner 密码、Origin、Cookie/nonce 和有效期校验的批准才能进入提交。
+只有通过 Owner 页面校验，或通过已启用的 Chat 卡片身份、会话、单次凭据、
+上下文和有效期校验的批准才能进入提交。Owner 页面继续保留 Origin 和 Cookie/nonce 防护。
 提交前重新验证原 OAuth token、工作区边界及审阅上下文，复用工具的同一输入
 schema 和 CodexBridge 的持久化 `requestKey` 去重，不新增执行队列或后台对话循环。
 

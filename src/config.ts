@@ -18,6 +18,8 @@ export interface ServerConfig {
   publicBaseUrl: string;
   toolMode: ToolMode;
   toolAuthorization?: 'legacy' | 'owner_approval';
+  approvalProfile?: 'conservative' | 'high_risk_only';
+  chatApprovalClientIds?: string[];
   uiEnabled: boolean;
   stateDir: string;
   worktreeRoot: string;
@@ -60,6 +62,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       ),
       accessTokenTtlSeconds: stored.oauth.accessTokenTtlSeconds,
       refreshTokenTtlSeconds: stored.oauth.refreshTokenTtlSeconds,
+      ownerSessionTtlSeconds: stored.oauth.ownerSessionTtlSeconds,
       scopes: stored.oauth.scopes,
       allowedRedirectHosts: stored.oauth.allowedRedirectHosts,
     },
@@ -68,6 +71,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     publicBaseUrl,
     toolMode: stored.tools.mode,
     toolAuthorization: stored.tools.authorization,
+    approvalProfile: stored.tools.approvalProfile,
+    chatApprovalClientIds: stored.tools.chatApprovalClientIds,
     uiEnabled: stored.ui.enabled,
     stateDir: normalizePath(stored.storage.stateDir),
     worktreeRoot: normalizePath(stored.workspaces.worktreeRoot),

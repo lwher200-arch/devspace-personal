@@ -1,7 +1,7 @@
 declare module "*.css";
 
 interface Window {
-  openai?: {
+  openai?: import('./approval-bridge.js').ChatGptApprovalBridge & {
     toolOutput?: unknown;
     toolResponseMetadata?: unknown;
   };

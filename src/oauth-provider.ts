@@ -11,8 +11,10 @@ import type {
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
+import { readOwnerSession, establishOwnerSession, ownerSessionFormProof, ownerSessionFormValid } from './owner-session.js';
 
 export interface OAuthConfig {
+  ownerSessionTtlSeconds?: number;
   ownerToken: string;
   accessTokenTtlSeconds: number;
   refreshTokenTtlSeconds: number;
@@ -21,6 +23,7 @@ export interface OAuthConfig {
 }
 
 interface AuthorizationCodeRecord {
+  ownerVerifiedAt?: number;
   clientId: string;
   params: AuthorizationParams;
   expiresAtMs: number;
@@ -49,6 +52,7 @@ function htmlEscape(value: string): string {
 }
 
 function formHtml(params: {
+  ownerVerifiedUntil?: number;
   error?: string;
   clientName: string;
   scopes: string[];
@@ -98,8 +102,7 @@ function formHtml(params: {
       </dl>
       <form method="post">
 ${hiddenFields}
-        <label for="owner_token">Owner password</label>
-        <input id="owner_token" name="owner_token" type="password" autocomplete="current-password" autofocus required />
+        ${params.ownerVerifiedUntil ? `<p>Owner login is verified until ${htmlEscape(new Date(params.ownerVerifiedUntil * 1000).toISOString())}. Confirm only this client connection.</p>` : '<label for="owner_token">Owner password</label><input id="owner_token" name="owner_token" type="password" autocomplete="current-password" autofocus required />'}
         <button type="submit">Authorize DevSpace</button>
       </form>
     </main>
@@ -121,6 +124,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     private readonly config: OAuthConfig,
     resourceServerUrl: URL,
     stateDir: string,
+    private readonly now = Date.now,
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.oauthStore = new SqliteOAuthStore(stateDir);
@@ -132,6 +136,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     params: AuthorizationParams,
     res: Response,
   ): Promise<void> {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Referrer-Policy', 'same-origin');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
     if (!params.resource || !checkResourceAllowed({ requestedResource: params.resource, configuredResource: this.resourceServerUrl })) {
       throw new InvalidRequestError("Invalid or missing OAuth resource");
     }
@@ -139,6 +147,9 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       throw new InvalidRequestError("Requested scope is not supported");
     }
 
+    const origin = this.resourceServerUrl.origin;
+    const session = readOwnerSession(res.req, this.config, origin, this.now());
+    const fields = authorizationFormFields(client, params);
     if (res.req.method !== "POST") {
       res.status(200).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(
@@ -146,14 +157,18 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           clientName: client.client_name ?? client.client_id,
           scopes: params.scopes ?? this.config.scopes,
           resource: params.resource,
-          fields: authorizationFormFields(client, params),
+          fields: { ...fields, ...(session ? { owner_session_proof: ownerSessionFormProof(session, fields, this.config) } : {}) },
+          ownerVerifiedUntil: session?.expiresAt,
         }),
       );
       return;
     }
 
     const providedToken = String(res.req.body?.owner_token ?? "");
-    if (!safeEquals(providedToken, this.config.ownerToken)) {
+    const passwordVerified = providedToken !== '' && safeEquals(providedToken, this.config.ownerToken);
+    const sessionVerified = !providedToken && session && res.req.headers.origin === origin &&
+      ownerSessionFormValid(String(res.req.body?.owner_session_proof ?? ''), session, fields, this.config);
+    if (!passwordVerified && !sessionVerified) {
       res.status(401).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(
         formHtml({
@@ -168,10 +183,13 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     const code = `code-${randomUUID()}`;
+    const verifiedAt = passwordVerified ? Math.floor(this.now() / 1000) : session!.issuedAt;
+    if (passwordVerified) establishOwnerSession(res, this.config, origin, this.now());
     this.codes.set(code, {
+      ownerVerifiedAt: verifiedAt,
       clientId: client.client_id,
       params,
-      expiresAtMs: Date.now() + CODE_TTL_MS,
+      expiresAtMs: this.now() + CODE_TTL_MS,
     });
 
     const redirectUrl = new URL(params.redirectUri);
@@ -204,7 +222,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     this.codes.delete(authorizationCode);
-    return this.issueTokens(client.client_id, record.params.scopes ?? this.config.scopes, record.params.resource);
+    return this.issueTokens(client.client_id, record.params.scopes ?? this.config.scopes, record.params.resource, undefined, record.ownerVerifiedAt);
   }
 
   async exchangeRefreshToken(
@@ -215,7 +233,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   ): Promise<OAuthTokens> {
     const refreshTokenHash = hashToken(refreshToken);
     const record = this.oauthStore.getRefreshToken(refreshTokenHash);
-    if (!record || record.clientId !== client.client_id || record.expiresAt < Math.floor(Date.now() / 1000)) {
+    if (!record || record.clientId !== client.client_id || record.expiresAt <= Math.floor(this.now() / 1000)) {
       throw new InvalidGrantError("Invalid refresh token");
     }
     if (resource && !checkResourceAllowed({ requestedResource: resource, configuredResource: this.resourceServerUrl })) {
@@ -227,19 +245,22 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       throw new AccessDeniedError("Refresh token cannot grant requested scopes");
     }
 
+    const verifiedAt = this.tokenOwnerVerifiedAt(refreshToken);
     return this.issueTokens(
       client.client_id,
       requestedScopes,
       resource ?? (record.resource ? new URL(record.resource) : undefined),
       refreshTokenHash,
+      verifiedAt,
     );
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     const record = this.oauthStore.getAccessToken(hashToken(token));
-    if (!record || record.expiresAt < Math.floor(Date.now() / 1000)) {
+    if (!record || record.expiresAt <= Math.floor(this.now() / 1000)) {
       throw new InvalidTokenError("Invalid or expired access token");
     }
+    try { this.tokenOwnerVerifiedAt(token); } catch { throw new InvalidTokenError('Owner login expired; reconnect and verify the Owner password.'); }
 
     return {
       token,
@@ -265,7 +286,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     authorizationCode: string,
   ): AuthorizationCodeRecord {
     const record = this.codes.get(authorizationCode);
-    if (!record || record.clientId !== client.client_id || record.expiresAtMs < Date.now()) {
+    if (!record || record.clientId !== client.client_id || record.expiresAtMs <= this.now()) {
       throw new InvalidGrantError("Invalid authorization code");
     }
     return record;
@@ -276,12 +297,18 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     scopes: string[],
     resource?: URL,
     consumedRefreshTokenHash?: string,
+    ownerVerifiedAt?: number,
   ): OAuthTokens {
-    const now = Math.floor(Date.now() / 1000);
-    const accessToken = randomToken();
-    const refreshToken = randomToken();
-    const accessExpiresAt = now + this.config.accessTokenTtlSeconds;
-    const refreshExpiresAt = now + this.config.refreshTokenTtlSeconds;
+    const now = Math.floor(this.now() / 1000);
+    const deadline = this.config.ownerSessionTtlSeconds ? (ownerVerifiedAt ?? 0) + this.config.ownerSessionTtlSeconds : Infinity;
+    if (deadline <= now) throw new InvalidGrantError('Owner login expired; reconnect and verify the Owner password.');
+    // The entire opaque token is hashed in SQLite, so its login timestamp cannot
+    // be edited without invalidating the credential. Refresh preserves it.
+    const prefix = this.config.ownerSessionTtlSeconds ? `ds1.${ownerVerifiedAt}.` : '';
+    const accessToken = prefix + randomToken();
+    const refreshToken = prefix + randomToken();
+    const accessExpiresAt = Math.min(now + this.config.accessTokenTtlSeconds, deadline);
+    const refreshExpiresAt = Math.min(now + this.config.refreshTokenTtlSeconds, deadline);
 
     const saved = this.oauthStore.saveTokenPair(
       {
@@ -309,10 +336,19 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     return {
       access_token: accessToken,
       token_type: "bearer",
-      expires_in: this.config.accessTokenTtlSeconds,
+      expires_in: accessExpiresAt - now,
       refresh_token: refreshToken,
       scope: scopes.join(" "),
     };
+  }
+  private tokenOwnerVerifiedAt(token: string): number | undefined {
+    if (!this.config.ownerSessionTtlSeconds) return undefined;
+    const match = /^ds1\.(\d+)\.[A-Za-z0-9_-]{43}$/.exec(token);
+    const issuedAt = match ? Number(match[1]) : NaN, now = Math.floor(this.now() / 1000);
+    if (!Number.isSafeInteger(issuedAt) || issuedAt > now || issuedAt + this.config.ownerSessionTtlSeconds <= now) {
+      throw new InvalidGrantError('Owner login expired or predates this policy; reconnect and verify the Owner password.');
+    }
+    return issuedAt;
   }
 }
 

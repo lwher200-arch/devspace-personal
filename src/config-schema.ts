@@ -26,6 +26,8 @@ const storageConfigSchema = z.object({
 const toolsConfigSchema = z.object({
   mode: z.enum(["claude", "codex"]).default("codex"),
   authorization: z.enum(['legacy', 'owner_approval']).default('legacy'),
+  approvalProfile: z.enum(['conservative', 'high_risk_only']).default('conservative'),
+  chatApprovalClientIds: z.array(z.string().trim().min(1).max(256)).max(20).default([]),
 }).strict().prefault({});
 
 const uiConfigSchema = z.object({
@@ -53,6 +55,7 @@ const loggingConfigSchema = z.object({
 }).strict().prefault({});
 
 const oauthConfigSchema = z.object({
+  ownerSessionTtlSeconds: z.number().int().min(60).max(86400).optional(),
   accessTokenTtlSeconds: z.number().int().positive().default(60 * 60),
   refreshTokenTtlSeconds: z.number().int().positive().default(30 * 24 * 60 * 60),
   scopes: z.array(z.string().trim().min(1)).min(1).default(["devspace"]),

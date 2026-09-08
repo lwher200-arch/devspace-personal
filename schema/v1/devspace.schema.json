@@ -115,6 +115,24 @@
             "legacy",
             "owner_approval"
           ]
+        },
+        "approvalProfile": {
+          "default": "conservative",
+          "type": "string",
+          "enum": [
+            "conservative",
+            "high_risk_only"
+          ]
+        },
+        "chatApprovalClientIds": {
+          "default": [],
+          "maxItems": 20,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
         }
       },
       "additionalProperties": false
@@ -270,6 +288,11 @@
       "default": {},
       "type": "object",
       "properties": {
+        "ownerSessionTtlSeconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 86400
+        },
         "accessTokenTtlSeconds": {
           "default": 3600,
           "type": "integer",

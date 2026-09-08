@@ -29,6 +29,9 @@ import {
   type ChatGptToolGlobals,
 } from "./tool-result.js";
 import "./workspace-app.css";
+import { mountApprovalCard } from './approval-card.js';
+import type { ApprovalView } from '../approval-protocol.js';
+import { createApprovalBridge } from './approval-bridge.js';
 
 interface CardDisplay {
   icon: ToolIcon;
@@ -61,6 +64,8 @@ let openWorkspaceInstructionKey: string | null = null;
 let showAvailableWorkspaceInstructions = false;
 let pendingToolResult: CallToolResult | null = null;
 let pendingReviewKey: string | null = null;
+let approval: ApprovalView | null = null;
+let unmountApproval: (() => void) | undefined;
 
 const maybeAppRoot = document.querySelector<HTMLElement>("#app");
 
@@ -113,16 +118,24 @@ async function boot(): Promise<void> {
   };
 
   try {
-    await app.connect();
+    await app.connect(undefined, typeof window.openai?.callTool === 'function' ? { timeout: 5000 } : undefined);
     const initialContext = app.getHostContext();
     if (initialContext) hostContext = initialContext;
     applyHostContext();
     connected = true;
     window.addEventListener("openai:set_globals", handleChatGptGlobalsChanged);
   } catch (connectError) {
-    connectionError = connectError instanceof Error
-      ? connectError.message
-      : String(connectError);
+    // App.connect closes a failed handshake. A documented ChatGPT bridge may
+    // still be available; this fallback performs no approval or tool replay.
+    app = null;
+    if (typeof window.openai?.callTool === 'function') {
+      connected = true;
+      document.documentElement.dataset.approvalLegacy = 'true';
+      if (window.openai.theme) hostContext = { ...hostContext, theme: window.openai.theme };
+      applyHostContext();
+      window.addEventListener('openai:set_globals', handleChatGptGlobalsChanged);
+      window.addEventListener('pagehide', () => { window.removeEventListener('openai:set_globals', handleChatGptGlobalsChanged); unmountPayload(); }, { once: true });
+    } else connectionError = connectError instanceof Error ? connectError.message : String(connectError);
   }
 
   const initialResult = pendingToolResult ?? chatGptRestoredResult();
@@ -136,6 +149,10 @@ async function boot(): Promise<void> {
 
 async function applyToolResult(result: CallToolResult): Promise<void> {
   const decoded = decodeToolResult(result);
+  if (decoded.kind === 'approval') {
+    pendingReviewKey = null; approval = decoded.approval; card = null; render(); return;
+  }
+  approval = null;
   if (decoded.kind === "card") {
     setCard(decoded.card);
     return;
@@ -218,9 +235,10 @@ function chatGptRestoredResult(): CallToolResult | undefined {
 }
 
 function handleChatGptGlobalsChanged(event: Event): void {
-  if (!connected || card) return;
-
   const customEvent = event as CustomEvent<{ globals?: ChatGptToolGlobals }>;
+  const theme = customEvent.detail?.globals?.theme;
+  if (connected && !app && theme) { hostContext = { ...hostContext, theme }; applyHostContext(); }
+  if (!connected || card || approval) return;
   const restored = toolResultFromChatGptGlobals(customEvent.detail?.globals)
     ?? chatGptRestoredResult();
   if (restored) void applyToolResult(restored);
@@ -251,6 +269,11 @@ function render(): void {
 
   if (!connected) {
     renderEmpty("Connecting to host...");
+    return;
+  }
+
+  if (approval) {
+    unmountApproval = mountApprovalCard(appRoot, approval, createApprovalBridge(() => app, () => window.openai));
     return;
   }
 
@@ -360,6 +383,7 @@ async function renderPayloadIfNeeded(): Promise<void> {
 }
 
 function unmountPayload(): void {
+  unmountApproval?.(); unmountApproval = undefined;
   unmountCurrentPayload();
   currentPayload = null;
   currentPayloadContainer = null;

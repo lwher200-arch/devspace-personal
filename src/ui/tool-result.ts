@@ -1,17 +1,22 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { ReviewFileType, ToolResultCard } from "./card-types.js";
+import { APPROVAL_META_KEY, type ApprovalView, type ApprovalState } from '../approval-protocol.js';
 
 export type DecodedToolResult =
+  | { kind: 'approval'; approval: ApprovalView }
   | { kind: "card"; card: ToolResultCard }
   | { kind: "review-reference"; workspaceId: string; reviewRef: string }
   | { kind: "invalid" };
 
 export interface ChatGptToolGlobals {
+  theme?: 'light' | 'dark';
   toolOutput?: unknown;
   toolResponseMetadata?: unknown;
 }
 
 export function decodeToolResult(result: CallToolResult): DecodedToolResult {
+  const approval = approvalFields(asRecord(asRecord(result._meta)?.[APPROVAL_META_KEY]));
+  if (approval) return { kind: 'approval', approval };
   const structured = asRecord(result.structuredContent);
   const metaCard = cardFields(asRecord(asRecord(result._meta)?.card));
 
@@ -112,7 +117,19 @@ function directResultMeta(
   metadata: Record<string, unknown> | undefined,
 ): Record<string, unknown> | undefined {
   if (!metadata) return undefined;
-  return "card" in metadata ? metadata : undefined;
+  return "card" in metadata || APPROVAL_META_KEY in metadata ? metadata : undefined;
+}
+
+function approvalFields(value: Record<string, unknown> | undefined): ApprovalView | undefined {
+  const states: ApprovalState[] = ['pending', 'approved', 'denied', 'submitting', 'submitted', 'failed'];
+  if (!value || value.version !== 1 || typeof value.id !== 'string' || typeof value.tool !== 'string' ||
+      typeof value.reason !== 'string' || typeof value.expiresAt !== 'string' || !Number.isFinite(Date.parse(value.expiresAt)) ||
+      !states.includes(value.state as ApprovalState) || !asRecord(value.args) || typeof value.automatic !== 'boolean' ||
+      value.state === 'pending' && (typeof value.decisionToken !== 'string' || value.decisionToken.length < 32)) return undefined;
+  const submission = asRecord(value.submission);
+  if (value.state === 'submitted' && !submission) return undefined;
+  if (submission && (typeof submission.agentId !== 'string' || !submission.agentId || typeof submission.workspaceId !== 'string' || !submission.workspaceId)) return undefined;
+  return value as unknown as ApprovalView;
 }
 
 function mcpToolResult(value: unknown): CallToolResult | undefined {

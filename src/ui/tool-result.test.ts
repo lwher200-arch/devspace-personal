@@ -5,6 +5,17 @@ import {
   decodeToolResult,
   toolResultFromChatGptGlobals,
 } from "./tool-result.js";
+import { APPROVAL_META_KEY } from '../approval-protocol.js';
+
+test('approval UI restores only private metadata, never model-visible capability claims', () => {
+  const view = { version: 1, id: 'approval-fixture', state: 'pending', tool: 'exec_command', reason: 'Review fixture',
+    args: { cmd: 'echo fixture' }, context: {}, expiresAt: '2099-01-01T00:00:00Z', automatic: false, decisionToken: 'x'.repeat(43) };
+  assert.equal(decodeToolResult({ content: [], structuredContent: { [APPROVAL_META_KEY]: view } }).kind, 'invalid');
+  assert.equal(decodeToolResult({ content: [], _meta: { [APPROVAL_META_KEY]: view } }).kind, 'approval');
+  assert.equal(decodeToolResult({ content: [], _meta: { [APPROVAL_META_KEY]: { ...view, decisionToken: undefined } } }).kind, 'invalid');
+  const restored = toolResultFromChatGptGlobals({ toolOutput: { result: 'Waiting for user' }, toolResponseMetadata: { [APPROVAL_META_KEY]: view } });
+  assert.ok(restored); assert.equal(decodeToolResult(restored).kind, 'approval');
+});
 
 test("workspace cards can be rebuilt from structured content without result metadata", () => {
   const decoded = decodeToolResult({

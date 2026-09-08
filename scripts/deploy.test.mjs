@@ -201,7 +201,9 @@ test('owned service requires IPC readiness and stops only its child',async t=>{
 test('startup failure and readiness timeout never report ready',async t=>{
   const root=fixture(t);const script=join(root,'scripts/local-server.mjs');
   writeFileSync(script,'process.exit(2);');
-  await assert.rejects(startOwnedService(root,process.env,{host:'127.0.0.1',port:19876},{say:()=>{throw Error('unexpected ready')},timeoutMs:1000}),/before readiness/);
+  // Keep exit and timeout coverage distinct: OS scheduling can exceed one second
+  // before this child runs. The exit case uses the production startup budget.
+  await assert.rejects(startOwnedService(root,process.env,{host:'127.0.0.1',port:19876},{say:()=>{throw Error('unexpected ready')}}),/before readiness/);
   writeFileSync(script,"process.on('message',()=>process.exit(0));setInterval(()=>{},1000);");
   await assert.rejects(startOwnedService(root,process.env,{host:'127.0.0.1',port:19876},{timeoutMs:500}),/timed out/);
 });

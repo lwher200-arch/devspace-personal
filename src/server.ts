@@ -24,7 +24,9 @@ import {
 import { loadConfig, type ServerConfig } from "./config.js";
 import { CodexBridge, parseCodexSubmission, registerCodexBridgeTools, submitCodexTool } from "./codex-bridge.js";
 import { registerProjectTools } from "./project-tools.js";
-import { OwnerApprovals, classifyMcpOperation, installOwnerApprovalRoutes } from './mcp-authorization.js';
+import { OwnerApprovals, approvalPrincipal, classifyMcpOperation, installOwnerApprovalRoutes } from './mcp-authorization.js';
+import { registerApprovalTools, isApprovalUiTool, chatApprovalEnabled, chatApprovalMode } from './approval-tools.js';
+import { REVIEW_APPROVAL_TOOL } from './approval-protocol.js';
 import {
   createOpenAIIncomingArtifactAdapter,
   type IncomingArtifactAdapter,
@@ -113,7 +115,7 @@ function serverInstructions(
   const common = `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected.`;
 
   const authorization = config.toolAuthorization === 'owner_approval'
-    ? ' High-risk operations require independent Owner approval. On OWNER_APPROVAL_REQUIRED, show approvalUrl to the user and stop; never ask for their password, approve on their behalf, disguise the operation, or switch tools to evade approval. Codex submissions execute once on user approval: recover the task with codex_tasks and query codex_task_status, rather than creating another request. Other operations require the exact retry after approval. Routine guarded patches remain available.' : '';
+    ? ' High-risk operations require user approval. On OWNER_APPROVAL_REQUIRED, if chatApproval.enabled is true call review_approval with approvalId to show the decision card, then wait for the user. Otherwise show approvalUrl and wait. Never ask for passwords, read private card metadata, call the UI decision tool on the user behalf, or evade approval. Codex submissions execute once on approval: recover the task and query status, not another start. Other operations need the exact retry after approval. Routine guarded patches remain available.' : '';
   return `${common} ${toolSurface.instructions({ agents, skills })}${artifactInstruction}${showChangesInstruction}${authorization}`;
 }
 
@@ -291,6 +293,7 @@ export function createMcpServer(
   resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
   codexBridge?: CodexBridge,
+  approvals?: OwnerApprovals,
 ): McpServer {
   const toolSurface = getToolSurface(config.toolMode);
   const server = new McpServer(
@@ -713,6 +716,7 @@ export function createMcpServer(
   }
 
   if (codexBridge) registerCodexBridgeTools(server, workspaces, codexBridge);
+  if (approvals && config.uiEnabled) registerApprovalTools(server, config, approvals, workspaces);
   return server;
 }
 
@@ -892,11 +896,16 @@ export function createServer(
         // Review the same normalized inputs the MCP schema will execute (for
         // example, whitespace must not route the reviewed and actual models differently).
         const executionArgs = automatic ? parseCodexSubmission(tool, args) : args;
-        const assessment = classifyMcpOperation(config, workspaces, tool, executionArgs);
+        const assessment = isApprovalUiTool(tool)
+          ? { reason: undefined, context: {} }
+          : classifyMcpOperation(config, workspaces, tool, executionArgs);
+        if (!assessment.reason && !isApprovalUiTool(tool) && config.approvalProfile === 'high_risk_only') {
+          logEvent(config.logging, 'info', 'tool_authorization_auto', { tool, requestId });
+        }
         if (assessment.reason) {
           // Transport sessions can reconnect while the user approves in a browser.
           // Retain the authenticated client and optional logical conversation scope.
-          const principal = JSON.stringify([req.auth!.clientId, openAiConversationScopeId(req.body.params?._meta) ?? null]);
+          const principal = approvalPrincipal(req.auth!.clientId, req.body.params?._meta);
           const snapshot = structuredClone(executionArgs), originalAssessment = JSON.stringify(assessment);
           const accessToken = req.auth!.token;
           const decision = approvals.require({ principal, tool, args, ...assessment, reason: assessment.reason }, automatic ? async () => {
@@ -925,9 +934,12 @@ export function createServer(
                 content: [textBlock(JSON.stringify(detail))], structuredContent: { result: JSON.stringify(detail) } } }); return;
             }
             const detail = { code: entry.state === 'denied' ? 'OWNER_DENIED' : 'OWNER_APPROVAL_REQUIRED', approvalId: entry.id,
+              approvalProfile: config.approvalProfile ?? 'conservative',
               approvalUrl: new URL(`/owner/approvals/${entry.id}`, config.publicBaseUrl).href, expiresAt: new Date(entry.expires).toISOString(),
               reason: entry.reason, executionMode: automatic ? 'submit_on_approval' : 'retry_after_approval',
-              instruction: `Ask the user to open this URL and approve with their Owner password. Never ask for the password in Chat or approve on their behalf. ${automatic ? 'Approval automatically submits exactly this Codex turn. Afterwards use codex_tasks and codex_task_status; an identical retry only recovers the submission receipt. Do not create a new request.' : 'Retry only the exact operation after approval.'} Approval grants no additional sandbox or directory access.` };
+              ...(config.uiEnabled ? { chatApproval: { ...chatApprovalMode(config, req.auth!.clientId, req.body.params?._meta), clientId: req.auth!.clientId,
+                reviewTool: REVIEW_APPROVAL_TOOL, instruction: 'When enabled, call review_approval to present the user decision card instead of asking for an Owner password. Never call the UI decision tool on the user behalf.' } } : {}),
+              instruction: `${chatApprovalEnabled(config, req.auth!.clientId, req.body.params?._meta) ? 'Call review_approval with this approvalId to show the user an inline decision card, then wait for their action. If the host cannot show the card, use approvalUrl as fallback.' : 'Ask the user to open approvalUrl and approve with their Owner password. Chat UI approval requires a trusted client and a non-empty host conversation context.'} Never ask for the password in Chat or approve on their behalf. ${automatic ? 'Approval automatically submits exactly this Codex turn. Afterwards use codex_tasks and codex_task_status; an identical retry only recovers the submission receipt. Do not create a new request.' : 'Retry only the exact operation after approval.'} Approval grants no additional sandbox or directory access.` };
             res.json({ jsonrpc: '2.0', id: req.body.id, result: { isError: true, content: [textBlock(JSON.stringify(detail))] } }); return;
           }
           logEvent(config.logging, 'info', 'owner_approval_consumed', { tool, requestId });
@@ -971,6 +983,7 @@ export function createServer(
           resolveLocalAgentProviders,
           incomingArtifactAdapters,
           codexBridge,
+          approvals,
         );
         await server.connect(transport);
       } else {

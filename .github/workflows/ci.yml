@@ -68,10 +68,17 @@ jobs:
         if: matrix.os == 'windows-latest'
         env:
           DEVSPACE_TEST_BROWSER: C:\Program Files\Google\Chrome\Application\chrome.exe
-        run: pnpm exec tsx --test src/mcp-authorization.browser.test.ts
+        run: pnpm exec tsx --test src/mcp-authorization.browser.test.ts src/ui/approval-card.browser.test.ts
 
       - name: Build
         run: pnpm build
+
+      - name: Built ChatGPT approval UI
+        if: matrix.os == 'windows-latest'
+        env:
+          DEVSPACE_TEST_BROWSER: C:\Program Files\Google\Chrome\Application\chrome.exe
+          DEVSPACE_UI_BUILD_DIR: dist/ui
+        run: pnpm exec tsx --test src/ui/approval-card.browser.test.ts
 
       - name: Doctor
         run: node dist/cli.js doctor

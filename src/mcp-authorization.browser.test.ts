@@ -12,36 +12,9 @@ import { loadConfig } from './config.js';
 import { OwnerApprovals, installOwnerApprovalRoutes } from './mcp-authorization.js';
 import { terminateProcessTree } from './process-platform.js';
 import { writeTestDevspaceConfig } from './test-support/config.test.js';
+import { BrowserProtocol } from './test-support/browser-protocol.js';
 
 const browserExecutable = process.env.DEVSPACE_TEST_BROWSER;
-
-// Use an isolated installed Chromium, without another browser automation dependency.
-class BrowserProtocol {
-  private sequence = 0;
-  private pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
-  constructor(private socket: WebSocket) {
-    socket.addEventListener('message', event => {
-      const value = JSON.parse(String(event.data));
-      const entry = this.pending.get(value.id);
-      if (!entry) return;
-      this.pending.delete(value.id); clearTimeout(entry.timer);
-      if (value.error) entry.reject(new Error(value.error.message)); else entry.resolve(value.result);
-    });
-    socket.addEventListener('close', () => {
-      for (const entry of this.pending.values()) { clearTimeout(entry.timer); entry.reject(new Error('Test browser closed.')); }
-      this.pending.clear();
-    });
-  }
-  send(method: string, params: object = {}, sessionId?: string): Promise<any> {
-    return new Promise((resolve, reject) => {
-      const id = ++this.sequence;
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`Browser timeout: ${method}`)); }, 8000);
-      this.pending.set(id, { resolve, reject, timer });
-      this.socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
-    });
-  }
-  disconnect() { this.socket.close(); }
-}
 
 for (const automatic of [false, true]) test(`browser approval preserves Origin and URL privacy (${automatic ? 'auto submission' : 'manual retry'})`, {
   skip: browserExecutable ? false : 'Set DEVSPACE_TEST_BROWSER to an installed Chromium executable.', timeout: 45000,
@@ -54,6 +27,7 @@ for (const automatic of [false, true]) test(`browser approval preserves Origin a
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   const config = loadConfig(writeTestDevspaceConfig(join(directory, 'config'), { server: { publicBaseUrl: origin }, logging: { level: 'silent' } }));
+  if (automatic) config.oauth.ownerSessionTtlSeconds = 43200;
   let submitted: { origin?: string; status: number; policy: unknown } | undefined;
   app.use((req, res, next) => {
     if (req.method === 'POST') res.on('finish', () => { submitted = { origin: req.header('origin'), status: res.statusCode, policy: res.getHeader('referrer-policy') }; });
@@ -124,6 +98,23 @@ for (const automatic of [false, true]) test(`browser approval preserves Origin a
     assert.equal(dispatched, 1);
     const receipt = approvals.require(operation); if (receipt.allowed) throw Error('no second execution grant');
     assert.equal(receipt.approval.state, 'submitted');
+    const second = approvals.require({ ...operation, args: { second: true } }, async () => { dispatched++; return { agentId: 'agt-browser-second', workspaceId: 'ws-browser-fixture' }; });
+    if (second.allowed) throw Error('unexpected grant');
+    await browser.send('Page.navigate', { url: `${origin}/owner/approvals/${second.approval.id}` }, sessionId);
+    let ready = false;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const result = await browser.send('Runtime.evaluate', { expression: 'Boolean(document.querySelector("button[value=approve]"))', returnByValue: true }, sessionId);
+      if (result.result.value) { ready = true; break; } await delay(50);
+    }
+    assert.ok(ready);
+    const passwordField = await browser.send('Runtime.evaluate', { expression: 'Boolean(document.querySelector("input[name=owner_token]"))', returnByValue: true }, sessionId);
+    assert.equal(passwordField.result.value, false, 'a verified 12h browser login must not ask for the password again');
+    assert.equal(dispatched, 1, 'remembered login must not approve the next operation');
+    const visibleCookies = await browser.send('Runtime.evaluate', { expression: 'document.cookie', returnByValue: true }, sessionId);
+    assert.equal(visibleCookies.result.value, '', 'Owner session and approval cookies are HttpOnly');
+    await browser.send('Runtime.evaluate', { expression: 'document.querySelector("button[value=approve]").click()', userGesture: true }, sessionId);
+    for (let attempt = 0; attempt < 100 && dispatched < 2; attempt++) await delay(50);
+    assert.equal(dispatched, 2);
   } else assert.equal(approvals.require(operation).allowed, true);
   await browser.send('Runtime.evaluate', { expression: `const link=document.createElement('a');link.href=${JSON.stringify(external)};document.body.append(link);link.click();`, userGesture: true }, sessionId);
   for (let attempt = 0; attempt < 100 && !outgoing; attempt++) await delay(50);

@@ -1,9 +1,25 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
+  DEVSPACE_CONFIG_SCHEMA_URL,
   devspaceConfigJsonSchema,
   devspaceConfigSchema,
 } from "./config-schema.js";
+
+const personalSchemaUrl =
+  "https://raw.githubusercontent.com/lwher200-arch/devspace-personal/refs/heads/codex/personal/schema/v1/devspace.schema.json";
+assert.equal(DEVSPACE_CONFIG_SCHEMA_URL, personalSchemaUrl, "personal configuration must not default to the upstream schema");
+assert.equal(devspaceConfigSchema.parse({ configVersion: 1 }).$schema, personalSchemaUrl);
+const schemaMetadata = devspaceConfigJsonSchema();
+assert.ok("$id" in schemaMetadata);
+assert.equal(schemaMetadata.$id, personalSchemaUrl);
+const configurationGuide = readFileSync(new URL("../docs/configuration.md", import.meta.url), "utf8");
+assert.ok(configurationGuide.includes(`"$schema": "${personalSchemaUrl}"`));
+assert.equal(
+  devspaceConfigSchema.parse({ configVersion: 1, $schema: "https://example.com/custom.schema.json" }).$schema,
+  "https://example.com/custom.schema.json",
+  "explicit custom schema metadata remains supported",
+);
 
 assert.throws(
   () => devspaceConfigSchema.parse({ configVersion: 1, typo: true }),

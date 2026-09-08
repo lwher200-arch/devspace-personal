@@ -148,7 +148,7 @@ export class LocalAgentManager {
       yield* manager.providerEnabledResult(target.provider, target.name, "start");
       const serverPolicy = target.provider === "codex" && input.workspaceId ? manager.codexExecutionPolicy : undefined;
       const executionPolicy = serverPolicy ?? input.executionPolicy;
-      if (serverPolicy && input.executionPolicy && !samePolicy(serverPolicy, input.executionPolicy)) {
+      if (serverPolicy && input.executionPolicy && !sameExecutionPolicy(serverPolicy, input.executionPolicy)) {
         return Result.err(new AgentTargetError({ code: "TARGET_RESOLUTION_FAILED", target: input.target,
           retryable: false, message: "The MCP Codex execution policy cannot be overridden." }));
       }
@@ -197,13 +197,13 @@ export class LocalAgentManager {
       yield* manager.providerEnabledResult(record.provider, record.profileName, "continue");
       yield* manager.driverResult(record.provider, "continue", agentId);
       const serverPolicy = record.provider === "codex" && scope.workspaceId ? manager.codexExecutionPolicy : undefined;
-      if (serverPolicy && overrides.executionPolicy && !samePolicy(serverPolicy, overrides.executionPolicy)) {
+      if (serverPolicy && overrides.executionPolicy && !sameExecutionPolicy(serverPolicy, overrides.executionPolicy)) {
         return Result.err(new AgentTargetError({ code: "TARGET_RESOLUTION_FAILED", target: record.profileName,
           retryable: false, message: "The MCP Codex execution policy cannot be overridden." }));
       }
       overrides = { ...overrides, executionPolicy: serverPolicy ?? overrides.executionPolicy };
       if (record.executionPolicy && overrides.executionPolicy &&
-        !samePolicy(record.executionPolicy, overrides.executionPolicy)) {
+        !sameExecutionPolicy(record.executionPolicy, overrides.executionPolicy)) {
         return Result.err(new AgentTargetError({ code: "TARGET_RESOLUTION_FAILED", target: record.profileName,
           retryable: false, message: "A stored execution policy cannot be replaced or weakened." }));
       }
@@ -674,10 +674,6 @@ export class LocalAgentManager {
   ): void {
     this.logger?.(level, event, fields);
   }
-}
-
-function samePolicy(left: CodexExecutionPolicy, right: CodexExecutionPolicy): boolean {
-  return sameExecutionPolicy(left, right);
 }
 
 export function createLocalAgentManager(options: LocalAgentManagerOptions): LocalAgentManager {

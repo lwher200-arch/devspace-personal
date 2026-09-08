@@ -4,7 +4,7 @@ import { subagentsConfigSchema } from "./local-agent-config.js";
 
 export const DEVSPACE_CONFIG_VERSION = 1 as const;
 export const DEVSPACE_CONFIG_SCHEMA_URL =
-  "https://raw.githubusercontent.com/Waishnav/devspace/main/schema/v1/devspace.schema.json";
+  "https://raw.githubusercontent.com/lwher200-arch/devspace-personal/refs/heads/codex/personal/schema/v1/devspace.schema.json";
 
 const serverConfigSchema = z.object({
   host: z.string().trim().min(1).default("127.0.0.1"),

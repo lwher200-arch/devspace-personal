@@ -19,7 +19,7 @@ Run `devspace init` to create both files. `devspace config set publicBaseUrl
 
 ```jsonc
 {
-  "$schema": "https://raw.githubusercontent.com/lwher200-arch/devspace-personal/codex/personal/schema/v1/devspace.schema.json",
+  "$schema": "https://raw.githubusercontent.com/lwher200-arch/devspace-personal/refs/heads/codex/personal/schema/v1/devspace.schema.json",
   "configVersion": 1,
 
   "server": {

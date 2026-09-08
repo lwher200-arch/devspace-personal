@@ -1,12 +1,12 @@
 {
-  "$id": "https://raw.githubusercontent.com/Waishnav/devspace/main/schema/v1/devspace.schema.json",
+  "$id": "https://raw.githubusercontent.com/lwher200-arch/devspace-personal/refs/heads/codex/personal/schema/v1/devspace.schema.json",
   "title": "DevSpace configuration",
   "description": "Versioned configuration for a local DevSpace MCP server.",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "properties": {
     "$schema": {
-      "default": "https://raw.githubusercontent.com/Waishnav/devspace/main/schema/v1/devspace.schema.json",
+      "default": "https://raw.githubusercontent.com/lwher200-arch/devspace-personal/refs/heads/codex/personal/schema/v1/devspace.schema.json",
       "type": "string",
       "format": "uri"
     },

@@ -44,6 +44,8 @@ import {
   type McpSessionCloseResult,
 } from "./mcp-sessions.js";
 import { ProcessSessionManager } from "./process-sessions.js";
+import { registerNativeProcessTools } from "./native-process-tools.js";
+import { AccessDeniedError } from "./roots.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
@@ -112,11 +114,12 @@ function serverInstructions(
     ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} to read that skill's path before proceeding. Skill paths may be outside the workspace, but ${toolNames.read} only permits advertised SKILL.md files and files under already-loaded skill directories. `
     : "";
   const agents = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
-  const common = `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected.`;
+  const common = `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work, reuse that workspaceId. Use refreshContext=true with the same checkout path only when project rules changed or the earlier bootstrap context is missing. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected.`;
 
   const authorization = config.toolAuthorization === 'owner_approval'
     ? ' High-risk operations require user approval. On OWNER_APPROVAL_REQUIRED, if chatApproval.enabled is true call review_approval with approvalId to show the decision card, then wait for the user. Otherwise show approvalUrl and wait. Never ask for passwords, read private card metadata, call the UI decision tool on the user behalf, or evade approval. Codex submissions execute once on approval: recover the task and query status, not another start. Other operations need the exact retry after approval. Routine guarded patches remain available.' : '';
-  return `${common} ${toolSurface.instructions({ agents, skills })}${artifactInstruction}${showChangesInstruction}${authorization}`;
+  const nativeWorkflow = ' Use project_read_batch for a bounded group of known files, following per-file hashes and continuation. Prefer run_process when a program and literal arguments express the command; use process_status for its existing session and inspect exitCode, timedOut and spawnError. Do not start a second execution to poll delayed work. A zero exit code is command evidence, not proof that tests were discovered or a product workflow succeeded.';
+  return `${common} ${toolSurface.instructions({ agents, skills })}${nativeWorkflow}${artifactInstruction}${showChangesInstruction}${authorization}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -346,7 +349,7 @@ export function createMcpServer(
     {
       title: "Open workspace",
       description:
-        "Start work in a project directory or isolated worktree when no usable workspaceId exists for it. During continued work, reuse the existing workspaceId instead of calling this tool again. By default this uses the actual checkout; set mode=\"worktree\" for isolated or parallel work.",
+        "Start work in a project directory or isolated worktree when no usable workspaceId exists for it. Reuse the workspaceId during continued work. Use refreshContext=true on the same checkout path only to recover changed or missing project context. Defaults to the actual checkout; mode=\"worktree\" creates a new isolated worktree.",
       inputSchema: {
         path: z
           .string()
@@ -363,6 +366,9 @@ export function createMcpServer(
           .string()
           .optional()
           .describe("Git ref to base a worktree on. Only used with mode=\"worktree\". Defaults to HEAD."),
+        refreshContext: z.boolean().optional().describe(
+          "Return current project instructions and catalogs even when this conversation reuses a checkout. Does not grant authority or change the default checkout reuse behavior. Do not use mode=worktree to refresh an existing worktree; read its instructions with the existing workspaceId.",
+        ),
       },
       outputSchema: {
         workspaceId: z.string(),
@@ -398,7 +404,7 @@ export function createMcpServer(
       ...workspaceAppDescriptorMeta(config),
       annotations: { readOnlyHint: true },
     },
-    async ({ path, mode, baseRef }, { _meta }) => {
+    async ({ path, mode, baseRef, refreshContext }, { _meta }) => {
       const startedAt = performance.now();
       const {
         workspace,
@@ -409,7 +415,7 @@ export function createMcpServer(
         includeBootstrapContext,
       } = await workspaces.openWorkspace(
         { path, mode, baseRef },
-        { conversationScopeId: openAiConversationScopeId(_meta) },
+        { conversationScopeId: openAiConversationScopeId(_meta), refreshContext },
       );
       const review = await reviewCheckpoints.initializeWorkspace({
         workspaceId: workspace.id,
@@ -451,7 +457,9 @@ export function createMcpServer(
       const cardInstruction = config.skillsEnabled
         ? "Use this workspaceId for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
         : "Use this workspaceId for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file.";
-      const instruction = workspaceReused
+      const instruction = workspaceReused && includeBootstrapContext
+        ? `Workspace context refreshed for ${workspace.id}. Keep this workspaceId and follow the current instructions and catalogs returned here.`
+        : workspaceReused
         ? [
             `Workspace already open as ${workspace.id}.`,
             "Continue with this workspaceId.",
@@ -642,6 +650,7 @@ export function createMcpServer(
     processSessions,
   });
   registerProjectTools({ server, config, workspaces, processSessions });
+  registerNativeProcessTools({ server, config, workspaces, processSessions });
 
   registerAppTool(
     server,
@@ -896,9 +905,21 @@ export function createServer(
         // Review the same normalized inputs the MCP schema will execute (for
         // example, whitespace must not route the reviewed and actual models differently).
         const executionArgs = automatic ? parseCodexSubmission(tool, args) : args;
-        const assessment = isApprovalUiTool(tool)
-          ? { reason: undefined, context: {} }
-          : classifyMcpOperation(config, workspaces, tool, executionArgs);
+        let assessment: { reason?: string; context: unknown };
+        try {
+          assessment = isApprovalUiTool(tool)
+            ? { reason: undefined, context: {} }
+            : classifyMcpOperation(config, workspaces, tool, executionArgs);
+        } catch (error) {
+          if (!(error instanceof AccessDeniedError)) throw error;
+          // A root-boundary rejection is an expected tool failure. Do not expose
+          // configured private roots or turn it into a misleading server fault.
+          const detail = { code: 'WORKSPACE_ACCESS_DENIED',
+            instruction: 'The requested path or workspace is outside its current authorized boundary. Use an allowed workspace-relative path; approval cannot expand that boundary.' };
+          logEvent(config.logging, 'warn', 'tool_workspace_access_denied', { tool, requestId });
+          res.json({ jsonrpc: '2.0', id: req.body.id, result: { isError: true,
+            content: [textBlock(JSON.stringify(detail))] } }); return;
+        }
         if (!assessment.reason && !isApprovalUiTool(tool) && config.approvalProfile === 'high_risk_only') {
           logEvent(config.logging, 'info', 'tool_authorization_auto', { tool, requestId });
         }

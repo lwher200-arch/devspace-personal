@@ -152,6 +152,15 @@ export function classifyMcpOperation(config: ServerConfig, workspaces: Pick<Work
   const highRiskOnly = config.approvalProfile === 'high_risk_only';
   let mutation = false;
   if (tool === 'exec_command' || tool === 'bash') reason = 'Arbitrary shell executes with the service OS account authority.';
+  else if (tool === 'run_process') reason = 'Native process execution uses the service OS account authority; literal arguments do not provide a sandbox.';
+  else if (tool === 'process_cancel') reason = 'Cancel one running process with the service OS account authority.';
+  else if (tool === 'project_read_batch') {
+    if (!Array.isArray(args.items) || args.items.length < 1 || args.items.length > 8) throw new Error('Batch read requires one to eight items.');
+    for (const item of args.items) {
+      if (!item || typeof item !== 'object' || typeof (item as Arguments).path !== 'string' || !(item as Arguments).path) throw new Error('Every batch item requires a path.');
+      paths.push((item as { path: string }).path);
+    }
+  }
   else if (tool === 'write_stdin') { if (args.chars !== undefined && args.chars !== '') reason = 'Interactive process input can execute additional commands.'; }
   else if (tool === 'codex_task_start' || tool === 'codex_task_continue') {
     reason = 'Authorize one Codex turn. Read-only prevents writes but is not a workspace-only read jail; review the prompt and selected model.';
@@ -166,7 +175,7 @@ export function classifyMcpOperation(config: ServerConfig, workspaces: Pick<Work
     if (!highRiskOnly && mutation && (!args.expectedHashes || typeof args.expectedHashes !== 'object' || Array.isArray(args.expectedHashes))) reason = 'Unguarded patch requires approval; prefer expectedHashes and dryRun.';
   } else if (tool === 'write' || tool === 'edit') { mutation = true; if (!highRiskOnly) reason = 'Legacy mutation has no SHA-256 contract; prefer a guarded apply_patch.'; }
   else if (tool === 'open_workspace') { if (args.mode === 'worktree' && !highRiskOnly) reason = 'Creating a worktree changes repository state.'; }
-  else if (!['read', 'project_read', 'project_files', 'project_search', 'show_changes', 'codex_preflight', 'codex_task_status', 'codex_tasks'].includes(tool)) reason = 'This capability has not been classified as routine; explicit approval is required.';
+  else if (!['read', 'project_read', 'project_files', 'project_search', 'process_status', 'show_changes', 'codex_preflight', 'codex_task_status', 'codex_tasks'].includes(tool)) reason = 'This capability has not been classified as routine; explicit approval is required.';
   if (typeof args.path === 'string') paths.push(args.path);
   const absolutePaths = paths.map(path => {
     const absolute = canonicalAllowedPath(tool === 'read' && workspace ? workspaces.resolveReadPath(workspace, path).absolutePath :

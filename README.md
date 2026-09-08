@@ -15,7 +15,9 @@ DevSpace Personal 是个人维护的 MCP 本地开发服务。它将项目发现
 - 以工作区为操作单位，复用明确的 `workspaceId`。
 - 分页列出项目文件，返回完成状态、游标和排除项。
 - 提供字面量搜索，以及带 SHA-256 的 UTF-8 分页读取。
+- 已知多个目标文件时，一次批量读取 1–8 项，按总结果预算返回逐项状态和带哈希的续读请求。
 - 加载项目说明和已声明的技能，报告未完成的上下文扫描。
+- 同一对话复用 checkout 时，可显式刷新项目规则和技能目录，默认继续省略重复上下文。
 
 “读取项目”意味着按范围逐页获取内容，不是把整个仓库自动上传或一次塞入模型。
 
@@ -31,6 +33,11 @@ DevSpace Personal 是个人维护的 MCP 本地开发服务。它将项目发现
 
 命令工具可运行测试、构建和项目脚本。短任务直接返回结果，长任务返回进程
 会话标识，调用方继续获取输出、退出码及截断状态。
+
+`run_process` 以原生 executable 和字面 argv 执行，避免 Shell 引号与展开问题；
+初始 stdin 写入后关闭，运行总超时与返回等待时间分开控制。通过 `process_status`
+继续同一次执行，通过 `process_cancel` 请求终止。两种宿主工具模式均可使用。
+退出码、启动失败、超时和取消分别返回；进程会话不会跨服务重启恢复。
 
 命令以服务账户的权限执行。工作区路径校验不会将任意 Shell 命令变成沙箱。
 
@@ -153,6 +160,7 @@ node scripts/deploy.mjs --no-start
 - [核心模块与契约](docs/core-modules.md)
 - [部署与使用](docs/setup.md)
 - [文件操作与开发流程](docs/chatgpt-coding-workflow.md)
+- [WebCodex 能力融入与使用](docs/webcodex-adoption.md)
 - [配置参考](docs/configuration.md)
 - [代理桥接](docs/closed-loop.md)
 - [代理档案](docs/agent-profile-schema.md)

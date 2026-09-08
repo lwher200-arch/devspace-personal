@@ -1,5 +1,6 @@
 import * as z from "zod/v4";
 import { projectFiles, projectRead, projectSearch, readProjectRequest } from "./project-access.js";
+import { projectReadBatch, projectReadBatchInputSchema } from "./project-read-batch.js";
 import { applyPatch } from "./apply-patch.js";
 import { resultOutputSchema, runLoggedToolOperation, textBlock } from "./tool-surfaces/shared.js";
 import { workspaceIdDescription, type ToolRegistrationContext } from "./tool-surfaces/types.js";
@@ -34,6 +35,11 @@ export function registerProjectTools({ server, config, workspaces }: ToolRegistr
       limit: z.number().int().min(2).max(20000).optional(), expectedSha256: z.string().regex(/^[a-f0-9]{64}$/).optional() },
     outputSchema: resultOutputSchema(), annotations: { readOnlyHint: true, openWorldHint: false },
   }, ({ workspaceId, ...input }) => response("project_read", workspaceId, root => projectRead(root, input)));
+  server.registerTool("project_read_batch", {
+    description: "Read one to eight UTF-8 project files in request order using project_read character offsets and SHA-256. All paths are checked before any body is read. maxResultBytes bounds the complete result JSON in UTF-8, including metadata, escaping and continuation. Follow continuation.items with the supplied hashes; inspect per-item errors separately. Each file is observed separately, not an atomic snapshot. Read applicable project instructions first.",
+    inputSchema: { ...scope, ...projectReadBatchInputSchema.shape },
+    outputSchema: resultOutputSchema(), annotations: { readOnlyHint: true, openWorldHint: false },
+  }, ({ workspaceId, ...input }) => response("project_read_batch", workspaceId, root => projectReadBatch(root, input)));
 }
 
 export async function runProjectCommand(root: string, args: string[]): Promise<unknown> {
@@ -55,6 +61,10 @@ export async function runProjectCommand(root: string, args: string[]): Promise<u
   if (command === "search") return projectSearch(root, discovery.extend({ query: z.string() }).strict().parse(values));
   if (command === "read") return projectRead(root, z.object({ path: z.string(), offset: z.number().optional(),
     limit: z.number().optional(), expectedSha256: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().parse(values));
+  if (command === "read-batch") {
+    const options = z.object({ requestFile: z.string() }).strict().parse(values);
+    return projectReadBatch(root, projectReadBatchInputSchema.parse(await readProjectRequest(root, options.requestFile)));
+  }
   if (command === "patch") {
     const options = z.object({ requestFile: z.string(), dryRun: z.boolean().optional() }).strict().parse(values);
     const request = z.object({ patch: z.string().min(1), expectedHashes: z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/).nullable()) })
@@ -63,5 +73,5 @@ export async function runProjectCommand(root: string, args: string[]): Promise<u
     // Keep command output bounded; the full diff is available through show_changes.
     return { files: result.files, additions: result.additions, removals: result.removals, dryRun: result.dryRun };
   }
-  throw new Error("Usage: devspace project <files|search|read|patch> [--path relative-path] [--query literal] [--cursor token] [--offset n] [--limit n] [--expected-sha256 hash] [--include-ignored] [--request-file path --dry-run] [--json]");
+  throw new Error("Usage: devspace project <files|search|read|read-batch|patch> [--path relative-path] [--query literal] [--cursor token] [--offset n] [--limit n] [--expected-sha256 hash] [--include-ignored] [--request-file path --dry-run] [--json]");
 }

@@ -27,11 +27,11 @@ test("tool modes expose the expected host-facing tool surface", async (t) => {
   }> = [
     {
       mode: "claude",
-      expected: ["open_workspace", "read", "write", "edit", "bash", "show_changes", "project_files", "project_search", "project_read"],
+      expected: ["open_workspace", "read", "write", "edit", "bash", "show_changes", "project_files", "project_search", "project_read", "project_read_batch", "run_process", "process_status", "process_cancel"],
     },
     {
       mode: "codex",
-      expected: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin", "show_changes", "project_files", "project_search", "project_read"],
+      expected: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin", "show_changes", "project_files", "project_search", "project_read", "project_read_batch", "run_process", "process_status", "process_cancel"],
     },
   ];
 
@@ -281,6 +281,58 @@ test("open_workspace refreshes provider availability for each catalog", async (t
     (usable.agents as Array<Record<string, unknown>>)[0]?.name,
     "reviewer",
   );
+});
+
+test("explicit context refresh returns changed rules without replacing the workspace", async (t) => {
+  const context = await fixture(t);
+  const initial = structuredContent(await callOpen(context.client, context.project, "refresh-chat"));
+  await writeFile(join(context.project, "AGENTS.md"), "Updated project rules: preserve fixtures.\n");
+  const skillDir = join(context.project, ".agents", "skills", "fixture-refresh");
+  await mkdir(skillDir, { recursive: true });
+  await writeFile(join(skillDir, "SKILL.md"), "---\nname: fixture-refresh\ndescription: Refreshed fixture guidance.\n---\nUse the new fixture.\n");
+  const ordinary = structuredContent(await callOpen(context.client, context.project, "refresh-chat"));
+  assert.equal(ordinary.agentsFiles, undefined);
+  const refreshed = await context.client.callTool({
+    name: "open_workspace",
+    arguments: { path: context.project, refreshContext: true },
+    _meta: { "openai/session": "refresh-chat" },
+  });
+  assert.notEqual(refreshed.isError, true);
+  const value = structuredContent(refreshed);
+  assert.equal(value.workspaceId, initial.workspaceId);
+  assert.ok((value.agentsFiles as Array<{ content: string }>).some(file => file.content.includes("Updated project rules")));
+  assert.ok(Array.isArray(value.availableAgentsFiles));
+  assert.ok((value.skills as Array<{ name: string }>).some(skill => skill.name === "fixture-refresh"));
+  assert.match(String(value.instruction), /refreshed/i);
+  const after = structuredContent(await callOpen(context.client, context.project, "refresh-chat"));
+  assert.equal(after.workspaceId, initial.workspaceId);
+  assert.equal(after.agentsFiles, undefined);
+  const invalid = await context.client.callTool({ name: "open_workspace", arguments: {
+    path: context.project, mode: "worktree", refreshContext: true,
+  }, _meta: { "openai/session": "refresh-chat" } });
+  assert.equal(invalid.isError, true);
+  assert.match(JSON.stringify(invalid.content), /must not create a worktree/);
+});
+
+test("legacy process polling cannot consume a native execution's final evidence", async (t) => {
+  const context = await fixture(t, { toolMode: "codex" });
+  const { workspaceId } = structuredContent(await callOpen(context.client, context.project));
+  const started = structuredContent(await context.client.callTool({ name: "run_process", arguments: {
+    workspaceId, executable: process.execPath, args: ["-e", "setTimeout(() => process.exit(7), 200)"],
+    yieldTimeMs: 0, timeoutMs: 3000,
+  } }));
+  const legacy = await context.client.callTool({ name: "write_stdin", arguments: {
+    workspaceId, sessionId: started.sessionId, yieldTimeMs: 1000,
+  } });
+  assert.equal(legacy.isError, true);
+  assert.match(JSON.stringify(legacy.content), /process_status/);
+  const finished = await context.client.callTool({ name: "process_status", arguments: {
+    workspaceId, sessionId: started.sessionId, yieldTimeMs: 2000,
+  } });
+  assert.equal(finished.isError, true);
+  assert.equal(structuredContent(finished).executionId, started.executionId);
+  assert.equal(structuredContent(finished).exitCode, 7);
+  assert.equal(structuredContent(finished).running, false);
 });
 
 test("open_workspace omits providers disabled by configuration", async (t) => {

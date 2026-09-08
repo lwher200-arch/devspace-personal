@@ -82,6 +82,7 @@ export interface OpenWorkspaceInput {
 
 export interface OpenWorkspaceOptions {
   conversationScopeId?: string;
+  refreshContext?: boolean;
 }
 
 type PathStats = Stats;
@@ -105,6 +106,9 @@ export class WorkspaceRegistry {
     openOptions: OpenWorkspaceOptions = {},
   ): Promise<WorkspaceContext> {
     const workspaceInput = typeof input === "string" ? { path: input } : input;
+    if (openOptions.refreshContext && workspaceInput.mode === "worktree") {
+      throw new Error("Context refresh must not create a worktree. Read the existing worktree instructions with its workspaceId.");
+    }
     const conversationScopeId = openOptions.conversationScopeId;
     if (!conversationScopeId || !this.store) {
       return this.openNewWorkspace(workspaceInput);
@@ -127,9 +131,9 @@ export class WorkspaceRegistry {
     if (pending) {
       const context = await pending;
       return {
-        ...context,
+        ...(openOptions.refreshContext ? this.refreshCatalogs(context) : context),
         workspaceReused: true,
-        includeBootstrapContext: false,
+        includeBootstrapContext: openOptions.refreshContext === true,
       };
     }
 
@@ -141,12 +145,19 @@ export class WorkspaceRegistry {
     this.pendingCheckoutOpens.set(operationKey, open);
 
     try {
-      return await open;
+      const context = await open;
+      return openOptions.refreshContext ? this.refreshCatalogs(context) : context;
     } finally {
       if (this.pendingCheckoutOpens.get(operationKey) === open) {
         this.pendingCheckoutOpens.delete(operationKey);
       }
     }
+  }
+
+  private refreshCatalogs(context: WorkspaceContext): WorkspaceContext {
+    const workspace = this.getWorkspace(context.workspace.id);
+    Object.assign(workspace, this.loadSkillsForWorkspace(workspace.root));
+    return { ...context, workspace, includeBootstrapContext: true };
   }
 
   private async openNewWorkspace(options: OpenWorkspaceInput): Promise<WorkspaceContext> {

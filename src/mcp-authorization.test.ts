@@ -160,6 +160,23 @@ test('real OAuth/MCP requires independent Owner approval before command side eff
   const conversationMeta={'openai/session':'fixture-logical-chat'};
   const tool=(name:string,args:Record<string,unknown>)=>rpc('tools/call',{name,arguments:{workspaceId,...args},_meta:conversationMeta});
   assert.notEqual((await tool('project_read',{path:'hello.txt'})).result.isError,true);
+  assert.notEqual((await tool('project_read_batch', { items: [{ path: 'hello.txt' }] })).result.isError, true);
+  writeFileSync(join(project, '.env'), 'FIXTURE_BATCH_SECRET_MUST_NOT_LEAK');
+  const protectedBatch = await tool('project_read_batch', { items: [{ path: 'hello.txt' }, { path: '.env' }] });
+  assert.equal(JSON.parse(protectedBatch.result.content[0].text).code, 'OWNER_APPROVAL_REQUIRED');
+  assert.doesNotMatch(JSON.stringify(protectedBatch), /FIXTURE_BATCH_SECRET_MUST_NOT_LEAK/);
+  const escapedBatch = await tool('project_read_batch', { items: [{ path: 'hello.txt' }, { path: '../outside.txt' }] });
+  assert.equal(escapedBatch.result.isError, true);
+  assert.equal(JSON.parse(escapedBatch.result.content[0].text).code, 'WORKSPACE_ACCESS_DENIED');
+  const nativeBlocked = await tool('run_process', { executable: process.execPath,
+    args: ['-e', "require('node:fs').writeFileSync('native-not-approved.txt','bad')"] });
+  assert.equal(JSON.parse(nativeBlocked.result.content[0].text).code, 'OWNER_APPROVAL_REQUIRED');
+  assert.equal(existsSync(join(project, 'native-not-approved.txt')), false);
+  const cancelBlocked = await tool('process_cancel', { sessionId: 12345 });
+  assert.equal(JSON.parse(cancelBlocked.result.content[0].text).code, 'OWNER_APPROVAL_REQUIRED');
+  const absentStatus = await tool('process_status', { sessionId: 12345, yieldTimeMs: 0 });
+  assert.equal(absentStatus.result.isError, true);
+  assert.doesNotMatch(JSON.stringify(absentStatus), /OWNER_APPROVAL_REQUIRED/);
   const args={cmd:'echo approved> approved.txt',yieldTimeMs:10000};
   const blocked=await tool('exec_command',args); assert.equal(blocked.result.isError,true);
   const approval=JSON.parse(blocked.result.content[0].text); assert.equal(approval.code,'OWNER_APPROVAL_REQUIRED');

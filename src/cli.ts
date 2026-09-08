@@ -462,7 +462,7 @@ function printHelp(): void {
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
       "  devspace show-changes <review-ref> [--json]",
-      "  devspace project <files|search|read|patch> [--path path] [--query literal] [--cursor token] [--offset n] [--limit n] [--expected-sha256 hash] [--include-ignored] [--request-file path --dry-run] [--json]",
+      "  devspace project <files|search|read|read-batch|patch> [--path path] [--query literal] [--cursor token] [--offset n] [--limit n] [--expected-sha256 hash] [--include-ignored] [--request-file path --dry-run] [--json]",
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] (<prompt> | --prompt-file <path>)",
       "  devspace agents continue <id> [--model <model>] [--effort <level>] (<prompt> | --prompt-file <path>)",

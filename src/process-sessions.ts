@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
@@ -34,6 +36,27 @@ export interface WriteStdinInput {
   maxOutputTokens?: number;
 }
 
+export interface StartProcessInput {
+  workspaceId: string;
+  executable: string;
+  args?: string[];
+  stdin?: string;
+  cwd: string;
+  workspaceRoot?: string;
+  timeoutMs?: number;
+  yieldTimeMs?: number;
+  maxOutputTokens?: number;
+}
+
+export interface NativeProcessSnapshot extends ProcessSnapshot {
+  executionId: string;
+  cwd: string;
+  timedOut: boolean;
+  cancelled: boolean;
+  spawnError?: string;
+  stdinError?: string;
+}
+
 export interface ProcessSnapshot {
   sessionId?: number;
   output: string;
@@ -64,6 +87,15 @@ interface ProcessSession {
   exitPromise: Promise<void>;
   resolveExit: () => void;
   cleanupTimer?: NodeJS.Timeout;
+  runtimeTimer?: NodeJS.Timeout;
+  native?: {
+    executionId: string;
+    cwd: string;
+    timedOut: boolean;
+    cancelled: boolean;
+    spawnError?: string;
+    stdinError?: string;
+  };
 }
 
 interface ProcessSessionManagerOptions {
@@ -77,6 +109,37 @@ function boundedInteger(value: number | undefined, fallback: number, maximum: nu
     throw new Error("Duration and output limits must be non-negative.");
   }
   return Math.min(Math.floor(value), maximum);
+}
+
+function nativeInteger(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`Native process limits must be integers between ${minimum} and ${maximum}.`);
+  }
+  return value;
+}
+
+function validateNativeInput(input: StartProcessInput): { args: string[]; timeoutMs: number; yieldTimeMs: number } {
+  if (typeof input.executable !== "string" || !input.executable.trim() || input.executable.length > 1_024 || input.executable.includes("\0")) {
+    throw new Error("Native executable must be a non-empty string of at most 1024 characters without NUL.");
+  }
+  if (process.platform === "win32" && /\.(cmd|bat)[ .]*$/i.test(input.executable)) {
+    throw new Error("Windows .cmd and .bat files require shell semantics; use exec_command or bash explicitly.");
+  }
+  const args = input.args ?? [];
+  if (!Array.isArray(args) || args.length > 256 || args.some(arg => typeof arg !== "string" || arg.length > 8_192 || arg.includes("\0"))) {
+    throw new Error("Native args must contain at most 256 strings, each at most 8192 characters without NUL.");
+  }
+  if ([input.executable, ...args].reduce((total, value) => total + Buffer.byteLength(value, "utf8") + 1, 0) > 16_000) {
+    throw new Error("Native executable and args must fit within 16000 UTF-8 bytes including argument boundaries.");
+  }
+  if (input.stdin !== undefined && (typeof input.stdin !== "string" || Buffer.byteLength(input.stdin, "utf8") > 65_536)) {
+    throw new Error("Native stdin must fit within 65536 UTF-8 bytes.");
+  }
+  const timeoutMs = nativeInteger(input.timeoutMs, 60_000, 1, 3_600_000);
+  const yieldTimeMs = nativeInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, 0, MAX_COMMAND_YIELD_MS);
+  nativeInteger(input.maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 1, 100_000);
+  return { args: [...args], timeoutMs, yieldTimeMs };
 }
 
 function terminalSize(value: number | undefined, fallback: number): number {
@@ -242,8 +305,45 @@ export class ProcessSessionManager {
     return snapshot;
   }
 
+  async startProcess(input: StartProcessInput): Promise<NativeProcessSnapshot> {
+    // Validate all budgets before the child can have any side effects.
+    const { args, timeoutMs, yieldTimeMs } = validateNativeInput(input);
+    const session = this.createSession({ workspaceId: input.workspaceId });
+    session.native = { executionId: randomUUID(), cwd: input.cwd, timedOut: false, cancelled: false };
+    this.sessions.set(session.id, session);
+    this.startNativePipe(session, input, args, timeoutMs);
+    await this.waitForExit(session, yieldTimeMs);
+    const snapshot = this.consume(session, input.maxOutputTokens) as NativeProcessSnapshot;
+    if (!session.running) this.removeSession(session.id);
+    return snapshot;
+  }
+
+  async nativeStatus(input: Omit<WriteStdinInput, "chars" | "columns" | "rows">): Promise<NativeProcessSnapshot> {
+    const session = this.getNativeSession(input.workspaceId, input.sessionId);
+    nativeInteger(input.yieldTimeMs, DEFAULT_POLL_YIELD_MS, 0, MAX_COMMAND_YIELD_MS);
+    nativeInteger(input.maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 1, 100_000);
+    return await this.writeSession(session, { workspaceId: input.workspaceId, sessionId: input.sessionId,
+      yieldTimeMs: input.yieldTimeMs, maxOutputTokens: input.maxOutputTokens }) as NativeProcessSnapshot;
+  }
+
+  async cancelNative(input: Omit<WriteStdinInput, "chars" | "columns" | "rows">): Promise<NativeProcessSnapshot> {
+    const session = this.getNativeSession(input.workspaceId, input.sessionId);
+    nativeInteger(input.yieldTimeMs, DEFAULT_INTERACTIVE_YIELD_MS, 0, MAX_COMMAND_YIELD_MS);
+    nativeInteger(input.maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 1, 100_000);
+    this.terminate(input.workspaceId, input.sessionId);
+    return await this.writeSession(session, { workspaceId: input.workspaceId, sessionId: input.sessionId,
+      yieldTimeMs: input.yieldTimeMs ?? DEFAULT_INTERACTIVE_YIELD_MS, maxOutputTokens: input.maxOutputTokens }) as NativeProcessSnapshot;
+  }
+
   async write(input: WriteStdinInput): Promise<ProcessSnapshot> {
     const session = this.getOwnedSession(input.workspaceId, input.sessionId);
+    if (session.native) {
+      throw new Error("Native process sessions require process_status or process_cancel; write_stdin cannot preserve their execution result.");
+    }
+    return this.writeSession(session, input);
+  }
+
+  private async writeSession(session: ProcessSession, input: WriteStdinInput): Promise<ProcessSnapshot> {
     const chars = input.chars ?? "";
     const interactionRequested =
       chars.length > 0 || input.columns !== undefined || input.rows !== undefined;
@@ -278,13 +378,20 @@ export class ProcessSessionManager {
 
   terminate(workspaceId: string, sessionId: number): void {
     const session = this.getOwnedSession(workspaceId, sessionId);
-    if (session.running) session.process?.kill("SIGTERM");
+    if (session.running) {
+      if (session.native) {
+        session.native.cancelled = true;
+        if (session.runtimeTimer) clearTimeout(session.runtimeTimer);
+      }
+      session.process?.kill(session.native ? "SIGKILL" : "SIGTERM");
+    }
   }
 
   shutdown(): void {
     for (const session of this.sessions.values()) {
       if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
-      if (session.running) session.process?.kill("SIGTERM");
+      if (session.runtimeTimer) clearTimeout(session.runtimeTimer);
+      if (session.running) session.process?.kill(session.native ? "SIGKILL" : "SIGTERM");
     }
     this.sessions.clear();
   }
@@ -303,7 +410,7 @@ export class ProcessSessionManager {
     }
   }
 
-  private createSession(input: StartCommandInput): ProcessSession {
+  private createSession(input: Pick<StartCommandInput, "workspaceId" | "columns" | "rows">): ProcessSession {
     let resolveExit = (): void => undefined;
     const exitPromise = new Promise<void>((resolve) => {
       resolveExit = resolve;
@@ -348,6 +455,50 @@ export class ProcessSessionManager {
     child.on("close", (code, signal) => this.finish(session, code ?? undefined, signal ?? undefined));
   }
 
+  private startNativePipe(session: ProcessSession, input: StartProcessInput, args: string[], timeoutMs: number): void {
+    const detached = process.platform !== "win32";
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(input.executable, args, {
+        cwd: input.cwd,
+        env: processEnvironment(input),
+        stdio: "pipe",
+        shell: false,
+        windowsHide: true,
+        detached,
+      });
+    } catch (error) {
+      session.native!.spawnError = (error as NodeJS.ErrnoException).code ?? "SPAWN_FAILED";
+      this.finish(session);
+      return;
+    }
+    session.process = {
+      write: () => { throw new Error("Native process stdin is closed."); },
+      kill: (signal = "SIGKILL") => terminateProcessTree(child, signal, detached),
+    };
+    for (const stream of [child.stdout!, child.stderr!]) {
+      const decoder = new StringDecoder("utf8");
+      stream.on("data", (data: Buffer) => this.append(session, decoder.write(data)));
+      stream.on("end", () => this.append(session, decoder.end()));
+    }
+    child.on("error", (error: NodeJS.ErrnoException) => {
+      // Error codes identify launch failures without copying argv or stdin into logs.
+      session.native!.spawnError = error.code ?? "SPAWN_FAILED";
+    });
+    child.stdin!.on("error", (error: NodeJS.ErrnoException) => {
+      session.native!.stdinError = error.code ?? "STDIN_FAILED";
+    });
+    child.on("close", (code, signal) => this.finish(session, code ?? undefined, signal ?? undefined));
+    session.runtimeTimer = setTimeout(() => {
+      if (!session.running) return;
+      session.native!.timedOut = true;
+      // A total runtime limit must also stop children that ignore graceful signals.
+      session.process?.kill("SIGKILL");
+    }, Math.max(0, timeoutMs - (Date.now() - session.startedAt)));
+    session.runtimeTimer.unref();
+    child.stdin!.end(input.stdin ?? "", "utf8");
+  }
+
   private async startPty(session: ProcessSession, input: StartCommandInput): Promise<void> {
     let nodePty: typeof import("node-pty");
     try {
@@ -387,6 +538,7 @@ export class ProcessSessionManager {
   private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
     if (!session.running) return;
     session.running = false;
+    if (session.runtimeTimer) clearTimeout(session.runtimeTimer);
     session.exitCode = exitCode;
     session.signal = signal;
     session.resolveExit();
@@ -414,6 +566,7 @@ export class ProcessSessionManager {
       exitCode: session.exitCode,
       signal: session.signal,
       wallTimeMs: Date.now() - session.startedAt,
+      ...(session.native ?? {}),
     };
   }
 
@@ -430,5 +583,11 @@ export class ProcessSessionManager {
     const session = this.sessions.get(sessionId);
     if (session?.cleanupTimer) clearTimeout(session.cleanupTimer);
     this.sessions.delete(sessionId);
+  }
+
+  private getNativeSession(workspaceId: string, sessionId: number): ProcessSession {
+    const session = this.getOwnedSession(workspaceId, sessionId);
+    if (!session.native) throw new Error(`Process session ${sessionId} was not started by run_process.`);
+    return session;
   }
 }

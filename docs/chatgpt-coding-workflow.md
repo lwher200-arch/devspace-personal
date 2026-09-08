@@ -47,6 +47,13 @@ Do not call `open_workspace` again for the same checkout folder unless:
 - work moves to a different project folder
 - work switches between checkout and worktree mode
 - the user asks for a new isolated worktree
+- project rules changed or the earlier context is missing: for a conversation-bound checkout,
+  use the same path with `refreshContext: true` to return current instructions and catalogs
+
+Explicit refresh preserves the conversation-bound checkout identity and reloads the skill
+catalog. Ordinary repeated opens still suppress duplicate context. Hosts without that
+conversation binding should read rules using their existing workspaceId. Combining
+`refreshContext` with `mode: "worktree"` is rejected, because that mode creates new worktrees.
 
 ## Checkout Mode
 
@@ -103,6 +110,13 @@ should read the relevant nested file before working under that directory.
 
 This keeps instructions explicit and inspectable instead of silently injecting
 new context during later tool calls.
+
+For a bounded group of known project files, use `project_read_batch` with one to eight
+items. Each item uses the same UTF-16 offset and SHA-256 contract as `project_read`.
+Follow `continuation` with its returned hashes and handle individual errors; batch
+completion does not imply a project-wide atomic snapshot. For literal executable/argv
+commands, prefer `run_process` and poll its returned session with `process_status`.
+The complete inputs, limits and failure semantics are in [WebCodex capability adoption](webcodex-adoption.md).
 
 ## Skills
 

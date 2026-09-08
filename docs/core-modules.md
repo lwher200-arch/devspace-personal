@@ -44,12 +44,14 @@ checkout 复用与 worktree 创建有不同生命周期。逻辑路径、物理�
 锚点必须一致，不能通过旧标识访问已改变目标的目录。
 
 指令扫描具有预算。发现不完整时必须报告，并由调用方补查目标目录的祖先说明。
+同一对话复用 checkout 时，`open_workspace.refreshContext` 可显式重新返回项目说明
+及当前技能/代理目录，保留原 workspaceId；默认仍省略重复上下文。
 
 ## 项目访问
 
 位置：[project-access.ts](../src/project-access.ts)、[project-tools.ts](../src/project-tools.ts)。
 
-主要接口为 `project_files`、`project_search`、`project_read`，相应能力也可
+主要接口为 `project_files`、`project_search`、`project_read`、`project_read_batch`，相应能力也可
 通过项目 CLI 使用。
 
 - 文件清单返回相对路径、分页游标、快照和覆盖状态。
@@ -58,6 +60,10 @@ checkout 复用与 worktree 创建有不同生命周期。逻辑路径、物理�
 
 游标绑定操作及范围，不能由调用方编造。读取偏移是 UTF-16 字符位置，不是行号。
 文本上限为 8 MiB；二进制、非 UTF-8 以及发现排除项需要明确报告。
+
+[project-read-batch.ts](../src/project-read-batch.ts) 复用单文件读取及路径守卫，先验证
+整批路径，再按序读取。完整批量结果的 JSON UTF-8 字节预算包含转义和续读元数据；
+逐项错误不会冒充完成。MCP 授权对每项路径分类，敏感文件仍需要原有 Owner 审批。
 
 ## 补丁执行
 
@@ -72,11 +78,18 @@ checkout 复用与 worktree 创建有不同生命周期。逻辑路径、物理�
 ## 命令与审查
 
 位置：[process-sessions.ts](../src/process-sessions.ts)、
+[native-process-tools.ts](../src/native-process-tools.ts)、
 [review-checkpoints.ts](../src/review-checkpoints.ts)。
 
 命令执行返回输出、退出码或可继续获取结果的进程会话。输出截断必须显式处理。
 差异审查使用 Git 支持的检查点；并行发生的改动可能进入同一审查范围，不能
 把汇总结果全部归因于最后一个工具调用。
+
+`run_process`、`process_status` 和 `process_cancel` 在两种宿主模式中共享同一个
+ProcessSessionManager。原生执行使用 `shell:false`、有界 argv/stdin、UTF-8 流解码
+和独立的总运行超时；旧 shell/PTY 入口保持原样。原生会话只有一次初始 stdin，
+启动错误、stdin 错误、超时、取消及真实退出状态分别报告。连接重建可续读已有
+内存会话，服务重启不能恢复它；当前没有新增持久 Job 或自动重试账本。
 
 ## 桥接与任务管理
 

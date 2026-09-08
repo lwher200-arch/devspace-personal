@@ -33,6 +33,12 @@ function guard(root: string) {
     return canonicalAllowedPath(assertAllowedPath(resolve(root, path), [root]));
   };
 }
+
+export function validateProjectReadPaths(root: string, paths: readonly string[]): void {
+  const safe = guard(root);
+  for (const path of paths) safe(path);
+}
+
 function sensitive(name: string): boolean {
   return (/^\.env(?:\.|$)/i.test(name) && !/[.-](example|sample|template)$/i.test(name)) ||
     /\.(pem|key|p12|pfx)$/i.test(name) || /^(auth|credentials|secrets)\.json$/i.test(name) || /^id_(rsa|ed25519)(\.|$)/i.test(name);

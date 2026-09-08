@@ -23,18 +23,23 @@ export function openDatabase(stateDir: string): DatabaseHandle {
   chmodSync(stateDir, 0o700);
   const path = databasePath(stateDir);
   const sqlite = new Database(path);
-  chmodSync(path, 0o600);
-  sqlite.pragma("journal_mode = WAL");
-  sqlite.pragma("synchronous = NORMAL");
-  sqlite.pragma("busy_timeout = 5000");
-  sqlite.pragma("foreign_keys = ON");
-  migrateDatabase(sqlite);
+  try {
+    chmodSync(path, 0o600);
+    sqlite.pragma("journal_mode = WAL");
+    sqlite.pragma("synchronous = NORMAL");
+    sqlite.pragma("busy_timeout = 5000");
+    sqlite.pragma("foreign_keys = ON");
+    migrateDatabase(sqlite);
 
-  return {
-    sqlite,
-    db: createDrizzleDatabase(sqlite),
-    close: () => sqlite.close(),
-  };
+    return {
+      sqlite,
+      db: createDrizzleDatabase(sqlite),
+      close: () => sqlite.close(),
+    };
+  } catch (error) {
+    sqlite.close();
+    throw error;
+  }
 }
 
 function createDrizzleDatabase(sqlite: SqliteDatabase) {

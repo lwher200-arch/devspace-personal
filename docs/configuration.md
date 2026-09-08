@@ -15,6 +15,17 @@ Authentication stays separate because it contains a secret:
 Run `devspace init` to create both files. `devspace config set publicBaseUrl
 <url|null>` updates the JSONC document without discarding its comments.
 
+## Legacy configuration migration
+
+The legacy `config.json` field `tool_mode` accepts `claude` or `codex` and
+migrates to `tools.mode`. If both forms are present, explicit `tools.mode`
+wins. Invalid values and unrelated unknown keys are still rejected.
+
+Successful migration preserves the original bytes in `config.json.v1.0.bak`
+and leaves `auth.json` unchanged. A failed validation leaves the legacy file
+in place without publishing a partial JSONC file. Existing `config.jsonc`
+continues to take precedence; `tool_mode` is not a new JSONC field.
+
 ## Complete example
 
 ```jsonc

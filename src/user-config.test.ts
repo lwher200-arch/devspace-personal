@@ -14,6 +14,36 @@ import {
   setDevspaceConfigValue,
   setDevspaceConfigValues,
 } from "./user-config.js";
+import { migrateLegacyConfig } from "./config-migration.js";
+
+for (const mode of ["claude", "codex"] as const) {
+  withConfigDir((configDir, env) => {
+    const legacy = JSON.stringify({ tool_mode: mode, port: 8787 });
+    writeFileSync(join(configDir, "config.json"), legacy);
+    const auth = JSON.stringify({ ownerToken: "fixture-owner-unchanged" });
+    writeFileSync(join(configDir, "auth.json"), auth);
+    const files = loadDevspaceFiles(env);
+    assert.equal(files.config.tools.mode, mode);
+    assert.equal(files.migratedLegacyConfig, true);
+    assert.equal(readFileSync(join(configDir, "config.json.v1.0.bak"), "utf8"), legacy);
+    assert.equal(readFileSync(join(configDir, "auth.json"), "utf8"), auth);
+    assert.equal(loadDevspaceFiles(env).migratedLegacyConfig, false);
+  });
+}
+assert.equal(migrateLegacyConfig({ tool_mode: "claude", tools: { mode: "codex" } }).tools.mode, "codex");
+assert.equal(migrateLegacyConfig({ tool_mode: "codex", tools: { mode: "claude" } }).tools.mode, "claude");
+assert.equal(migrateLegacyConfig({ tools: {} }).tools.mode, "codex");
+assert.throws(() => migrateLegacyConfig({ tool_mode: "invalid" }), /tool_mode/);
+assert.throws(() => migrateLegacyConfig({ tool_mode: "claude", unknownSetting: true }), /Unsupported legacy configuration keys/);
+
+withConfigDir((configDir, env) => {
+  const legacy = JSON.stringify({ tool_mode: "invalid" });
+  writeFileSync(join(configDir, "config.json"), legacy);
+  assert.throws(() => loadDevspaceFiles(env), /tool_mode/);
+  assert.equal(readFileSync(join(configDir, "config.json"), "utf8"), legacy);
+  assert.equal(existsSync(join(configDir, "config.jsonc")), false);
+  assert.equal(existsSync(join(configDir, "config.json.v1.0.bak")), false);
+});
 
 withConfigDir((configDir, env) => {
   writeFileSync(join(configDir, "config.json"), JSON.stringify({

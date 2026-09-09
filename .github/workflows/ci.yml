@@ -64,11 +64,11 @@ jobs:
       - name: Deployment contracts
         run: pnpm test:deploy
 
-      - name: Browser approval contract
+      - name: Browser authorization contracts
         if: matrix.os == 'windows-latest'
         env:
           DEVSPACE_TEST_BROWSER: C:\Program Files\Google\Chrome\Application\chrome.exe
-        run: pnpm exec tsx --test src/mcp-authorization.browser.test.ts src/ui/approval-card.browser.test.ts
+        run: pnpm exec tsx --test src/oauth-redirect.browser.test.ts src/mcp-authorization.browser.test.ts src/ui/approval-card.browser.test.ts
 
       - name: Build
         run: pnpm build

@@ -139,7 +139,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Referrer-Policy', 'same-origin');
     res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+    // The SDK validates this callback against the client's registered redirect URIs.
+    // Chromium applies form-action to the POST's 302 redirect as well as its target.
+    const callbackOrigin = new URL(params.redirectUri).origin;
+    res.setHeader('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${callbackOrigin}; frame-ancestors 'none'; base-uri 'none'`);
     if (!params.resource || !checkResourceAllowed({ requestedResource: params.resource, configuredResource: this.resourceServerUrl })) {
       throw new InvalidRequestError("Invalid or missing OAuth resource");
     }

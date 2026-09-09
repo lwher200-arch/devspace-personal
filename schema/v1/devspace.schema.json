@@ -124,6 +124,13 @@
             "high_risk_only"
           ]
         },
+        "approvalTtlSeconds": {
+          "default": 1800,
+          "description": "Single-use approval window in seconds (1800-7200); opening or retrying a request does not renew its deadline.",
+          "type": "integer",
+          "minimum": 1800,
+          "maximum": 7200
+        },
         "chatApprovalClientIds": {
           "default": [],
           "maxItems": 20,

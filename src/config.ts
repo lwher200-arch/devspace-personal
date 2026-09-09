@@ -19,6 +19,7 @@ export interface ServerConfig {
   toolMode: ToolMode;
   toolAuthorization?: 'legacy' | 'owner_approval';
   approvalProfile?: 'conservative' | 'high_risk_only';
+  approvalTtlSeconds?: number;
   chatApprovalClientIds?: string[];
   uiEnabled: boolean;
   stateDir: string;
@@ -72,6 +73,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     toolMode: stored.tools.mode,
     toolAuthorization: stored.tools.authorization,
     approvalProfile: stored.tools.approvalProfile,
+    approvalTtlSeconds: stored.tools.approvalTtlSeconds,
     chatApprovalClientIds: stored.tools.chatApprovalClientIds,
     uiEnabled: stored.ui.enabled,
     stateDir: normalizePath(stored.storage.stateDir),

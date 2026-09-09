@@ -26,7 +26,7 @@ import { CodexBridge, parseCodexSubmission, registerCodexBridgeTools, submitCode
 import { registerProjectTools } from "./project-tools.js";
 import { OwnerApprovals, approvalPrincipal, classifyMcpOperation, installOwnerApprovalRoutes } from './mcp-authorization.js';
 import { registerApprovalTools, isApprovalUiTool, chatApprovalEnabled, chatApprovalMode } from './approval-tools.js';
-import { REVIEW_APPROVAL_TOOL } from './approval-protocol.js';
+import { APPROVAL_TTL_SECONDS, REVIEW_APPROVAL_TOOL } from './approval-protocol.js';
 import {
   createOpenAIIncomingArtifactAdapter,
   type IncomingArtifactAdapter,
@@ -760,7 +760,8 @@ export function createServer(
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
-  const approvals = config.toolAuthorization === 'owner_approval' ? new OwnerApprovals() : undefined;
+  const approvals = config.toolAuthorization === 'owner_approval'
+    ? new OwnerApprovals(undefined, (config.approvalTtlSeconds ?? APPROVAL_TTL_SECONDS.default) * 1000) : undefined;
   if (approvals) installOwnerApprovalRoutes(app, config, approvals);
   const codexBridge = config.bridge?.enabled ? (options.codexBridgeFactory?.(config) ?? new CodexBridge(config)) : undefined;
   const localAgentProviders = buildLocalAgentProviderStatuses(

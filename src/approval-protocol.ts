@@ -1,6 +1,7 @@
 export const REVIEW_APPROVAL_TOOL = 'review_approval';
 export const DECIDE_APPROVAL_TOOL = 'decide_approval';
 export const APPROVAL_META_KEY = 'devspace/approval';
+export const APPROVAL_TTL_SECONDS = { min: 1800, max: 7200, default: 1800 } as const;
 export const APPROVAL_ERROR_CODES = ['CHAT_CLIENT_NOT_ENABLED', 'CHAT_CONTEXT_REQUIRED', 'APPROVAL_UNAVAILABLE', 'APPROVAL_CONTEXT_CHANGED', 'APPROVAL_RESPONSE_MISMATCH', 'CHAT_BRIDGE_UNAVAILABLE'] as const;
 export type ApprovalErrorCode = typeof APPROVAL_ERROR_CODES[number];
 export class ApprovalError extends Error {

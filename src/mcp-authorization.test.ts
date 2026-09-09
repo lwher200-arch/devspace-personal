@@ -112,7 +112,7 @@ test('real OAuth/MCP requires independent Owner approval before command side eff
   const origin = `http://127.0.0.1:${port}`, resource = `${origin}/mcp`;
   const config = loadConfig({ ...writeTestDevspaceConfig(join(root,'config'), {
     server: { port, publicBaseUrl: origin }, workspaces: { allowedRoots: [project] },
-    storage: { stateDir: join(root,'state') }, skills: { enabled: false }, tools: { authorization: 'owner_approval' },
+    storage: { stateDir: join(root,'state') }, skills: { enabled: false }, tools: { authorization: 'owner_approval', approvalTtlSeconds: 7200 },
     logging: { level: 'silent' },
   }), DEVSPACE_OAUTH_OWNER_TOKEN: owner });
   const noWorkspace = { getWorkspace:()=>{throw Error('not needed');}, resolveReadPath:()=>{throw Error('not needed');} };
@@ -177,9 +177,12 @@ test('real OAuth/MCP requires independent Owner approval before command side eff
   const absentStatus = await tool('process_status', { sessionId: 12345, yieldTimeMs: 0 });
   assert.equal(absentStatus.result.isError, true);
   assert.doesNotMatch(JSON.stringify(absentStatus), /OWNER_APPROVAL_REQUIRED/);
+  const approvalStartedAt = Date.now();
   const args={cmd:'echo approved> approved.txt',yieldTimeMs:10000};
   const blocked=await tool('exec_command',args); assert.equal(blocked.result.isError,true);
   const approval=JSON.parse(blocked.result.content[0].text); assert.equal(approval.code,'OWNER_APPROVAL_REQUIRED');
+  assert.ok(Date.parse(approval.expiresAt) >= approvalStartedAt + 7200_000);
+  assert.ok(Date.parse(approval.expiresAt) <= Date.now() + 7200_000);
   assert.equal(existsSync(join(project,'approved.txt')),false);
   const forged=await tool('exec_command',{...args,approved:true}); assert.equal(forged.result.isError,true);
   const page=await fetch(approval.approvalUrl); const html=await page.text();

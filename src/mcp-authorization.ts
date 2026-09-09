@@ -10,7 +10,7 @@ import { parsePatch } from './apply-patch.js';
 import { selectExecutionModel } from './local-agent-execution.js';
 import { logEvent } from './logger.js';
 import { openAiConversationScopeId } from './request-meta.js';
-import type { ApprovalState, ApprovalView } from './approval-protocol.js';
+import { APPROVAL_TTL_SECONDS, type ApprovalState, type ApprovalView } from './approval-protocol.js';
 import { readOwnerSession, establishOwnerSession } from './owner-session.js';
 
 type Arguments = Record<string, unknown>;
@@ -45,7 +45,11 @@ export class OwnerApprovals {
   private readonly failures = new Map<string, number>();
   private readonly inFlight = new Set<Promise<void>>();
   private closed = false;
-  constructor(private readonly now = Date.now, private readonly ttl = 300_000) {}
+  constructor(private readonly now = Date.now, private readonly ttl = APPROVAL_TTL_SECONDS.default * 1000) {
+    if (!Number.isSafeInteger(ttl) || ttl <= 0 || ttl > APPROVAL_TTL_SECONDS.max * 1000) {
+      throw new RangeError('Approval lifetime must be positive and no longer than two hours.');
+    }
+  }
   private prune() { for (const [id, value] of this.entries) if (value.expires <= this.now() && value.state !== 'submitting') { this.entries.delete(id); this.failures.delete(id); } }
   inspect(id: string): Approval | undefined { this.prune(); return this.entries.get(id); }
   require(operation: ApprovalOperation, submit?: () => Promise<SubmissionReceipt>): { allowed: true } | { allowed: false; approval: Approval } {
@@ -220,10 +224,11 @@ ${entry.submission ? `<pre>${escape(JSON.stringify(entry.submission, null, 2))}<
     if (!entry || entry.state !== 'pending') { res.status(404).send('Request unavailable, expired or already decided.'); return; }
     const nonce = approvals.challenge(entry.id);
     const ownerSession = readOwnerSession(req, config.oauth, origin);
-    res.cookie(`devspace_approval_${entry.id}`, nonce, { httpOnly: true, sameSite: 'strict', secure: origin.startsWith('https:'), path: `${base}/${entry.id}`, maxAge: 300_000 });
+    // The browser proof shares the request deadline; opening the page must not renew it.
+    res.cookie(`devspace_approval_${entry.id}`, nonce, { httpOnly: true, sameSite: 'strict', secure: origin.startsWith('https:'), path: `${base}/${entry.id}`, expires: new Date(entry.expires) });
     res.type('html').send(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Approve one DevSpace operation</title>
 <style>body{font-family:Georgia,serif;max-width:780px;margin:40px auto;padding:20px;background:#f5f2ec;color:#25231f}pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:16px;background:#fff}input,button{font:inherit;padding:10px;margin:8px 0}button{cursor:pointer}label{display:block}</style>
-<h1>Approve one operation</h1><p>${escape(entry.reason)}</p><p>One-use grant, expiring in five minutes. Workspace and provider sandbox restrictions remain. Shell commands may access the service account's files and network. Review the exact operation before approving.</p>
+<h1>Approve one operation</h1><p>${escape(entry.reason)}</p><p>Single-use approval. Expires at ${escape(new Date(entry.expires).toISOString())}. Workspace and provider sandbox restrictions remain. Shell commands may access the service account's files and network. Review the exact operation before approving.</p>
 <p>${entry.submit ? 'Approving will automatically submit exactly this Codex turn. No return-to-Chat retry is needed to start it. Chat still needs to query the result.' : 'Approving grants one exact retry from Chat; this page does not execute the operation.'}</p>
 <pre>${escape(JSON.stringify({ tool: entry.tool, arguments: entry.args, context: entry.context }, null, 2))}</pre>
 <form method="post" action="${base}/${entry.id}"><input type="hidden" name="nonce" value="${nonce}">${ownerSession ? `<p>Owner login verified until ${escape(new Date(ownerSession.expiresAt * 1000).toISOString())}. This still requires your decision for this one operation.</p>` : '<label>Owner password (never send this to Chat)<br><input name="owner_token" type="password" autocomplete="current-password" required maxlength="1024"></label>'}<button name="decision" value="approve">Approve once</button> <button name="decision" value="deny">Deny</button></form></html>`);

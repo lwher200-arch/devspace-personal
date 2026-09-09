@@ -1,6 +1,7 @@
 import * as z from "zod/v4";
 import { executionPolicySchema } from "./local-agent-execution.js";
 import { subagentsConfigSchema } from "./local-agent-config.js";
+import { APPROVAL_TTL_SECONDS } from "./approval-protocol.js";
 
 export const DEVSPACE_CONFIG_VERSION = 1 as const;
 export const DEVSPACE_CONFIG_SCHEMA_URL =
@@ -27,6 +28,9 @@ const toolsConfigSchema = z.object({
   mode: z.enum(["claude", "codex"]).default("codex"),
   authorization: z.enum(['legacy', 'owner_approval']).default('legacy'),
   approvalProfile: z.enum(['conservative', 'high_risk_only']).default('conservative'),
+  approvalTtlSeconds: z.number().int().min(APPROVAL_TTL_SECONDS.min).max(APPROVAL_TTL_SECONDS.max)
+    .default(APPROVAL_TTL_SECONDS.default)
+    .describe('Single-use approval window in seconds (1800-7200); opening or retrying a request does not renew its deadline.'),
   chatApprovalClientIds: z.array(z.string().trim().min(1).max(256)).max(20).default([]),
 }).strict().prefault({});
 

@@ -11,7 +11,7 @@ DevSpace 继续使用已有 HTTP/MCP 与 OAuth 入口。
 可显式配置：
 
 ```json
-{"tools":{"authorization":"owner_approval","approvalProfile":"high_risk_only"},"oauth":{"ownerSessionTtlSeconds":43200}}
+{"tools":{"authorization":"owner_approval","approvalProfile":"high_risk_only","approvalTtlSeconds":1800},"oauth":{"ownerSessionTtlSeconds":43200}}
 ```
 
 `high_risk_only` 让普通文件读写、编辑、小批量非敏感补丁及工作区创建按原文件
@@ -27,6 +27,16 @@ DevSpace 继续使用已有 HTTP/MCP 与 OAuth 入口。
 带签名、HttpOnly、SameSite 和 HTTPS Secure 属性的会话 Cookie 记住已验证身份，
 Owner 兼容页面在有效期内只需点击批准，不必再次输入密码。Cookie 自身不批准操作。
 OAuth 使用 Cookie 重复确认连接时还校验 Origin 和绑定表单的 CSRF 证明。
+
+`tools.approvalTtlSeconds` 控制任务待审批及未消费授权的有效期，默认 1800 秒
+（30 分钟），只接受 1800–7200 秒的整数，最长 2 小时。截止时间从首次请求创建
+起固定计算；重复打开页面、查看卡片或重试同一请求都不续期。Owner 页面 Cookie
+和显示的到期时间与请求一致，不再保留独立的 5 分钟 Cookie。配置缺省的旧部署
+升级后采用 30 分钟，无需修改配置文件；此变化不影响 12 小时登录验证期限。
+
+单次批准仍只允许原始操作。参数、文件或模型上下文变化仍需重新审批；正在提交
+或已启动的任务不会因为审批窗口到期被取消，这不是任务执行超时设置。服务重启
+仍会清除内存中的待审批请求；扩大窗口不意味着审批持久化或永久授权。
 
 启用固定验证期限后，无法证明验证时间的旧令牌会要求重新登录一次；客户端注册
 及 Owner 密码不删除、不重置。到期后新的调用/刷新需重新验证，已启动任务不会
@@ -56,7 +66,7 @@ OAuth 使用 Cookie 重复确认连接时还校验 Origin 和绑定表单的 CSR
 1. Chat 收到 `OWNER_APPROVAL_REQUIRED` 和 `approvalUrl`，此时操作尚未执行。
 2. 已启用 Chat 审批的客户端调用 `review_approval` 展示卡片；否则用户自己打开
    Owner 地址。核对工具、完整参数、路径/文件指纹和选定模型。
-3. 在卡片中选择单次批准或拒绝。Owner 兼容页面仍需输入密码，不要把密码交给 Chat。
+3. 在卡片中选择单次批准或拒绝。Owner 兼容页面仅在登录身份需要重新验证时输入密码，不要把密码交给 Chat。
 4. 对 `codex_task_start` / `codex_task_continue`，批准会自动提交刚刚展示的
    一个轮次，无需回 Chat 重试才能启动。审批页会跳转到提交状态，显示任务编号；
    提交不等于完成，Chat 用 `codex_task_status` 查询结果，编号遗失时用
@@ -129,14 +139,15 @@ schema 和 CodexBridge 的持久化 `requestKey` 去重，不新增执行队列�
 
 旧客户端批准后再次发送完全相同的请求，会收到 `OWNER_OPERATION_SUBMITTED`
 及 `agentId` / `workspaceId`，而不是再次执行或生成新授权。提交期间返回
-`OWNER_OPERATION_SUBMITTING`。收据在内存中保留五分钟，此后或服务重启后应
+`OWNER_OPERATION_SUBMITTING`。提交结果返回后，收据在内存中保留一个配置的审批窗口
+（默认 30 分钟，最多 2 小时）；这是只读收据保留期，不重新授予执行权限。此后或服务重启后应
 使用 `codex_tasks` 恢复已经持久化的任务，而不是创建新的 `requestKey`。
 
 若出现 `OWNER_SUBMISSION_UNCONFIRMED` 或页面显示提交未确认，可能是凭据失效、
 工作区/模型上下文改变，或交付失败。不要自动换模型、重新批准或重发；先查看
 该工作区的任务和服务日志。交付不确定时沿用现有桥接恢复规则，避免重复执行。
 
-未消费的授权五分钟过期，服务重启后失效；已提交任务不因此取消或重放。
+未消费的授权按首次创建时的截止时间过期（默认 30 分钟，最多 2 小时），服务重启后失效；已提交任务不因此取消或重放。
 拒绝的请求不会自动转为同意。页面要求
 同源提交、浏览器 Cookie/nonce 和 Owner 密码，日志不记录密码或完整参数。
 请求数量与总大小均有限制，超过限额需处理已有请求或等待其过期。

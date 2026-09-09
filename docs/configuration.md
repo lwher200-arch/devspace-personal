@@ -51,6 +51,7 @@ continues to take precedence; `tool_mode` is not a new JSONC field.
   "tools": {
     "mode": "codex",
     "authorization": "owner_approval",
+    "approvalTtlSeconds": 1800,
   },
   "ui": {
     "enabled": true,
@@ -90,6 +91,14 @@ Omitted sections and keys use the defaults shown above. An empty
 rejected so spelling mistakes cannot silently alter behavior.
 
 ## Tool modes and UI
+
+`tools.approvalTtlSeconds` is the single-use approval window: an integer from
+1800 to 7200 seconds (30 minutes to 2 hours), defaulting to 1800. Existing
+Owner-gated configurations that omit it use the new 30-minute default instead
+of the previous five minutes. Reopening a page or retrying the same pending
+operation does not extend its original deadline. The Owner form cookie and
+visible expiry share that deadline. This setting does not change the separate
+12-hour Owner login policy or the runtime limit of an already submitted task.
 
 `tools.mode` accepts two values:
 

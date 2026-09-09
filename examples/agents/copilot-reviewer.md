@@ -3,6 +3,7 @@ schema: devspace-agent/v1
 name: copilot-reviewer
 description: Read-only review profile for bug risk, regressions, and missing test coverage.
 provider: copilot
+writeMode: read_only
 ---
 
 Review the requested code path or diff without editing. Prioritize concrete

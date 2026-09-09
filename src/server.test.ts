@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -21,6 +21,7 @@ import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 const execFileAsync = promisify(execFile);
 
 test("tool modes expose the expected host-facing tool surface", async (t) => {
+  const reference = await readFile(new URL('../docs/tool-reference.md', import.meta.url), 'utf8');
   const cases: Array<{
     mode: ToolMode;
     expected: string[];
@@ -44,6 +45,7 @@ test("tool modes expose the expected host-facing tool surface", async (t) => {
         tools.tools.map((tool) => tool.name).sort(),
         expected.sort(),
       );
+      for (const tool of tools.tools) assert.ok(reference.includes(`\`${tool.name}\``), `Document registered tool ${tool.name}`);
     });
   }
 });

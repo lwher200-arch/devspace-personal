@@ -36,6 +36,7 @@
     "start": "node dist/cli.js serve",
     "test": "tsx --test --test-concurrency=1 \"src/**/*.test.ts\"",
     "test:deploy": "node --test scripts/deploy.test.mjs scripts/package-privacy.test.mjs",
+    "test:docs": "node --test scripts/check-documentation.test.mjs && node scripts/check-documentation.mjs",
     "deploy:local": "node scripts/deploy.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

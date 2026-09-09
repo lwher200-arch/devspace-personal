@@ -3,6 +3,7 @@ schema: devspace-agent/v1
 name: opencode-explorer
 description: Read-only profile for fast relevant-file discovery and small architecture questions.
 provider: opencode
+writeMode: read_only
 model: opencode/deepseek-v4-flash-free
 effort: high
 ---

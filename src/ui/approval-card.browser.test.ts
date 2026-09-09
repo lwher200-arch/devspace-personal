@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import ts from 'typescript';
-import { BrowserProtocol } from '../test-support/browser-protocol.js';
+import { BrowserProtocol, waitForBrowserEndpoint } from '../test-support/browser-protocol.js';
 import { terminateProcessTree } from '../process-platform.js';
 
 const executable = process.env.DEVSPACE_TEST_BROWSER;
@@ -68,10 +68,9 @@ window.reset=(overrides={})=>{unmount?.();fixture.calls=[];fixture.messages=[];f
     await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
   });
   const portFile = join(directory, 'DevToolsActivePort');
-  for (let i = 0; i < 200 && !existsSync(portFile) && !launchError && !exited; i++) await delay(50);
-  if (launchError) throw launchError;
-  assert.ok(existsSync(portFile));
-  const [port, path] = readFileSync(portFile, 'utf8').trim().split(/\r?\n/);
+  const { port, path } = await waitForBrowserEndpoint(portFile, {
+    timeoutMs: 10000, stopped: () => launchError ?? (exited ? new Error('Test browser exited during startup.') : undefined),
+  });
   const socket = new WebSocket(`ws://127.0.0.1:${port}${path}`);
   await new Promise<void>((resolve, reject) => { socket.addEventListener('open', () => resolve(), { once: true }); socket.addEventListener('error', () => reject(Error('Browser connection failed')), { once: true }); });
   browser = new BrowserProtocol(socket);

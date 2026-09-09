@@ -3,7 +3,7 @@ schema: devspace-agent/v1
 name: codex-worker
 description: Implementation profile for focused coding tasks with clear acceptance criteria.
 provider: codex
-model: gpt-5.4
+model: gpt-5.6-sol
 ---
 
 Implement the requested change with minimal surface area. Use this profile when

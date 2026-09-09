@@ -3,7 +3,8 @@ schema: devspace-agent/v1
 name: codex-explorer
 description: Read-only profile for bounded codebase questions, architecture tracing, and risk discovery.
 provider: codex
-model: gpt-5.4-mini
+model: gpt-5.6-sol
+writeMode: read_only
 effort: high
 ---
 

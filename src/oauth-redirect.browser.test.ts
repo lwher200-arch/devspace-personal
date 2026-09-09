@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -13,7 +13,7 @@ import { tokenHandler } from '@modelcontextprotocol/sdk/server/auth/handlers/tok
 import express from 'express';
 import { SingleUserOAuthProvider } from './oauth-provider.js';
 import { terminateProcessTree } from './process-platform.js';
-import { BrowserProtocol } from './test-support/browser-protocol.js';
+import { BrowserProtocol, waitForBrowserEndpoint } from './test-support/browser-protocol.js';
 
 const browserExecutable = process.env.DEVSPACE_TEST_BROWSER;
 
@@ -80,11 +80,10 @@ test('OAuth browser consent reaches its registered cross-origin callback and blo
     '--disable-component-update', '--disable-breakpad', '--disable-sync', '--host-resolver-rules=MAP localhost 127.0.0.1', 'about:blank'], { windowsHide: true, stdio: 'ignore' });
   completion = new Promise<void>(resolve => child!.once('exit', () => { exited = true; resolve(); }));
   child.once('error', error => { launchError = error; });
-  const portFile = join(profile, 'DevToolsActivePort'), deadline = Date.now() + 12000;
-  while (!existsSync(portFile) && Date.now() < deadline && !exited && !launchError) await delay(50);
-  if (launchError) throw launchError;
-  assert.ok(existsSync(portFile), 'Isolated browser must expose its test debugging endpoint.');
-  const [port, path] = readFileSync(portFile, 'utf8').trim().split(/\r?\n/);
+  const portFile = join(profile, 'DevToolsActivePort');
+  const { port, path } = await waitForBrowserEndpoint(portFile, {
+    stopped: () => launchError ?? (exited ? new Error('Test browser exited during startup.') : undefined),
+  });
   const socket = new WebSocket(`ws://127.0.0.1:${port}${path}`);
   await new Promise<void>((resolve, reject) => { socket.addEventListener('open', () => resolve(), { once: true }); socket.addEventListener('error', () => reject(new Error('Test browser connection failed.')), { once: true }); });
   browser = new BrowserProtocol(socket);

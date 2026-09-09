@@ -51,7 +51,9 @@ continues to take precedence; `tool_mode` is not a new JSONC field.
   "tools": {
     "mode": "codex",
     "authorization": "owner_approval",
+    "approvalProfile": "conservative",
     "approvalTtlSeconds": 1800,
+    "chatApprovalClientIds": [],
   },
   "ui": {
     "enabled": true,
@@ -78,15 +80,23 @@ continues to take precedence; `tool_mode` is not a new JSONC field.
     "shellCommands": false,
   },
   "oauth": {
+    "ownerSessionTtlSeconds": 43200,
     "accessTokenTtlSeconds": 3600,
     "refreshTokenTtlSeconds": 2592000,
     "scopes": ["devspace"],
     "allowedRedirectHosts": ["chatgpt.com", "localhost", "127.0.0.1"],
   },
+  "bridge": {
+    "enabled": false,
+    "allowWorkspaceWrite": false,
+  },
 }
 ```
 
-Omitted sections and keys use the defaults shown above. An empty
+This example explicitly selects Owner approval and a 12-hour login policy;
+it is not a dump of every default. Omitted keys use the JSON Schema defaults:
+authorization defaults to `legacy`, the approval profile to `conservative`,
+and a fixed Owner login lifetime is opt-in. An empty
 `workspaces.allowedRoots` uses the current working directory. Unknown keys are
 rejected so spelling mistakes cannot silently alter behavior.
 
@@ -107,14 +117,16 @@ visible expiry share that deadline. This setting does not change the separate
 | `codex` | Default. `open_workspace`, `read`, `apply_patch`, `exec_command`, `write_stdin`, and `show_changes`. |
 | `claude` | `open_workspace`, `read`, `write`, `edit`, `bash`, and `show_changes`. |
 
-The dedicated MCP tools `grep`, `glob`, and `ls` are not exposed. Each mode uses
-its shell tool with programs such as `rg`, `find`, and `ls` when it needs those
-operations.
+Both modes also expose `project_files`, `project_search`, `project_read`,
+`project_read_batch`, `run_process`, `process_status` and `process_cancel`.
+Bridge tools require `bridge.enabled`; approval tools require Owner approval
+and UI. Native download is optional and platform-dependent. See the complete
+[tool directory](tool-reference.md) for registration conditions and budgets.
 
-DevSpace attaches Apps UI metadata only to `open_workspace` and `show_changes`.
-This avoids rendering an iframe for every read, edit, search, or command call.
-Setting `ui.enabled` to `false` removes the metadata but does not remove the
-`show_changes` tool.
+Basic Apps UI metadata accompanies `open_workspace` and `show_changes`; when
+approval UI is enabled, `review_approval` also presents its dedicated card.
+`decide_approval` is app-only and still verifies its private capability.
+Disabling UI does not remove ordinary tools or bypass the Owner-page fallback.
 
 ## Skills and subagents
 
@@ -134,7 +146,7 @@ Subagent providers are explicit. Omitted providers are disabled:
       {
         "id": "codex",
         "enabled": true,
-        "model": "gpt-5.4",
+        "model": "gpt-5.6-sol",
         "effort": "high",
       },
       {
@@ -172,7 +184,8 @@ Only two user-facing DevSpace environment variables remain:
 | `DEVSPACE_CONFIG_DIR` | Bootstrap location for `config.jsonc`, `auth.json`, skills, and profiles. |
 | `DEVSPACE_OAUTH_OWNER_TOKEN` | Optional secret override for the owner token stored in `auth.json`. |
 
-Durable environment settings were removed in v1.1. Move existing deployment
+The current configuration loader does not import durable environment settings.
+Move old deployment
 values to these JSONC keys:
 
 | Removed setting | JSONC key |
@@ -203,13 +216,13 @@ values to these JSONC keys:
 | `DEVSPACE_OAUTH_SCOPES` | `oauth.scopes` |
 | `DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS` | `oauth.allowedRedirectHosts` |
 
-These environment values are not read or auto-imported in v1.1. Environment is
+These environment values are not read or auto-imported. Environment is
 process state, so there is no reliable file DevSpace can migrate on the user's
 behalf.
 
-## v1.0 file migration
+## Legacy JSON file migration
 
-The first v1.1 load performs one migration when `config.jsonc` is missing and
+The loader performs one migration when `config.jsonc` is missing and
 `config.json` exists:
 
 1. Validate the old JSON document.
@@ -224,7 +237,7 @@ actionable error instead of being silently discarded.
 
 The persisted fields map as follows:
 
-| v1.0 JSON field | v1.1 JSONC key |
+| Legacy JSON field | Versioned JSONC key |
 | --- | --- |
 | `host`, `port` | `server.host`, `server.port` |
 | `publicBaseUrl`, `allowedHosts` | `server.publicBaseUrl`, `server.allowedHosts` |

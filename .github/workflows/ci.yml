@@ -56,6 +56,9 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
+      - name: Documentation contracts
+        run: pnpm test:docs
+
       - name: Test
         env:
           DEVSPACE_REQUIRE_PI_SANDBOX: ${{ matrix.os == 'ubuntu-latest' && '1' || '0' }}

@@ -2,6 +2,12 @@
 
 本文只使用虚构目录和示例域名。先部署本地服务，再单独验证远程连接。
 
+## 文档与验证入口
+
+完整资料见 [文档导航](README.md)，当前工具与预算见 [工具目录](tool-reference.md)。
+维护源码时运行 `npm run typecheck`、`npm run test:docs`、`npm test` 和
+`npm run test:deploy`。一键部署本身不等于执行了所有测试，也不证明远程宿主可用。
+
 ## 先准备什么
 
 1. 安装满足 `package.json` 中 `engines` 的 Node.js，包含 npm。当前要求是

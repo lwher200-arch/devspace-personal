@@ -5,6 +5,8 @@ description: Delegate focused coding, research, review, or verification work to 
 
 # DevSpace subagents
 
+Use direct workspace tools for ordinary reads, searches and guarded edits. Delegate only when a separate worker materially helps; one primary executor should own each complex scope.
+
 Use the DevSpace CLI through the shell or process tool. Run commands from the project the subagent should work on.
 
 ## Choose a target
@@ -17,7 +19,7 @@ devspace agents targets --json
 
 Configured profiles include a description and may define provider, model, effort, and task instructions. Choose a matching profile when one fits. Use a provider target when no profile fits or a specific provider is needed.
 
-Usually rely on the target's configured model and effort. Pass `--model` or `--effort` only with a value supported by that provider. DevSpace passes these values through without translating them between providers.
+Unprotected manual sessions may use the target's configured model and effort. Protected Codex work launched through MCP instead requires an explicit approved model on every start and continuation. Use `codex_preflight` first; missing version/model evidence or unavailable access must stop that route, not trigger a model or channel fallback. Prefer the dedicated Codex bridge when it is available for the authorized task. DevSpace does not translate model IDs between providers.
 
 ## Start work
 
@@ -35,6 +37,8 @@ The result contains a DevSpace agent `id` and its current status. Execution cont
 ```bash
 devspace agents show <id> --json
 devspace agents continue <id> "<follow-up brief>" --json
+
+devspace agents continue <id> --model <approved-model> "<follow-up brief>" --json
 devspace agents ls --json
 ```
 

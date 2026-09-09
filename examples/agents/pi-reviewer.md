@@ -3,6 +3,7 @@ schema: devspace-agent/v1
 name: pi-reviewer
 description: Read-only review profile for quick risk checks and targeted implementation questions.
 provider: pi
+writeMode: read_only
 model: openai-codex/gpt-5.5
 effort: high
 ---

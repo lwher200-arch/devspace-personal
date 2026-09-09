@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -12,7 +12,7 @@ import { loadConfig } from './config.js';
 import { OwnerApprovals, installOwnerApprovalRoutes } from './mcp-authorization.js';
 import { terminateProcessTree } from './process-platform.js';
 import { writeTestDevspaceConfig } from './test-support/config.test.js';
-import { BrowserProtocol } from './test-support/browser-protocol.js';
+import { BrowserProtocol, waitForBrowserEndpoint } from './test-support/browser-protocol.js';
 
 const browserExecutable = process.env.DEVSPACE_TEST_BROWSER;
 
@@ -65,11 +65,9 @@ for (const automatic of [false, true]) test(`browser approval preserves Origin a
     await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
   });
   const portFile = join(profile, 'DevToolsActivePort');
-  const deadline = Date.now() + 12000;
-  while (!existsSync(portFile) && Date.now() < deadline && !exited && !launchError) await delay(50);
-  if (launchError) throw launchError;
-  assert.ok(existsSync(portFile), 'Isolated browser must expose its test debugging endpoint.');
-  const [port, path] = readFileSync(portFile, 'utf8').trim().split(/\r?\n/);
+  const { port, path } = await waitForBrowserEndpoint(portFile, {
+    stopped: () => launchError ?? (exited ? new Error('Test browser exited during startup.') : undefined),
+  });
   const socket = new WebSocket(`ws://127.0.0.1:${port}${path}`);
   await new Promise<void>((resolve, reject) => { socket.addEventListener('open', () => resolve(), { once: true }); socket.addEventListener('error', () => reject(new Error('Test browser connection failed.')), { once: true }); });
   browser = new BrowserProtocol(socket);

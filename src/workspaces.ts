@@ -91,15 +91,36 @@ type DirectoryOps = {
   mkdir: (path: string, options: { recursive: true }) => Promise<unknown>;
 };
 
+interface CachedWorkspace {
+  workspace: Workspace;
+  canonicalRoot: string;
+}
+
+const MAX_CACHED_WORKSPACES = 32;
+
 export class WorkspaceRegistry {
-  private readonly workspaces = new Map<string, Workspace>();
-  private readonly canonicalRoots = new Map<string, string>();
+  private readonly workspaces = new Map<string, CachedWorkspace>();
   private readonly pendingCheckoutOpens = new Map<string, Promise<WorkspaceContext>>();
 
   constructor(
     private readonly config: ServerConfig,
     private readonly store?: WorkspaceStore,
   ) {}
+
+  get cachedWorkspaceCount(): number { return this.workspaces.size; }
+
+  private rememberWorkspace(workspace: Workspace, canonicalRoot: string): void {
+    this.workspaces.delete(workspace.id);
+    this.workspaces.set(workspace.id, { workspace, canonicalRoot });
+    // Evict only when the same identity and trusted root can be restored. Legacy
+    // stores without anchor support must retain their instance-local state.
+    if (!this.store?.getRootAnchor || !this.store.setRootAnchor) return;
+    while (this.workspaces.size > MAX_CACHED_WORKSPACES) {
+      const oldest = this.workspaces.keys().next().value;
+      if (oldest === undefined) break;
+      this.workspaces.delete(oldest);
+    }
+  }
 
   async openWorkspace(
     input: string | OpenWorkspaceInput,
@@ -260,13 +281,15 @@ export class WorkspaceRegistry {
   }
 
   getWorkspace(workspaceId: string): Workspace {
-    const workspace = this.workspaces.get(workspaceId);
-    if (workspace) {
+    const cached = this.workspaces.get(workspaceId);
+    if (cached) {
+      const { workspace, canonicalRoot } = cached;
       this.assertWorkspaceRootAllowed(workspace.root, workspace.mode, workspace.sourceRoot);
-      if (canonicalAllowedPath(workspace.root) !== this.canonicalRoots.get(workspaceId)) {
+      if (canonicalAllowedPath(workspace.root) !== canonicalRoot) {
         throw new AccessDeniedError("Workspace root changed its filesystem target. Reopen the workspace.");
       }
       this.store?.touchSession(workspaceId);
+      this.rememberWorkspace(workspace, canonicalRoot);
       return workspace;
     }
 
@@ -303,8 +326,7 @@ export class WorkspaceRegistry {
       activatedSkillDirs: new Set(),
     };
     this.store?.touchSession(workspaceId);
-    this.workspaces.set(restoredWorkspace.id, restoredWorkspace);
-    this.canonicalRoots.set(restoredWorkspace.id, anchor);
+    this.rememberWorkspace(restoredWorkspace, anchor);
 
     return restoredWorkspace;
   }
@@ -406,9 +428,8 @@ export class WorkspaceRegistry {
       baseSha: workspace.worktree?.baseSha,
       managed: workspace.worktree?.managed,
     });
-    this.workspaces.set(workspace.id, workspace);
-    this.canonicalRoots.set(workspace.id, canonicalRoot);
     this.store?.setRootAnchor?.(workspace.id, canonicalRoot);
+    this.rememberWorkspace(workspace, canonicalRoot);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
     const discovery = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
 

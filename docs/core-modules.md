@@ -12,6 +12,8 @@
 工具 schema 更新、运行服务更新与宿主缓存刷新是不同步骤。接口是否可见，
 必须与一次实际调用的结果区分。
 
+完整模式和条件工具清单见 [工具目录](tool-reference.md)，不是只有最初的六个基础工具。
+
 ## 本地部署入口
 
 位置：[deploy.mjs](../scripts/deploy.mjs)、[local-server.mjs](../scripts/local-server.mjs)、
@@ -34,6 +36,11 @@
 
 配置加载成功不等于所选模型、网络或回调地址实际可用。
 
+单次批准由 [mcp-authorization.ts](../src/mcp-authorization.ts)、
+[approval-tools.ts](../src/approval-tools.ts) 和 [approval-protocol.ts](../src/approval-protocol.ts)
+共同负责；身份新鲜度由 [owner-session.ts](../src/owner-session.ts) 及 OAuth 令牌链维护。
+固定请求截止时间与浏览器 Cookie 一致；卡片凭据不进入模型可见结果。
+
 ## 工作区与路径
 
 位置：[workspaces.ts](../src/workspaces.ts)、[workspace-store.ts](../src/workspace-store.ts)、
@@ -42,6 +49,10 @@
 输入为已授权项目路径或已有工作区身份，输出为操作上下文、指令发现和状态。
 checkout 复用与 worktree 创建有不同生命周期。逻辑路径、物理路径和根目录
 锚点必须一致，不能通过旧标识访问已改变目标的目录。
+
+对象与锚点使用同一缓存条目。具有持久锚点接口的存储启用 32 项 LRU，
+`cachedWorkspaceCount` 只报告缓存数量，不是数据库工作区数。恢复重验锚点并清空
+非持久化的技能激活状态；无锚点旧适配器保持兼容，不做不可恢复的驱逐。
 
 指令扫描具有预算。发现不完整时必须报告，并由调用方补查目标目录的祖先说明。
 同一对话复用 checkout 时，`open_workspace.refreshContext` 可显式重新返回项目说明
@@ -126,6 +137,17 @@ ProcessSessionManager。原生执行使用 `shell:false`、有界 argv/stdin、U
 
 SQLite 保存任务等持久状态；运行进程、连接和内存互斥不因写入数据库而自动
 获得跨进程事务保证。数据库结构演进、回执保留和错误恢复应独立维护。
+
+[local-agent-usage.ts](../src/local-agent-usage.ts) 定义可选提供方用量观察值，
+通过执行器、运行池、管理器、存储、daemon 协议和展示层传递。保留原 thread/turn
+标识与采样时间，不把累计值差分当成本次工具的账单；详见 [用量说明](token-usage.md)。
+
+## 文档与交付门禁
+
+[check-documentation.mjs](../scripts/check-documentation.mjs) 检查公开 Markdown 的
+本地目标，不读取运行状态。配置示例通过 [config-schema.test.ts](../src/config-schema.test.ts)
+验证，基础工具目录由 [server.test.ts](../src/server.test.ts) 与真实注册结果核对。
+这些检查不替代真实宿主、网络和提供方验收。
 
 ## 工程边界
 

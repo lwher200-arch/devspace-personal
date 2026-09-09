@@ -48,7 +48,7 @@ import { registerNativeProcessTools } from "./native-process-tools.js";
 import { AccessDeniedError } from "./roots.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
-import { shutdownHttpServer } from "./server-shutdown.js";
+import { closeResourcesInOrder, shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
@@ -1031,16 +1031,18 @@ export function createServer(
     config,
     localAgentProviders,
     close: () => {
-      closePromise ??= (async () => {
-        clearInterval(sessionCleanupTimer);
-        const results = await transports.closeAll();
-        logSessionCloseResults("server_shutdown", results);
-        processSessions.shutdown();
-        await approvals?.close();
-        oauthProvider.close();
-        workspaceStore.close?.();
-        codexBridge?.close();
-      })();
+      closePromise ??= closeResourcesInOrder([
+        () => clearInterval(sessionCleanupTimer),
+        async () => {
+          const results = await transports.closeAll();
+          logSessionCloseResults("server_shutdown", results);
+        },
+        () => processSessions.shutdown(),
+        () => approvals?.close(),
+        () => oauthProvider.close(),
+        () => workspaceStore.close?.(),
+        () => codexBridge?.close(),
+      ]);
       return closePromise;
     },
   };

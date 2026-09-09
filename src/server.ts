@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { access, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -15,6 +16,7 @@ import {
   RESOURCE_MIME_TYPE,
 } from "@modelcontextprotocol/ext-apps/server";
 import express from "express";
+import { MemoryStore } from "express-rate-limit";
 import type { Request, Response } from "express";
 import * as z from "zod/v4";
 import {
@@ -738,6 +740,25 @@ export function createServer(
   config = loadConfig(),
   options: CreateServerOptions = {},
 ): RunningServer {
+  const rollback: Array<() => void> = [];
+  try { return initializeServer(config, options, rollback); }
+  catch (error) {
+    const errors = [error];
+    // Nothing is listening yet. Only synchronously acquired resources need
+    // rollback, in reverse ownership order; do not replay setup or erase state.
+    for (const close of rollback.reverse()) {
+      try { close(); } catch (cleanupError) { errors.push(cleanupError); }
+    }
+    if (errors.length > 1) throw new AggregateError(errors, `DevSpace startup rollback failed after: ${String(error)}`);
+    throw error;
+  }
+}
+
+function initializeServer(
+  config: ServerConfig,
+  options: CreateServerOptions,
+  rollback: Array<() => void>,
+): RunningServer {
   const incomingArtifactAdapters = options.incomingArtifactAdapters
     ?? [createOpenAIIncomingArtifactAdapter()];
   const allowedHosts = config.allowedHosts.includes("*")
@@ -751,12 +772,14 @@ export function createServer(
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
+  rollback.push(() => oauthProvider.close());
   const bearerAuth = requireBearerAuth({
     verifier: oauthProvider,
     requiredScopes: [config.oauth.scopes[0] ?? "devspace"],
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
   });
   const workspaceStore = createWorkspaceStore(config.stateDir);
+  rollback.push(() => workspaceStore.close?.());
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
@@ -764,6 +787,7 @@ export function createServer(
     ? new OwnerApprovals(undefined, (config.approvalTtlSeconds ?? APPROVAL_TTL_SECONDS.default) * 1000) : undefined;
   if (approvals) installOwnerApprovalRoutes(app, config, approvals);
   const codexBridge = config.bridge?.enabled ? (options.codexBridgeFactory?.(config) ?? new CodexBridge(config)) : undefined;
+  if (codexBridge) rollback.push(() => codexBridge.close());
   const localAgentProviders = buildLocalAgentProviderStatuses(
     config.subagents,
     getLocalAgentProviderAvailabilitySnapshot(),
@@ -802,6 +826,7 @@ export function createServer(
       .closeIdle(MCP_SESSION_IDLE_TIMEOUT_MS)
       .then((results) => logSessionCloseResults("idle_timeout", results));
   }, MCP_SESSION_CLEANUP_INTERVAL_MS);
+  rollback.push(() => clearInterval(sessionCleanupTimer));
   sessionCleanupTimer.unref();
 
   if (config.logging.trustProxy) {
@@ -831,6 +856,14 @@ export function createServer(
     next();
   });
 
+  // Own the SDK middleware's existing stores so setup failure and normal close
+  // can stop their timers. Endpoint limits and keying remain SDK defaults.
+  const authRateLimitStores = {
+    authorization: new MemoryStore(), token: new MemoryStore(),
+    registration: new MemoryStore(), revocation: new MemoryStore(),
+  };
+  const closeAuthRateLimits = Object.values(authRateLimitStores).map(store => () => store.shutdown());
+  rollback.push(...closeAuthRateLimits);
   app.use(
     mcpAuthRouter({
       provider: oauthProvider,
@@ -839,6 +872,10 @@ export function createServer(
       resourceServerUrl,
       scopesSupported: config.oauth.scopes,
       resourceName: "DevSpace",
+      authorizationOptions: { rateLimit: { store: authRateLimitStores.authorization } },
+      tokenOptions: { rateLimit: { store: authRateLimitStores.token } },
+      clientRegistrationOptions: { rateLimit: { store: authRateLimitStores.registration } },
+      revocationOptions: { rateLimit: { store: authRateLimitStores.revocation } },
     }),
   );
 
@@ -1039,6 +1076,7 @@ export function createServer(
         },
         () => processSessions.shutdown(),
         () => approvals?.close(),
+        ...closeAuthRateLimits,
         () => oauthProvider.close(),
         () => workspaceStore.close?.(),
         () => codexBridge?.close(),
@@ -1046,6 +1084,35 @@ export function createServer(
       return closePromise;
     },
   };
+}
+
+export async function startServer(
+  config = loadConfig(),
+  options: CreateServerOptions = {},
+): Promise<RunningServer & { httpServer: HttpServer }> {
+  const running = createServer(config, options);
+  try {
+    const httpServer = createHttpServer(running.app);
+    await new Promise<void>((resolve, reject) => {
+      const detach = () => {
+        httpServer.removeListener("error", failed);
+        httpServer.removeListener("listening", ready);
+      };
+      const failed = (error: unknown) => { detach(); reject(error); };
+      const ready = () => { detach(); resolve(); };
+      httpServer.once("error", failed);
+      httpServer.once("listening", ready);
+      try { httpServer.listen(config.port, config.host); }
+      catch (error) { failed(error); }
+    });
+    return { ...running, httpServer };
+  } catch (error) {
+    try { await running.close(); }
+    catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], `DevSpace listen and cleanup failed: ${String(error)}`);
+    }
+    throw error;
+  }
 }
 
 async function isMainModule(): Promise<boolean> {
@@ -1057,25 +1124,21 @@ async function isMainModule(): Promise<boolean> {
 }
 
 if (await isMainModule()) {
-  const { app, config, close, localAgentProviders } = createServer();
-  const httpServer = app.listen(config.port, config.host, () => {
-    console.log(
-      `devspace listening on http://${config.host}:${config.port}/mcp`,
-    );
-    console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
-    console.log("auth: oauth owner-token flow required");
-    console.log(`logging: ${config.logging.level} ${config.logging.format}`);
-    console.log(`request logging: ${config.logging.requests ? "enabled" : "disabled"}`);
-    console.log(`asset logging: ${config.logging.assets ? "enabled" : "disabled"}`);
-    console.log(`trust proxy: ${config.logging.trustProxy ? "enabled" : "disabled"}`);
-    const artifactDownloadStatus = !config.artifactsEnabled
-      ? "disabled"
-      : isArtifactDownloadSupportedPlatform()
-        ? "enabled"
-        : `unsupported on ${process.platform}`;
-    console.log(`native artifact download: ${artifactDownloadStatus}`);
-    console.log(`subagent providers: ${formatLocalAgentProviderStatusSummary(localAgentProviders)}`);
-  });
+  const { httpServer, config, close, localAgentProviders } = await startServer();
+  console.log(`devspace listening on http://${config.host}:${config.port}/mcp`);
+  console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
+  console.log("auth: oauth owner-token flow required");
+  console.log(`logging: ${config.logging.level} ${config.logging.format}`);
+  console.log(`request logging: ${config.logging.requests ? "enabled" : "disabled"}`);
+  console.log(`asset logging: ${config.logging.assets ? "enabled" : "disabled"}`);
+  console.log(`trust proxy: ${config.logging.trustProxy ? "enabled" : "disabled"}`);
+  const artifactDownloadStatus = !config.artifactsEnabled
+    ? "disabled"
+    : isArtifactDownloadSupportedPlatform()
+      ? "enabled"
+      : `unsupported on ${process.platform}`;
+  console.log(`native artifact download: ${artifactDownloadStatus}`);
+  console.log(`subagent providers: ${formatLocalAgentProviderStatusSummary(localAgentProviders)}`);
 
   let shuttingDown = false;
   const shutdown = async () => {

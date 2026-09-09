@@ -18,7 +18,10 @@ export function databasePath(stateDir: string): string {
   return join(stateDir, "devspace.sqlite");
 }
 
-export function openDatabase(stateDir: string): DatabaseHandle {
+export function openDatabase(
+  stateDir: string,
+  initialize?: (sqlite: SqliteDatabase) => void,
+): DatabaseHandle {
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   chmodSync(stateDir, 0o700);
   const path = databasePath(stateDir);
@@ -30,6 +33,9 @@ export function openDatabase(stateDir: string): DatabaseHandle {
     sqlite.pragma("busy_timeout = 5000");
     sqlite.pragma("foreign_keys = ON");
     migrateDatabase(sqlite);
+    // Keep synchronous store-specific setup inside the connection owner's
+    // failure boundary; a throwing constructor cannot return a handle to close.
+    initialize?.(sqlite);
 
     return {
       sqlite,
@@ -37,7 +43,10 @@ export function openDatabase(stateDir: string): DatabaseHandle {
       close: () => sqlite.close(),
     };
   } catch (error) {
-    sqlite.close();
+    try { sqlite.close(); }
+    catch (closeError) {
+      throw new AggregateError([error, closeError], `Database initialization and cleanup failed: ${String(error)}`);
+    }
     throw error;
   }
 }

@@ -41,8 +41,11 @@ export class SqliteOAuthStore {
   private readonly database: DatabaseHandle;
 
   constructor(stateDir: string) {
-    this.database = openDatabase(stateDir);
-    this.deleteExpiredTokens(Math.floor(Date.now() / 1000));
+    this.database = openDatabase(stateDir, sqlite => {
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      sqlite.prepare("delete from oauth_access_tokens where expires_at < ?").run(nowSeconds);
+      sqlite.prepare("delete from oauth_refresh_tokens where expires_at < ?").run(nowSeconds);
+    });
   }
 
   getClient(clientId: string): OAuthClientInformationFull | undefined {
@@ -181,10 +184,6 @@ export class SqliteOAuthStore {
     this.database.close();
   }
 
-  private deleteExpiredTokens(nowSeconds: number): void {
-    this.database.sqlite.prepare("delete from oauth_access_tokens where expires_at < ?").run(nowSeconds);
-    this.database.sqlite.prepare("delete from oauth_refresh_tokens where expires_at < ?").run(nowSeconds);
-  }
 }
 
 export class SqliteOAuthClientsStore implements OAuthRegisteredClientsStore {

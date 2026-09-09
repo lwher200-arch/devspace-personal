@@ -359,21 +359,19 @@ async function serve(): Promise<void> {
     );
   }
 
-  const { createServer } = await import("./server.js");
+  const { startServer } = await import("./server.js");
   const config = loadConfig();
-  const { app, close, localAgentProviders } = createServer(config);
-  const httpServer = app.listen(config.port, config.host, () => {
-    console.log(`devspace listening on http://${config.host}:${config.port}/mcp`);
-    console.log(`public base url: ${config.publicBaseUrl}`);
-    console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
-    console.log(`allowed hosts: ${config.allowedHosts.join(", ")}`);
-    if (config.allowedHosts.includes("*")) {
-      console.warn("warning: Host header allowlist is disabled because server.allowedHosts contains '*'");
-    }
-    console.log("auth: Owner password approval required");
-    console.log(`logging: ${config.logging.level} ${config.logging.format}`);
-    console.log(`subagent providers: ${formatLocalAgentProviderStatusSummary(localAgentProviders)}`);
-  });
+  const { httpServer, close, localAgentProviders } = await startServer(config);
+  console.log(`devspace listening on http://${config.host}:${config.port}/mcp`);
+  console.log(`public base url: ${config.publicBaseUrl}`);
+  console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
+  console.log(`allowed hosts: ${config.allowedHosts.join(", ")}`);
+  if (config.allowedHosts.includes("*")) {
+    console.warn("warning: Host header allowlist is disabled because server.allowedHosts contains '*'");
+  }
+  console.log("auth: Owner password approval required");
+  console.log(`logging: ${config.logging.level} ${config.logging.format}`);
+  console.log(`subagent providers: ${formatLocalAgentProviderStatusSummary(localAgentProviders)}`);
 
   let shuttingDown = false;
   const shutdown = async () => {

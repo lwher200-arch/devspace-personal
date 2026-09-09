@@ -26,13 +26,12 @@ export class CodexBridge {
     private readonly client: AgentClient = createLocalAgentClient(config),
     private readonly commandResolver: CodexCommandResolver = resolveCodexCommand,
   ) {
-    this.database = openDatabase(join(config.stateDir, "codex-bridge"));
-    this.database.sqlite.exec(`CREATE TABLE IF NOT EXISTS bridge_requests (
+    this.database = openDatabase(join(config.stateDir, "codex-bridge"), sqlite => sqlite.exec(`CREATE TABLE IF NOT EXISTS bridge_requests (
       request_hash TEXT PRIMARY KEY,
       fingerprint TEXT NOT NULL,
       agent_id TEXT,
       state TEXT NOT NULL
-    )`);
+    )`));
   }
 
   close(): void { this.database.close(); }

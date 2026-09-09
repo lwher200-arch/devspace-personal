@@ -62,11 +62,10 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
   private readonly database: DatabaseHandle;
 
   constructor(stateDir: string) {
-    this.database = openDatabase(stateDir);
-    this.database.sqlite.exec(`CREATE TABLE IF NOT EXISTS workspace_root_anchors (
+    this.database = openDatabase(stateDir, sqlite => sqlite.exec(`CREATE TABLE IF NOT EXISTS workspace_root_anchors (
       workspace_id TEXT PRIMARY KEY REFERENCES workspace_sessions(id) ON DELETE CASCADE,
       canonical_root TEXT NOT NULL
-    )`);
+    )`));
   }
 
   getRootAnchor(id: string): string | undefined {

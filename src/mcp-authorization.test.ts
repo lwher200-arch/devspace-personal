@@ -298,7 +298,19 @@ test('real OAuth/MCP requires independent Owner approval before command side eff
   assert.equal(modelVisible.includes(view.decisionToken), false);
   assert.equal(modelVisible.includes('decisionToken'), false);
   const listed = await rpc('tools/list', {});
-  assert.deepEqual(listed.result.tools.find((item: any) => item.name === 'decide_approval')._meta.ui.visibility, ['app']);
+  const decisionTool = listed.result.tools.find((item: any) => item.name === 'decide_approval');
+  const reviewTool = listed.result.tools.find((item: any) => item.name === 'review_approval');
+  assert.deepEqual(decisionTool._meta.ui.visibility, ['app']);
+  assert.equal(decisionTool._meta['openai/visibility'], 'private');
+  assert.equal(decisionTool._meta['openai/widgetAccessible'], true);
+  assert.equal(decisionTool.annotations.destructiveHint, true);
+  assert.equal(decisionTool.annotations.openWorldHint, true);
+  assert.equal(decisionTool._meta.ui.resourceUri, undefined,
+    'a hidden action must not own an output template: ChatGPT disables templates associated with hidden tools');
+  assert.equal(decisionTool._meta['openai/outputTemplate'], undefined);
+  assert.equal(reviewTool._meta.ui.resourceUri, 'ui://devspace/workspace-app.html');
+  assert.equal(reviewTool._meta['openai/outputTemplate'], reviewTool._meta.ui.resourceUri);
+  assert.deepEqual(reviewTool._meta.ui.visibility, ['model', 'app']);
   const uiDecision = { name: 'decide_approval', arguments: { approvalId: view.id, decisionToken: view.decisionToken, decision: 'approve' }, _meta: conversationMeta };
   const unreviewed = await rpc('tools/call', { name: 'decide_approval', arguments: { approvalId: view.id, decisionToken: 'forged', decision: 'approve' }, _meta: conversationMeta });
   assert.equal(unreviewed.result.isError, true);

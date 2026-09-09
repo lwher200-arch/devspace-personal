@@ -71,7 +71,9 @@ export function registerApprovalTools(server: McpServer, config: ServerConfig, a
     inputSchema: { approvalId: id, decisionToken: z.string().min(1).max(128), decision: z.enum(['approve', 'deny']) },
     outputSchema: { result: z.string() },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-    _meta: { ui: { resourceUri: WORKSPACE_APP_URI, visibility: ['app'] }, 'openai/visibility': 'private', 'openai/widgetAccessible': true },
+    // This private tool handles a click, not template rendering. Associating a
+    // hidden action with the shared output template disables that template in ChatGPT.
+    _meta: { ui: { visibility: ['app'] }, 'openai/visibility': 'private', 'openai/widgetAccessible': true },
   }, ({ approvalId, decisionToken, decision }, extra) => respond(approvalId, () => {
     const identity = principal(extra);
     const view = approvals.decideUi(approvalId, identity, decisionToken, decision === 'approve', validatePending);

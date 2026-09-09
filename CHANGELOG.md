@@ -1,5 +1,16 @@
 # Development Log
 
+## 2026-09-09 - Document cost-aware execution and compact accounting (L0)
+
+- Current State: Traffic/token reporting and standing authorization were already implemented and published; the practical cost-control recommendations needed explicit repository guidance.
+- Changes: Require search before reading, necessary excerpts and changed context, one primary executor per complex scope, risk-related validation and useful bounded delegation. Collect one accounting snapshot near each turn end, keep the footer compact and retain per-call details in the local report.
+- Root Cause: Repeated context, duplicated analysis and repeated accounting refreshes add work without establishing better results or more complete final-response receipts.
+- Impact: Project instructions and usage documentation only; all required verification and permission boundaries remain.
+- Tests: Two guides passed baseline and post-edit local-link/fence checks; scoped diff and publication-privacy review passed. Shared source guides were synchronized only after matching their prior committed contents. No source logic changed, so code tests were not rerun for this L0 update.
+- Compatibility: Existing CLI, token/traffic fields and missing-source semantics are unchanged. Every-turn accounting remains required.
+- Known Risks: Guidance does not prove a savings percentage, enforce model behavior automatically, or deploy runtime services. Equal-acceptance task comparisons and actual receipts are still needed.
+- Next Highest-Leverage Step: Apply these controls in subsequent work and compare finalized task receipts without adding repeated measurement-only model cycles.
+
 ## 2026-09-09 - Include recorded traffic and standing accounting authorization (L2)
 
 - Current State: The controller report summarized token receipts and visible calls but omitted payload byte counts. Repository guidance still referred to separate authorization for receipt reads despite the user's standing authorization for task accounting.

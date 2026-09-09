@@ -184,6 +184,19 @@ separately rather than relabeling this payload measurement.
 
 ## End each work report with accounting
 
+Keep accounting economical: collect one snapshot near the end of the turn,
+reuse already available receipts, and put detailed call records in the local
+JSON report. Show a compact footer with the required counters, scope and gaps.
+Do not add repeated model/tool cycles merely to update a still-running total;
+the final response cannot have a finalized receipt before it is generated.
+
+For execution, search before reading, send only necessary excerpts and changed
+context, and give a complex scope one primary executor. Run required checks and
+behavior-relevant tests; expand them when failures or unresolved risks justify
+it. Use bounded subagents when independent work improves coverage or turnaround.
+These are workflow controls, not evidence of measured savings: compare equal
+acceptance criteria and actual receipts before making a cost-reduction claim.
+
 Every task turn must end with a traffic and token accounting footer after the
 work outcome and validation evidence, even when receipts are unavailable. Give
 the sampling time, separate coverage states and one set of counters for each

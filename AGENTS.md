@@ -114,6 +114,14 @@ checks. Give each complex scope one primary executor; reuse its task and pass
 paths, acceptance criteria and concise evidence instead of full histories.
 Preserve required verification and permission boundaries.
 
+- Search to locate the relevant source before reading it; pass changed context
+  and necessary excerpts instead of repeatedly sending whole files or histories.
+- Run required checks and tests tied to affected behavior. Broaden validation
+  when failures or unresolved risks warrant it; use bounded subagents where
+  independent work improves verification or turnaround.
+- Take one accounting snapshot near the end of each turn and reuse available
+  receipts. Keep the footer concise and retain per-call details in a local
+  report; avoid extra model round trips just to refresh unfinished counters.
 - Record every edit, write, test and other tool invocation, including failures
   and retries, with the operation, observed outcome and available receipt.
 - End every task turn with both traffic and token accounting for the controller,

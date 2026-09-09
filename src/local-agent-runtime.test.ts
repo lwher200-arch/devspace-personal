@@ -10,10 +10,21 @@ import { LocalAgentRuntimePool } from "./local-agent-runtime-pool.js";
 import type {
   LocalAgentDriver,
   LocalAgentRunInput,
+  LocalAgentRunCallbacks,
   LocalAgentRunResult,
   LocalAgentRuntime,
   LocalAgentRuntimeContext,
 } from "./local-agent-runtime.js";
+
+const usage = {
+  source: "codex/thread-token-usage" as const,
+  scope: "provider_thread" as const,
+  threadId: "thread_1",
+  turnId: "turn_usage",
+  observedAt: "2026-09-08T00:00:00.000Z",
+  total: { inputTokens: 100, cachedInputTokens: 40, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 120 },
+  lastModelResponse: { inputTokens: 60, cachedInputTokens: 30, outputTokens: 10, reasoningOutputTokens: 3, totalTokens: 70 },
+};
 
 const context: LocalAgentRuntimeContext = {
   agentId: "agt_test",
@@ -56,9 +67,10 @@ class FakeRuntime implements LocalAgentRuntime {
     this.releaseResolve = undefined;
   }
 
-  async run(runInput: LocalAgentRunInput): Promise<BetterResult<LocalAgentRunResult, AgentProviderError>> {
+  async run(runInput: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<BetterResult<LocalAgentRunResult, AgentProviderError>> {
     assert.equal(this.releaseInFlight, false, "a session turn must not overlap session release");
     this.runCount += 1;
+    if (runInput.prompt === "usage") await callbacks?.onUsage?.(usage);
     if (runInput.prompt === "wait") await new Promise<void>((resolve) => this.pending.push(resolve));
     return Result.ok({
       provider: this.provider,
@@ -111,6 +123,16 @@ assert.equal(createCount, 1, "runtime creation is single-flight per runtime key"
 assert.equal(unwrap(first).finalResponse, "done:inspect");
 assert.equal(unwrap(second).finalResponse, "done:second");
 assert.equal(runtime.runCount, 2);
+
+let observedUsage: unknown;
+const metered = await pool.run(driver, context, { ...input, prompt: "usage" }, {
+  onUsage: async (snapshot) => {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    observedUsage = snapshot;
+  },
+});
+assert.equal(metered.isOk(), true);
+assert.deepEqual(observedUsage, usage, "the runtime pool forwards and awaits provider usage callbacks");
 
 const running = pool.run(driver, context, { ...input, prompt: "wait", providerSessionId: "thread_1" });
 await new Promise<void>((resolve) => setImmediate(resolve));

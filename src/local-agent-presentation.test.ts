@@ -8,6 +8,16 @@ import {
 } from "./local-agent-presentation.js";
 import type { LocalAgentRecord } from "./local-agent-store.js";
 
+const usage = {
+  source: "codex/thread-token-usage" as const,
+  scope: "provider_thread" as const,
+  threadId: "thread_usage",
+  turnId: "turn_usage",
+  observedAt: "2026-09-08T00:00:00.000Z",
+  total: { inputTokens: 100, cachedInputTokens: 40, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 120 },
+  lastModelResponse: { inputTokens: 60, cachedInputTokens: 30, outputTokens: 10, reasoningOutputTokens: 3, totalTokens: 70 },
+};
+
 const record: LocalAgentRecord = {
   id: "agt_test",
   workspaceId: "ws_private",
@@ -64,6 +74,12 @@ assert.deepEqual(failed, {
     retryable: true,
   },
 });
+
+for (const status of ["running", "idle", "error", "stopped"] as const) {
+  assert.deepEqual(presentAgentObservation({ ...record, status, usage }).usage, usage);
+}
+assert.equal("usage" in completed, false, "missing telemetry is omitted rather than zero");
+assert.equal("usage" in failed, false);
 
 const catalog: LocalAgentCatalog = {
   enabled: true,

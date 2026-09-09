@@ -124,6 +124,7 @@ export class LocalAgentRuntimePool {
       }
     };
     const callbacks: LocalAgentRunCallbacks = {
+      onUsage: inputCallbacks?.onUsage,
       onSessionId: async (providerSessionId) => {
         const reservationError = await reserveSession(providerSessionId);
         if (reservationError) throw reservationError;

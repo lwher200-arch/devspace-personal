@@ -162,6 +162,10 @@ configuration. The bundled `subagents` skill teaches the minimal
 comes from `open_workspace`; `devspace agents ls` lists existing subagent
 sessions for that workspace.
 
+For reducing repeated work and inspecting provider-reported task counters, see
+[Observing Codex token usage](token-usage.md). Usage is a latest thread snapshot;
+it does not include the host's own model consumption or establish a savings rate.
+
 ## Tool Names
 
 The Claude surface exposes these tool names:

@@ -153,6 +153,7 @@ function observation(record: LocalAgentRecord, policy?: CodexExecutionPolicy) {
         evidence.threadId !== record.providerSessionId) throw new Error();
     } catch {
       return { id: record.id, status: "failed" as const, requestedModel: record.model,
+        ...(record.usage === undefined ? {} : { usage: record.usage }),
         error: { code: "MODEL_EVIDENCE_UNAVAILABLE", message: "Stored result has no matching approved runtime model evidence; historical/unverified output is withheld.", retryable: false },
         ...(record.providerSessionId ? { codexThreadId: record.providerSessionId } : {}), updatedAt: record.updatedAt };
     }

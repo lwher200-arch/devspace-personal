@@ -12,6 +12,7 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
 import type {
   LocalAgentDriver,
   LocalAgentRunInput,
+  LocalAgentRunCallbacks,
   LocalAgentRunResult,
   LocalAgentRuntime,
   LocalAgentRuntimeContext,
@@ -19,6 +20,16 @@ import type {
 import { LocalAgentRuntimePool } from "./local-agent-runtime-pool.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
+
+const usage = {
+  source: "codex/thread-token-usage" as const,
+  scope: "provider_thread" as const,
+  threadId: "thread_usage",
+  turnId: "turn_usage",
+  observedAt: "2026-09-08T00:00:00.000Z",
+  total: { inputTokens: 100, cachedInputTokens: 40, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 120 },
+  lastModelResponse: { inputTokens: 60, cachedInputTokens: 30, outputTokens: 10, reasoningOutputTokens: 3, totalTokens: 70 },
+};
 
 const root = await mkdtemp(join(tmpdir(), "devspace-agent-manager-test-"));
 const directRoot = await mkdtemp(join(tmpdir(), "devspace-direct-agent-manager-test-"));
@@ -54,9 +65,20 @@ class FakeRuntime implements LocalAgentRuntime {
 
   async run(
     input: LocalAgentRunInput,
-    callbacks?: { onSessionId?: (id: string) => void | Promise<void> },
+    callbacks?: LocalAgentRunCallbacks,
   ): Promise<BetterResult<LocalAgentRunResult, AgentProviderError>> {
     this.inputs.push(input);
+    if (input.prompt.includes("usage-fail")) {
+      await callbacks?.onSessionId?.(usage.threadId);
+      await callbacks?.onUsage?.(usage);
+      await callbacks?.onUsage?.(usage);
+      return Result.err(providerFailure("provider failed after reporting usage"));
+    }
+    if (input.prompt.includes("usage-new-session")) {
+      await callbacks?.onSessionId?.("thread_new");
+      await callbacks?.onUsage?.(usage);
+      return Result.ok({ provider: this.provider, providerSessionId: "thread_new", finalResponse: "new session", items: [] });
+    }
     if (input.prompt.includes("early-fail")) {
       await callbacks?.onSessionId?.("thread_early");
       return Result.err(providerFailure("provider failed after session creation"));
@@ -68,7 +90,7 @@ class FakeRuntime implements LocalAgentRuntime {
     }
     return Result.ok({
       provider: this.provider,
-      providerSessionId: "thread_test",
+      providerSessionId: input.providerSessionId ?? "thread_test",
       finalResponse: `response:${input.prompt}`,
       items: [],
     });
@@ -286,6 +308,21 @@ const earlyFailure = unwrap(await manager.start({
 }));
 await waitFor(() => getRecord(earlyFailure.id).status === "error");
 assert.equal(getRecord(earlyFailure.id).providerSessionId, "thread_early");
+
+const usageFailure = unwrap(await manager.start({
+  target: "reviewer", prompt: "usage-fail", ...scope,
+}));
+await waitFor(() => getRecord(usageFailure.id).status === "error");
+assert.deepEqual(getRecord(usageFailure.id).usage, usage, "failure retains the last provider observation");
+assert.deepEqual(getRecord(usageFailure.id).usage, usage, "repeated reads do not add usage");
+const usageRecovery = unwrap(await manager.continue(usageFailure.id, "recovered without telemetry", {}, scope));
+assert.deepEqual(usageRecovery.usage, usage, "continuation keeps the prior observed turn until a new observation arrives");
+await waitFor(() => getRecord(usageFailure.id).status === "idle");
+assert.deepEqual(getRecord(usageFailure.id).usage, usage, "a successful turn without telemetry does not invent zero");
+unwrap(await manager.continue(usageFailure.id, "usage-new-session", {}, scope));
+await waitFor(() => getRecord(usageFailure.id).status === "idle");
+assert.equal(getRecord(usageFailure.id).providerSessionId, "thread_new");
+assert.equal(getRecord(usageFailure.id).usage, undefined, "new sessions clear old usage and reject late old-session events");
 
 const wrongWorkspace = await manager.continue(
   first.id,

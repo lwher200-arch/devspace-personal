@@ -44,6 +44,7 @@ export type AgentObservationOutput = (
   | { id: string; status: "failed"; error: AgentFailureOutput }
   | { id: string; status: "stopped"; error?: AgentFailureOutput }) & {
     requestedModel?: string;
+    usage?: LocalAgentRecord["usage"];
     executionEvidence?: LocalAgentRecord["executionEvidence"];
   };
 
@@ -80,7 +81,10 @@ export function presentAgentSummary(record: LocalAgentRecord): AgentSummaryOutpu
 }
 
 export function presentAgentObservation(record: LocalAgentRecord): AgentObservationOutput {
-  const output = presentLegacyAgentObservation(record);
+  const output = {
+    ...presentLegacyAgentObservation(record),
+    ...(record.usage === undefined ? {} : { usage: record.usage }),
+  };
   return record.executionPolicy ? { ...output, requestedModel: record.model,
     ...(output.status === "completed" && record.executionEvidence ? { executionEvidence: record.executionEvidence } : {}) } : output;
 }

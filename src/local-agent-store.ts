@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { localAgentTokenUsageSchema, type LocalAgentTokenUsage } from "./local-agent-usage.js";
 import { resolve } from "node:path";
 import { Result, type Result as BetterResult } from "better-result";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
@@ -16,6 +17,7 @@ export interface LocalAgentRecord {
   model?: string;
   executionPolicy?: CodexExecutionPolicy;
   executionEvidence?: CodexExecutionEvidence;
+  usage?: LocalAgentTokenUsage;
   effort?: string;
   providerSessionId?: string;
   status: LocalAgentStatus;
@@ -198,6 +200,17 @@ export class LocalAgentStore {
       updatedAt: new Date().toISOString(),
     };
 
+    // Telemetry is optional. Keep the last valid snapshot until the provider
+    // session changes; missing or malformed telemetry must never become zero.
+    updated.usage = current.providerSessionId === updated.providerSessionId ? current.usage : undefined;
+    if (Object.hasOwn(patch, "usage")) {
+      const usage = readTokenUsage(patch.usage);
+      if (patch.usage === undefined) updated.usage = undefined;
+      else if (usage && (!updated.providerSessionId || usage.threadId === updated.providerSessionId)) {
+        updated.usage = usage;
+      }
+    }
+
     this.database.sqlite
       .prepare(
         `update local_agent_sessions set
@@ -224,7 +237,7 @@ export class LocalAgentStore {
         updated.provider,
         updated.model ?? null,
         updated.effort ?? null,
-        JSON.stringify({ policy: updated.executionPolicy, evidence: updated.executionEvidence }),
+        JSON.stringify({ policy: updated.executionPolicy, evidence: updated.executionEvidence, usage: updated.usage }),
         updated.providerSessionId ?? null,
         updated.status,
         updated.latestResponse ?? null,
@@ -284,6 +297,7 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     model: row.model ?? undefined,
     executionPolicy: execution.policy === undefined ? undefined : executionPolicySchema.parse(execution.policy),
     executionEvidence: execution.evidence === undefined ? undefined : executionEvidenceSchema.parse(execution.evidence),
+    usage: readTokenUsage(execution.usage),
     effort: row.effort ?? undefined,
     providerSessionId: row.provider_session_id ?? undefined,
     status: readStatus(row.status),
@@ -294,6 +308,11 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function readTokenUsage(value: unknown): LocalAgentTokenUsage | undefined {
+  const parsed = localAgentTokenUsageSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
 }
 
 function readOptionalBoolean(value: string | null): boolean | undefined {

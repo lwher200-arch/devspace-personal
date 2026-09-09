@@ -12,6 +12,7 @@ import { normalizeCommandPathEnvironment, removeDevspaceNodeModulesBinFromPath }
 import { terminateProcessTree } from "./process-platform.js";
 import { assertExecutionSelection, readCodexTurnEvidence, type CodexExecutionPolicy } from "./local-agent-execution.js";
 import { assertAllowedPath, canonicalAllowedPath } from "./roots.js";
+import { localAgentTokenUsageSchema, type LocalAgentTokenUsage } from "./local-agent-usage.js";
 import type {
   LocalAgentDriver,
   LocalAgentRunCallbacks,
@@ -191,7 +192,7 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
           assertAllowedPath(rolloutPath, [join(this.actualHome!, "sessions"), join(this.actualHome!, "archived_sessions")]);
         }
         const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId), input.executionPolicy ? input.model : undefined,
-          input.executionPolicy ? this.options.turnTimeoutMs ?? 600000 : undefined);
+          input.executionPolicy ? this.options.turnTimeoutMs ?? 600000 : undefined, callbacks?.onUsage);
         const parsed = parseCompletedTurn(completed.event.params, completed.items);
         if (parsed.failure) {
           throw new AgentProviderExecutionError({
@@ -237,6 +238,7 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
           finalResponse: parsed.finalResponse.trim(),
           items: parsed.items,
           ...(executionEvidence ? { executionEvidence } : {}),
+          ...(completed.usage ? { usage: completed.usage } : {}),
         };
         } catch (cause) {
           if (!input.executionPolicy) throw cause;
@@ -390,6 +392,7 @@ interface CodexEvent {
 interface CodexTurnResult {
   event: CodexEvent;
   items: unknown[];
+  usage?: LocalAgentTokenUsage;
 }
 
 interface CodexTurnAccumulator {
@@ -401,6 +404,11 @@ interface CodexTurnAccumulator {
   reject: (error: Error) => void;
   requiredModel?: string;
   policyError?: Error;
+  usage?: LocalAgentTokenUsage;
+  earlyUsage: unknown[];
+  usageWrites: Promise<void>;
+  usageWriteError?: Error;
+  onUsage?: LocalAgentRunCallbacks["onUsage"];
 }
 
 class CodexAppServerRpc {
@@ -443,7 +451,8 @@ class CodexAppServerRpc {
     this.write({ method, ...(params === undefined ? {} : { params }) });
   }
 
-  async runTurn(threadId: string, params: unknown, requiredModel?: string, timeoutMs?: number): Promise<CodexTurnResult> {
+  async runTurn(threadId: string, params: unknown, requiredModel?: string, timeoutMs?: number,
+    onUsage?: LocalAgentRunCallbacks["onUsage"]): Promise<CodexTurnResult> {
     if (this.fatalError) throw this.fatalError;
     if (this.turns.has(threadId)) throw new Error(`Codex thread ${threadId} already has an active turn.`);
     let resolveTurn!: (result: CodexTurnResult) => void;
@@ -459,6 +468,9 @@ class CodexAppServerRpc {
       resolve: resolveTurn,
       reject: rejectTurn,
       requiredModel,
+      earlyUsage: [],
+      usageWrites: Promise.resolve(),
+      onUsage,
     };
     this.turns.set(threadId, turn);
     const timer = timeoutMs === undefined ? undefined : setTimeout(() => {
@@ -468,12 +480,17 @@ class CodexAppServerRpc {
     try {
       const response = await this.request("turn/start", params);
       turn.turnId = readString(asRecord(response)?.turn, "id");
+      for (const pendingUsage of turn.earlyUsage) this.captureUsage(turn, pendingUsage);
+      turn.earlyUsage = [];
       if (turn.policyError) throw turn.policyError;
-      if (turn.completed) return { event: turn.completed, items: turn.items };
-      return await completion;
+      const result = turn.completed ? { event: turn.completed, items: turn.items } : await completion;
+      return { ...result, ...(turn.usage ? { usage: turn.usage } : {}) };
     } finally {
       if (timer) clearTimeout(timer);
       if (this.turns.get(threadId) === turn) this.turns.delete(threadId);
+      // Flush receipts before returning success/error or closing a guarded runtime.
+      await turn.usageWrites;
+      if (turn.usageWriteError) throw turn.usageWriteError;
     }
   }
 
@@ -522,6 +539,15 @@ class CodexAppServerRpc {
     const turn = this.findTurn(event);
     if (!turn) return;
     const params = asRecord(event.params);
+    if (method === "thread/tokenUsage/updated") {
+      if (!turn.turnId) {
+        // Notifications can precede the turn/start reply. Bind them only once
+        // that reply establishes the turn, keeping the pre-reply buffer bounded.
+        turn.earlyUsage.push(event.params);
+        if (turn.earlyUsage.length > 16) turn.earlyUsage.shift();
+      } else this.captureUsage(turn, event.params);
+      return;
+    }
     if (method === "model/rerouted" && turn.requiredModel && params?.toModel !== turn.requiredModel && turnMatchesEvent(turn, event)) {
       turn.policyError = new Error(`Codex model rerouted to ${String(params?.toModel ?? "unknown")}; required ${turn.requiredModel}.`);
       this.fail(turn.policyError);
@@ -534,6 +560,31 @@ class CodexAppServerRpc {
     if (event.method !== "turn/completed" || !turnMatchesEvent(turn, event)) return;
     turn.completed = event;
     turn.resolve({ event, items: turn.items.slice() });
+  }
+
+  private captureUsage(turn: CodexTurnAccumulator, value: unknown): void {
+    const params = asRecord(value);
+    if (!turn.turnId || params?.threadId !== turn.threadId || params?.turnId !== turn.turnId) return;
+    const counters = asRecord(params.tokenUsage);
+    const parsed = localAgentTokenUsageSchema.safeParse({
+      source: "codex/thread-token-usage", scope: "provider_thread",
+      threadId: turn.threadId, turnId: turn.turnId, observedAt: new Date().toISOString(),
+      total: counters?.total, lastModelResponse: counters?.last,
+    });
+    if (!parsed.success) return;
+    const usage = parsed.data;
+    if (turn.usage && JSON.stringify([turn.usage.total, turn.usage.lastModelResponse]) ===
+      JSON.stringify([usage.total, usage.lastModelResponse])) return;
+    turn.usage = usage;
+    turn.usageWrites = turn.usageWrites.then(async () => {
+      try { await turn.onUsage?.(usage); }
+      catch (error) {
+        // A telemetry failure must not release an in-flight provider turn or
+        // kill other sessions sharing this runtime. Report it at the turn's
+        // normal terminal boundary, and keep attempting later snapshots.
+        turn.usageWriteError ??= error instanceof Error ? error : new Error(String(error));
+      }
+    });
   }
 
   private findTurn(event: CodexEvent): CodexTurnAccumulator | undefined {

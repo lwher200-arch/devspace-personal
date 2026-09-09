@@ -7,6 +7,16 @@ import {
   LocalAgentDaemonProtocolError,
 } from "./local-agent-daemon-protocol.js";
 
+const usage = {
+  source: "codex/thread-token-usage" as const,
+  scope: "provider_thread" as const,
+  threadId: "thread_usage",
+  turnId: "turn_usage",
+  observedAt: "2026-09-08T00:00:00.000Z",
+  total: { inputTokens: 100, cachedInputTokens: 40, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 120 },
+  lastModelResponse: { inputTokens: 60, cachedInputTokens: 30, outputTokens: 10, reasoningOutputTokens: 3, totalTokens: 70 },
+};
+
 const request = decodeLocalAgentDaemonRequest({
   requestId: "req_1",
   protocolVersion: 3,
@@ -76,6 +86,9 @@ const record = decodeAgentRecord({
   updatedAt: "now",
 });
 assert.equal(record.id, "agt_1234");
+assert.equal(record.usage, undefined);
+assert.deepEqual(decodeAgentRecord({ ...record, usage }).usage, usage);
+assert.equal(decodeAgentRecord({ ...record, usage: { ...usage, total: { ...usage.total, totalTokens: -1 } } }).usage, undefined);
 assert.equal(record.latestResponse, "  response whitespace  \n");
 
 const directRecord = decodeAgentRecord({ ...record, workspaceId: undefined });

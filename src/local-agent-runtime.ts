@@ -2,6 +2,7 @@ import type { Result } from "better-result";
 import type { AgentProviderError } from "./local-agent-errors.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import type { CodexExecutionPolicy, CodexExecutionEvidence } from "./local-agent-execution.js";
+import type { LocalAgentTokenUsage } from "./local-agent-usage.js";
 
 export type LocalAgentWriteMode = "read_only" | "allowed" | "full_access";
 
@@ -23,6 +24,7 @@ export interface LocalAgentRunResult {
   finalResponse: string;
   items: unknown[];
   executionEvidence?: CodexExecutionEvidence;
+  usage?: LocalAgentTokenUsage;
 }
 
 export interface LocalAgentRunCallbacks {
@@ -32,6 +34,8 @@ export interface LocalAgentRunCallbacks {
    * could otherwise fail and lose that identity.
    */
   onSessionId?: (providerSessionId: string) => void | Promise<void>;
+  /** Persist observed receipts even if execution later fails or is interrupted. */
+  onUsage?: (usage: LocalAgentTokenUsage) => void | Promise<void>;
 }
 
 export interface LocalAgentRuntimeContext {

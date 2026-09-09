@@ -9,6 +9,16 @@ import { loadConfig } from "./config.js";
 import type { LocalAgentRecord } from "./local-agent-store.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 
+const usage = {
+  source: "codex/thread-token-usage" as const,
+  scope: "provider_thread" as const,
+  threadId: "thread_usage",
+  turnId: "turn_usage",
+  observedAt: "2026-09-08T00:00:00.000Z",
+  total: { inputTokens: 100, cachedInputTokens: 40, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 120 },
+  lastModelResponse: { inputTokens: 60, cachedInputTokens: 30, outputTokens: 10, reasoningOutputTokens: 3, totalTokens: 70 },
+};
+
 test("configured bridge requires explicit models, gates old CLI, and withholds unverified history", async () => {
   const temp = mkdtempSync(join(tmpdir(), "devspace-bridge-policy-"));
   const config = loadConfig(writeTestDevspaceConfig(join(temp, "config"), { storage: { stateDir: join(temp, "state") } }));
@@ -37,9 +47,11 @@ test("configured bridge requires explicit models, gates old CLI, and withholds u
     assert.equal(calls, 1);
     record.status = "idle";
     record.latestResponse = "unverified old result";
+    record.usage = usage;
     const history = await bridge.status(scope, record.id);
     assert.equal(history.status, "failed");
     assert.equal("response" in history, false);
+    assert.deepEqual(history.usage, usage, "rejected model evidence does not erase provider-reported usage");
     await bridge.submit(scope, { ...input, requestKey: "two", model: "gpt-6-astra", agentId: record.id });
     assert.equal(calls, 2);
   } finally { bridge.close(); rmSync(temp, { recursive: true, force: true }); }
@@ -62,10 +74,13 @@ test("Codex bridge preserves context, scopes, read-only default and durable dedu
   let bridge = new CodexBridge(config, client);
   try {
     const input = { requestKey: "first", prompt: "Only reply", writeMode: "read_only" as const };
+    record.usage = { ...usage, threadId: "thread-test" };
     const first = await bridge.submit(scope, input);
+    assert.deepEqual(first.usage, record.usage);
     assert.equal(first.codexThreadId, "thread-test");
     assert.equal(first.status, "completed");
-    await bridge.submit(scope, input);
+    const replayed = await bridge.submit(scope, input);
+    assert.deepEqual(replayed.usage, record.usage);
     assert.equal(starts, 1);
     await bridge.submit({ ...scope, workspaceId: "reopened" }, input);
     assert.equal(starts, 1);
@@ -77,6 +92,9 @@ test("Codex bridge preserves context, scopes, read-only default and durable dedu
     assert.equal(starts, 1);
     await bridge.submit(scope, { ...input, requestKey: "follow-up", agentId: record.id });
     assert.equal(continues, 1);
+    assert.deepEqual((await bridge.status(scope, record.id)).usage, record.usage);
+    assert.deepEqual((await bridge.status(scope, record.id)).usage, record.usage);
+    assert.equal(starts, 1, "polling and receipt replay never start another inference");
     record.latestResponse = "x".repeat(30000);
     const long = await bridge.status(scope, record.id);
     assert.equal("responseTruncated" in long && long.responseTruncated, true);

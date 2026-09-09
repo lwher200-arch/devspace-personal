@@ -12,6 +12,16 @@ import { loadConfig } from "./config.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 
+const usage = {
+  source: "codex/thread-token-usage" as const,
+  scope: "provider_thread" as const,
+  threadId: "thread_usage",
+  turnId: "turn_usage",
+  observedAt: "2026-09-08T00:00:00.000Z",
+  total: { inputTokens: 100, cachedInputTokens: 40, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 120 },
+  lastModelResponse: { inputTokens: 60, cachedInputTokens: 30, outputTokens: 10, reasoningOutputTokens: 3, totalTokens: 70 },
+};
+
 test("MCP advertises explicit model/preflight and returns verified structured evidence", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-policy-mcp-"));
   const policy = { requiredModel: "gpt-6-astra", minimumCliVersion: "0.153.0" };
@@ -26,6 +36,7 @@ test("MCP advertises explicit model/preflight and returns verified structured ev
     providerSessionId: "thread", executionPolicy: policy, latestResponse: "done", createdAt: "now", updatedAt: "now",
     executionEvidence: { requestedModel: "gpt-6-astra", sessionModel: "gpt-6-astra", runtimeModel: "gpt-6-astra", cliVersion: "0.153.4",
       executable: "fixture", threadId: "thread", turnId: "turn", source: "codex-rollout/turn_context", sandbox: "readOnly", approvalPolicy: "never" } };
+  record.usage = { ...usage, threadId: "thread" };
   const agentClient: any = { start: async (input: any) => { starts++; assert.equal(input.model, "gpt-6-astra"); assert.deepEqual(input.executionPolicy, policy); return Result.ok(record); },
     continue: async () => Result.ok(record), get: async () => Result.ok(record), list: async () => Result.ok([]) };
   const bridge = new CodexBridge(config, agentClient, () => ({ executable: "fixture", version: "0.153.4" }));
@@ -48,4 +59,5 @@ test("MCP advertises explicit model/preflight and returns verified structured ev
   const value = JSON.parse((result.structuredContent as { result: string }).result);
   assert.equal(value.executionEvidence.runtimeModel, "gpt-6-astra");
   assert.equal(value.status, "completed");
+  assert.deepEqual(value.usage, record.usage, "the MCP host receives the latest provider usage snapshot");
 });

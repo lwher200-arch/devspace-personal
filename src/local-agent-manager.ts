@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { localAgentTokenUsageSchema } from "./local-agent-usage.js";
 import { Result, type Result as BetterResult } from "better-result";
 import {
   AgentConflictError,
@@ -359,6 +360,15 @@ export class LocalAgentManager {
         agentDir: this.agentDir,
       };
       const callbacks: LocalAgentRunCallbacks = {
+        onUsage: (usage) => {
+          const parsed = localAgentTokenUsageSchema.safeParse(usage);
+          if (!parsed.success) return;
+          const current = this.store.getByIdResult(record.id);
+          if (current.isErr()) throw current.error;
+          if (!current.value || current.value.providerSessionId !== parsed.data.threadId) return;
+          const updated = this.store.updateResult(record.id, { usage: parsed.data });
+          if (updated.isErr()) throw updated.error;
+        },
         onSessionId: (providerSessionId) => {
           const current = this.store.getByIdResult(record.id);
           if (current.isErr()) throw current.error;
@@ -395,6 +405,7 @@ export class LocalAgentManager {
         status: "idle",
         latestResponse: runResult.finalResponse,
         executionEvidence: runResult.executionEvidence,
+        ...(runResult.usage === undefined ? {} : { usage: runResult.usage }),
         error: undefined,
         errorCode: undefined,
         errorRetryable: undefined,

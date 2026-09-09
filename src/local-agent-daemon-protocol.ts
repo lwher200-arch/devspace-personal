@@ -10,6 +10,7 @@ import type {
 import type { LocalAgentWriteMode } from "./local-agent-runtime.js";
 import { LOCAL_AGENT_DAEMON_PROTOCOL_VERSION } from "./local-agent-daemon-lifecycle.js";
 import { executionPolicySchema, executionEvidenceSchema } from "./local-agent-execution.js";
+import { localAgentTokenUsageSchema } from "./local-agent-usage.js";
 
 export type LocalAgentDaemonMethod =
   | "hello"
@@ -179,6 +180,7 @@ export function decodeLocalAgentDaemonResponse(value: unknown): LocalAgentDaemon
 export function decodeAgentRecord(value: unknown): LocalAgentRecord {
   const record = asRecord(value);
   const status = requiredString(record?.status, "status");
+  const usage = localAgentTokenUsageSchema.safeParse(record?.usage);
   if (!isLocalAgentStatus(status)) throw new LocalAgentDaemonProtocolError("INVALID_RECORD", "Invalid agent status.");
   return {
     id: requiredString(record?.id, "id"),
@@ -189,6 +191,7 @@ export function decodeAgentRecord(value: unknown): LocalAgentRecord {
     model: optionalString(record?.model),
     ...(record?.executionPolicy === undefined ? {} : { executionPolicy: decodeExecutionPolicy(record.executionPolicy) }),
     ...(record?.executionEvidence === undefined ? {} : { executionEvidence: decodeExecutionEvidence(record.executionEvidence) }),
+    ...(usage.success ? { usage: usage.data } : {}),
     effort: optionalString(record?.effort),
     providerSessionId: optionalString(record?.providerSessionId),
     status,

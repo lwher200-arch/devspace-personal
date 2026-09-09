@@ -29,7 +29,8 @@ test("canonical response receipts reconcile without adding duplicates, snapshots
   assert.equal(report.duplicateResponseCount, 1);
   assert.deepEqual(report.usage, twice);
   assert.equal(report.uncachedInputTokens, 60);
-  assert.deepEqual(report.operations, [{ callId: "call-a", tool: "exec", resultRecorded: true, independentTokens: null }]);
+  assert.deepEqual(report.operations, [{ callId: "call-a", tool: "exec", resultRecorded: true, independentTokens: null,
+    requestBytes: 17, responseBytes: 15 }]);
   assert.ok(!JSON.stringify(report).includes("PRIVATE"));
   assert.ok(!formatTokenUsageReport(report).includes("PRIVATE"));
 });
@@ -58,6 +59,66 @@ test("missing canonical receipts are unavailable even with legacy token_count", 
   assert.equal(report.usage, null);
   assert.equal(report.uncachedInputTokens, null);
   assert.match(formatTokenUsageReport(report), /Total: unavailable/);
+});
+
+test("traffic measures UTF-8 payload bytes without exposing contents or claiming wire traffic", () => {
+  const report = parseTokenUsageReport(jsonl(start(),
+    event("response_item", { type: "custom_tool_call", name: "exec", call_id: "unicode", input: "你好🙂" }),
+    event("response_item", { type: "custom_tool_call_output", call_id: "unicode", output: { text: "好" } }),
+    receipt(), done()));
+  assert.equal(report.traffic.scope, "recorded_tool_payload_utf8");
+  assert.equal(report.traffic.requestBytes, 10);
+  assert.equal(report.traffic.responseBytes, 14);
+  assert.equal(report.traffic.totalBytes, 24);
+  assert.equal(report.traffic.networkWireBytes, null);
+  assert.equal(report.traffic.status, "complete");
+  assert.ok(!JSON.stringify(report).includes("你好"));
+  assert.match(formatTokenUsageReport(report), /Network wire traffic: unavailable/);
+});
+
+test("traffic counts repeated recorded payloads while token receipts remain deduplicated", () => {
+  const report = parseTokenUsageReport(jsonl(start(),
+    event("response_item", { type: "function_call", name: "read", call_id: "repeat", arguments: "a" }),
+    event("response_item", { type: "function_call", name: "read", call_id: "repeat", arguments: "你" }),
+    event("response_item", { type: "function_call_output", call_id: "repeat", output: "ok" }),
+    event("response_item", { type: "function_call_output", call_id: "repeat", output: "ok" }),
+    receipt(), receipt(), done()));
+  assert.equal(report.traffic.requestRecords, 2);
+  assert.equal(report.traffic.responseRecords, 2);
+  assert.equal(report.traffic.requestBytes, 4);
+  assert.equal(report.traffic.responseBytes, 4);
+  assert.equal(report.usage?.total_tokens, 120);
+});
+
+test("missing, pending and unmatched traffic stays unavailable instead of zero", () => {
+  const call = event("response_item", { type: "custom_tool_call", name: "exec", call_id: "call", input: "" });
+  const pending = parseTokenUsageReport(jsonl(start(), call, receipt()));
+  assert.equal(pending.traffic.requestBytes, 0);
+  assert.equal(pending.traffic.responseBytes, null);
+  assert.equal(pending.traffic.totalBytes, null);
+  assert.equal(pending.traffic.observedTotalBytes, 0, "known empty request is not a claim that the missing response costs zero");
+  assert.equal(pending.traffic.status, "partial");
+  const missing = parseTokenUsageReport(jsonl(start(), call,
+    event("response_item", { type: "custom_tool_call_output", call_id: "call" }), receipt(), done()));
+  assert.equal(missing.traffic.missingPayloadRecords, 1);
+  assert.equal(missing.traffic.responseBytes, null);
+  const orphan = parseTokenUsageReport(jsonl(start(), call,
+    event("response_item", { type: "custom_tool_call_output", call_id: "other", output: "private" }), receipt(), done()));
+  assert.equal(orphan.traffic.unmatchedResponseRecords, 1);
+  assert.equal(orphan.traffic.totalBytes, null);
+  assert.equal(orphan.traffic.observedResponseBytes, 0, "orphan payload cannot be charged to a selected call");
+  const noIdentity = parseTokenUsageReport(jsonl(start(),
+    event("response_item", { type: "custom_tool_call", name: "exec", input: "private" }), receipt(), done()));
+  assert.equal(noIdentity.traffic.requestBytes, null);
+  assert.equal(noIdentity.status, "partial");
+});
+
+test("traffic is bounded to the selected turn and empty observed tool activity is distinct from network zero", () => {
+  const report = parseTokenUsageReport(jsonl(start(), receipt(), done(), start("turn-b"),
+    event("response_item", { type: "custom_tool_call", name: "exec", call_id: "later", input: "private" })), "turn-a");
+  assert.equal(report.traffic.totalBytes, 0);
+  assert.equal(report.traffic.networkWireBytes, null);
+  assert.equal(parseTokenUsageReport(jsonl(receipt())).traffic.status, "unavailable");
 });
 
 test("missing cache details remain unknown instead of zero", () => {

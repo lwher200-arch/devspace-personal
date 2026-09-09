@@ -1,5 +1,16 @@
 # Development Log
 
+## 2026-09-09 - Include recorded traffic and standing accounting authorization (L2)
+
+- Current State: The controller report summarized token receipts and visible calls but omitted payload byte counts. Repository guidance still referred to separate authorization for receipt reads despite the user's standing authorization for task accounting.
+- Changes: Added recorded-tool-payload traffic totals, per-call request/response bytes, known observed subtotals and explicit wire-traffic unavailability. Updated rules and footer documentation to require traffic and token reporting every turn without renewed approval for related existing receipts; execution permissions remain unchanged.
+- Root Cause: Recorded payload size is measurable from the selected JSONL source, but it is not network wire traffic. Pending, absent and unmatched payloads also cannot safely become zero or a complete total.
+- Impact: UTF-8 strings and JSON-serialized structured payloads are measured without returning content. Each recorded occurrence, including repeats, contributes bytes while response token receipts remain deduplicated. Missing full-direction totals stay null; observed subtotals include only measured payloads attributable to visible calls. Wire bytes remain null because HTTP/TLS framing, compression, retransmission and model API transfer are not observed.
+- Tests: Baseline 10 passed. Reporter plus CLI regression 15 passed, 0 failures/skips, in 35.211 seconds; typecheck and backend compilation passed. Coverage includes multibyte Unicode, structured output, repeated records, missing/pending/unmatched payloads, absent identities and turn boundaries. The compiled CLI returned complete, reconciled token and recorded-payload results for a completed related rollout. Document links, fields, fences and scoped diff checks passed. The prior broader suite was not rerun for this bounded reporter update.
+- Compatibility: Additive JSON fields and text lines. No database, model, server permission or network-capture change. Existing token sources and partial/missing semantics remain. Accounting authorization does not authorize unrelated sessions, credentials or execution actions.
+- Known Risks: Traffic is recorded tool payload volume, not an ISP/API network invoice. Active snapshots omit later results and final-response usage; subagent and host records must be labeled separately when unavailable. Current runtime services were not deployed by this change.
+- Next Highest-Leverage Step: Use the report at each turn boundary, displaying observed traffic subsets and receipt coverage until finalized records are available.
+
 ## 2026-09-09 - Add read-only controller usage reports and accounting rules (L2)
 
 - Current State: Delegated Codex thread snapshots were already available, but there was no reusable controller receipt report or repository rule requiring an accounting footer. The release candidate was isolated from the shared checkout.

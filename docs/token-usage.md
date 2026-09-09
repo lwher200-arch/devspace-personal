@@ -1,4 +1,4 @@
-# Observing Codex token usage
+# Observing token usage and recorded tool traffic
 
 DevSpace can expose the latest token counters reported by a delegated Codex
 thread. Direct project reads, searches and patches do not start Codex inference;
@@ -75,7 +75,11 @@ devspace usage report --rollout 'C:\authorized\rollout.jsonl'
 devspace usage report --rollout 'C:\authorized\rollout.jsonl' --turn-id '<turn-id>' --json
 ```
 
-Use a rollout path already identified and authorized for the current task.
+Reading existing usage and traffic receipts for the current task and subtasks
+it actually invoked has standing user authorization; accounting does not need
+another confirmation. Use the identified rollout path for that task. This does
+not authorize reading unrelated sessions or credentials, starting additional
+execution, or changing a service or its permissions.
 The command reads a UTF-8 snapshot of the supplied regular JSONL file, at most
 64 MiB and 100,000 JSONL records, using one file handle. It does not search session
 folders, load credentials, start inference, or change a project or service.
@@ -121,35 +125,84 @@ summary for the supplied controller log, not automatic access to ChatGPT's
 web-host billing. If that host exposes no receipt, its usage is unavailable.
 The delegated `usage` snapshot described above does not replace a controller
 receipt, and the controller report does not automatically read subagent logs.
-Read only explicitly authorized additional receipt sources, label them
-separately and avoid duplicate counting across sources.
+Apply the same standing authorization to existing receipts from subtasks this
+task actually invoked. Label each source separately, identify missing sources
+and avoid duplicate token counting across sources.
 
 The JSON report identifies `scope: "controller_turn"`, `turnId`, `sampledAt`,
 `status` (`complete`, `partial` or `unavailable`) and `complete`. It includes
 `responseCount`, `duplicateResponseCount`, `providerTurnTotalMatches`, `warnings`
-and `operations`. Each operation contains `callId`, `tool`, `resultRecorded`
-and `independentTokens: null`. `usage` contains `input_tokens`,
-`cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`,
+and `operations`. Each operation contains `callId`, `tool`, `resultRecorded`,
+`requestBytes`, `responseBytes` and `independentTokens: null`. `usage` contains
+`input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`,
 `reasoning_output_tokens` and `total_tokens`; missing detail counters are `null`.
 Without usable receipts, `usage` itself is `null`. `uncachedInputTokens` is
 available only when both cache counters are known. The text report uses
 `unavailable` for missing counters and prints coverage warnings.
 
+## Recorded tool traffic
+
+The same report counts the UTF-8 bytes of request arguments and returned payloads
+visible in the selected turn's log. Text uses its UTF-8 byte length; structured
+content is JSON-serialized before measuring. Each visible request or response
+record contributes once, including duplicates. This describes what the log
+records; a duplicate record is not evidence that a network retry occurred.
+The report emits counters and identifiers without emitting payload contents.
+
+The `traffic` object uses `scope: "recorded_tool_payload_utf8"` and contains
+`requestBytes`, `responseBytes`, `totalBytes`, `observedRequestBytes`,
+`observedResponseBytes`, `observedTotalBytes`, `requestRecords`, `responseRecords`,
+`missingPayloadRecords`, `unmatchedResponseRecords`, `status` (`complete`,
+`partial` or `unavailable`) and `networkWireBytes: null`. Each entry in
+`operations` also includes `requestBytes` and `responseBytes`. Missing payload
+measurements remain unavailable rather than being assigned zero. Each source
+has token and traffic coverage states; measured payload bytes do not establish
+token-receipt or network coverage.
+
+A missing payload makes the affected direction's aggregate and total `null`.
+An output without a matching call makes the response aggregate and total
+`null`; its record still contributes to `responseRecords` and
+`unmatchedResponseRecords`. Without a turn start, traffic is unavailable and
+calls cannot be assigned. A known empty payload or observed empty call range
+can measure zero; that is not a claim that unrecorded traffic was zero.
+
+`observedRequestBytes`, `observedResponseBytes` and `observedTotalBytes` preserve
+known subtotals even when a complete direction total is unavailable. They count
+only measurable request payloads and measurable responses attributable to calls
+in the selected turn. Missing payloads, pending responses and unmatched output
+records are excluded from these subtotals; without a turn start all three are
+`null`. Label these values as an observed subset, never the complete turn or
+network wire traffic. For example, a pending response can make `responseBytes`
+`null` while `observedResponseBytes` still shows earlier measured responses.
+These are recorded payload bytes, not real network wire bytes. They exclude
+unobserved data and cannot establish HTTP or TLS framing, compression, network
+retransmissions, model-provider traffic, or overall bandwidth. Real network
+traffic remains unavailable without its own measurement. Do not convert byte
+counts into token counts or treat them as a provider bill. If independent
+network telemetry is available for the task, show its source and scope
+separately rather than relabeling this payload measurement.
+
 ## End each work report with accounting
 
-After the work outcome and validation evidence, include a footer with the
-sampling time, receipt coverage and one set of counters for each available
-source. Use actual values or `unavailable`; never estimate a tool's token cost
-from its runtime, response length or the number of tool calls.
+Every task turn must end with a traffic and token accounting footer after the
+work outcome and validation evidence, even when receipts are unavailable. Give
+the sampling time, separate coverage states and one set of counters for each
+available source. Use actual values or `unavailable`; never estimate a tool's
+token cost from its runtime, response length or the number of tool calls.
 
 ```text
-Token accounting (sampled at <UTC timestamp>)
+Traffic and token accounting (sampled at <UTC timestamp>)
 Controller: <partial / complete / unavailable>; <receipt and turn coverage>
   Input: <value>; cached input: <value or unavailable>
   Cache-write input: <value or unavailable>
   Output: <value>; reasoning output: <value or unavailable>; total: <value>
-Delegated agents: <separately identified receipt counters / not invoked / unavailable>
-Subagents: <separately identified receipt counters / not invoked / unavailable>
+Recorded tool payload traffic: <partial / complete / unavailable>; <record coverage>
+  Direction totals: request <bytes or unavailable>; response <bytes or unavailable>; total <bytes or unavailable>
+  Observed subset: request <known bytes or unavailable>; response <known bytes or unavailable>; total <known bytes or unavailable>
+  Missing payload records: <count>; unmatched responses: <count>
+Real network traffic: unavailable unless independently measured
+Delegated agents: <separate token/traffic receipts / not invoked / unavailable>
+Subagents: <separate token/traffic receipts / not invoked / unavailable>
 Operations: <observed calls, failures, retries and result coverage; log path>
 Independent per-operation tokens: unavailable unless a separate receipt exists
 Missing/excluded usage: <sources and responses not covered, including later final response>

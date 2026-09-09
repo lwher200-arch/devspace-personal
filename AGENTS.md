@@ -107,7 +107,7 @@ For UI changes, include before/after images and a short interaction video when b
 
 Start at the boundary named by the problem and follow the data. Keep policy in DevSpace, provider translation in adapters, and important behavior in schemas, types, checks, or explicit tool results rather than hidden prompt conventions.
 
-## Task scope and token accounting
+## Task scope, traffic and token accounting
 
 Use direct tools for scoped reads, searches, guarded edits and deterministic
 checks. Give each complex scope one primary executor; reuse its task and pass
@@ -116,16 +116,24 @@ Preserve required verification and permission boundaries.
 
 - Record every edit, write, test and other tool invocation, including failures
   and retries, with the operation, observed outcome and available receipt.
-- End work reports with token accounting for the controller, delegated agents
-  and subagents separately: input, cached input, cache-write input when supplied,
-  output, reasoning output and total, plus sampling time and receipt coverage.
+- End every task turn with both traffic and token accounting for the controller,
+  delegated agents and subagents separately. Include input, cached input,
+  cache-write input when supplied, output, reasoning output and total; recorded
+  request/response payload bytes; sampling time and coverage for each source.
 - Use actual response receipts, deduplicate response IDs, and do not add their
   totals to provider cumulative totals. Cache and reasoning counts are details
   of parent counters. A receipt shared by several operations is counted once;
   without a separate per-call receipt, mark that operation's token cost unavailable.
-- Use [the usage report](docs/token-usage.md) only with an explicitly authorized
-  controller rollout path. Do not discover or read unrelated sessions. Visible
-  call batches are not proof of every nested operation or its success.
+- Reading existing usage and traffic receipts for the current task and subtasks
+  it actually invoked has standing user authorization; do not ask again merely
+  to perform accounting. Use [the usage report](docs/token-usage.md) with those
+  identified paths. Do not read unrelated tasks or credentials, or treat this
+  authorization as permission for additional execution or service changes.
+- Count recorded request/response UTF-8 payload bytes once per visible record,
+  including duplicate records. Label them as recorded payload traffic, not
+  network wire bytes or proven retransmissions. Keep payload contents private;
+  missing traffic and independent per-tool tokens are unavailable, never zero.
+  Visible call batches do not prove every nested operation or its success.
 - Mark missing sources and unfinished snapshots explicitly. Do not call an
   active-turn snapshot the completed turn's exact total, infer Chat usage from
   delegated receipts, or claim savings without both usage and billing evidence.

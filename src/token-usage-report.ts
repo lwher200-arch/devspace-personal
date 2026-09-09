@@ -8,6 +8,22 @@ type Counter = typeof counterNames[number];
 type Counters = Record<Counter, number | null>;
 type RecordValue = Record<string, unknown>;
 
+export interface RecordedTraffic {
+  scope: "recorded_tool_payload_utf8";
+  requestBytes: number | null;
+  responseBytes: number | null;
+  totalBytes: number | null;
+  observedRequestBytes: number | null;
+  observedResponseBytes: number | null;
+  observedTotalBytes: number | null;
+  requestRecords: number;
+  responseRecords: number;
+  missingPayloadRecords: number;
+  unmatchedResponseRecords: number;
+  status: "complete" | "partial" | "unavailable";
+  networkWireBytes: null;
+}
+
 export interface TokenUsageReport {
   scope: "controller_turn";
   turnId: string | null;
@@ -19,12 +35,24 @@ export interface TokenUsageReport {
   usage: Counters | null;
   uncachedInputTokens: number | null;
   providerTurnTotalMatches: boolean;
-  operations: Array<{ callId: string; tool: string; resultRecorded: boolean; independentTokens: null }>;
+  operations: Array<{ callId: string; tool: string; resultRecorded: boolean; independentTokens: null;
+    requestBytes: number | null; responseBytes: number | null }>;
+  traffic: RecordedTraffic;
   warnings: string[];
 }
 
 function record(value: unknown): RecordValue | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as RecordValue : undefined;
+}
+
+function payloadBytes(value: unknown): number | null {
+  if (typeof value === "string") return Buffer.byteLength(value, "utf8");
+  if (Array.isArray(value) || record(value)) return Buffer.byteLength(JSON.stringify(value), "utf8");
+  return null;
+}
+
+function addBytes(a: number | null, b: number | null): number | null {
+  return a === null || b === null ? null : a + b;
 }
 
 function counters(value: unknown): Counters | undefined {
@@ -122,25 +150,70 @@ export function parseTokenUsageReport(text: string, requestedTurnId?: string): T
   if (!completed) warnings.push("Turn is not finalized; final-response and unrecorded usage may be missing.");
   if (!start) warnings.push("Turn start boundary unavailable; calls cannot be assigned safely.");
   const calls = new Map<string, TokenUsageReport["operations"][number]>();
-  const outputs = new Set<string>();
+  const responses: Array<{ callId: string; bytes: number | null }> = [];
+  let requestRecords = 0;
+  let missingPayloadRecords = 0;
+  let unassignedPayload = false;
+  let observedRequestBytes = 0;
+  let observedResponseBytes = 0;
   for (const row of start ? rows.filter(r => r.line > start.line && r.line <= endLine) : []) {
     if (row.type !== "response_item") continue;
     const p = row.payload;
-    if (typeof p.call_id !== "string") continue;
+    if (typeof p.call_id !== "string" || !p.call_id) {
+      if (["function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output"].includes(String(p.type))) {
+        unassignedPayload = true;
+        warnings.push("A tool record has no call identity; payload totals are unavailable.");
+      }
+      continue;
+    }
     if ((p.type === "function_call" || p.type === "custom_tool_call") && typeof p.name === "string") {
-      calls.set(p.call_id, { callId: p.call_id, tool: p.name, resultRecorded: false, independentTokens: null });
-    } else if (p.type === "function_call_output" || p.type === "custom_tool_call_output") outputs.add(p.call_id);
+      const bytes = payloadBytes(p.type === "function_call" ? p.arguments : p.input);
+      requestRecords++;
+      if (bytes === null) missingPayloadRecords++;
+      else observedRequestBytes += bytes;
+      const previous = calls.get(p.call_id);
+      if (previous) previous.requestBytes = addBytes(previous.requestBytes, bytes);
+      else calls.set(p.call_id, { callId: p.call_id, tool: p.name, resultRecorded: false,
+        independentTokens: null, requestBytes: bytes, responseBytes: null });
+    } else if (p.type === "function_call_output" || p.type === "custom_tool_call_output") {
+      const bytes = payloadBytes(p.output);
+      if (bytes === null) missingPayloadRecords++;
+      responses.push({ callId: p.call_id, bytes });
+    }
   }
-  for (const call of calls.values()) call.resultRecorded = outputs.has(call.callId);
+  let unmatchedResponseRecords = 0;
+  for (const response of responses) {
+    const call = calls.get(response.callId);
+    if (!call) { unmatchedResponseRecords++; continue; }
+    if (response.bytes !== null) observedResponseBytes += response.bytes;
+    call.responseBytes = call.resultRecorded ? addBytes(call.responseBytes, response.bytes) : response.bytes;
+    call.resultRecorded = true;
+  }
   if ([...calls.values()].some(c => !c.resultRecorded)) warnings.push("Some visible calls have no recorded result at the sampling boundary.");
+  if (missingPayloadRecords) warnings.push("Some tool records omit a measurable payload; missing bytes are unavailable.");
+  if (unmatchedResponseRecords) warnings.push("Some output records have no matching call in this turn; response total is unavailable.");
   const complete = usage !== null && providerTurnTotalMatches && !!start && !!completed && warnings.length === 0;
+  const requestBytes = start && !unassignedPayload ? [...calls.values()].reduce<number | null>((sum, c) => addBytes(sum, c.requestBytes), 0) : null;
+  const responseBytes = start && !unmatchedResponseRecords && !unassignedPayload
+    ? [...calls.values()].reduce<number | null>((sum, c) => addBytes(sum, c.responseBytes), 0) : null;
+  const traffic: RecordedTraffic = {
+    scope: "recorded_tool_payload_utf8", requestBytes, responseBytes,
+    totalBytes: addBytes(requestBytes, responseBytes),
+    observedRequestBytes: start ? observedRequestBytes : null,
+    observedResponseBytes: start ? observedResponseBytes : null,
+    observedTotalBytes: start ? observedRequestBytes + observedResponseBytes : null,
+    requestRecords, responseRecords: responses.length,
+    missingPayloadRecords, unmatchedResponseRecords,
+    status: !start ? "unavailable" : completed && warnings.length === 0 ? "complete" : "partial",
+    networkWireBytes: null,
+  };
   return {
     scope: "controller_turn", turnId: turnId ?? null, sampledAt: new Date().toISOString(),
     status: !usage ? "unavailable" : complete ? "complete" : "partial", complete,
     responseCount: receipts.size, duplicateResponseCount, usage,
     uncachedInputTokens: usage && usage.cached_input_tokens !== null && usage.cache_write_input_tokens !== null
       ? usage.input_tokens! - usage.cached_input_tokens - usage.cache_write_input_tokens : null,
-    providerTurnTotalMatches, operations: [...calls.values()], warnings: [...new Set(warnings)],
+    providerTurnTotalMatches, operations: [...calls.values()], traffic, warnings: [...new Set(warnings)],
   };
 }
 
@@ -170,10 +243,13 @@ export function formatTokenUsageReport(report: TokenUsageReport): string {
   return [
     `Token usage (${report.status}; controller only)`, `Sampled: ${report.sampledAt}`,
     `Turn: ${report.turnId ?? "unavailable"}; responses: ${report.responseCount}; duplicate receipts: ${report.duplicateResponseCount}`,
-    ...report.operations.map(c => `Call ${c.callId} (${c.tool}): result ${c.resultRecorded ? "recorded" : "not recorded"}; independent tokens unavailable`),
+    ...report.operations.map(c => `Call ${c.callId} (${c.tool}): result ${c.resultRecorded ? "recorded" : "not recorded"}; request/response payload bytes ${n(c.requestBytes)}/${n(c.responseBytes)}; independent tokens unavailable`),
     `Input: ${n(report.usage?.input_tokens)}; cached input: ${n(report.usage?.cached_input_tokens)}; cache-write input: ${n(report.usage?.cache_write_input_tokens)}`,
     `Uncached input: ${n(report.uncachedInputTokens)}; output: ${n(report.usage?.output_tokens)}; reasoning output: ${n(report.usage?.reasoning_output_tokens)}`,
     `Total: ${n(report.usage?.total_tokens)}; delegated agents: not included`,
+    `Recorded tool payload (${report.traffic.status}, UTF-8 bytes): request ${n(report.traffic.requestBytes)}; response ${n(report.traffic.responseBytes)}; total ${n(report.traffic.totalBytes)}`,
+    `Known recorded payload subtotal: request ${n(report.traffic.observedRequestBytes)}; response ${n(report.traffic.observedResponseBytes)}; total ${n(report.traffic.observedTotalBytes)} bytes (excludes missing/unmatched records)`,
+    "Network wire traffic: unavailable; recorded payload excludes protocol framing, model API traffic, compression and retransmissions.",
     "Cache/reasoning details are included in their parent counters; do not add them again.",
     ...report.warnings.map(w => `Coverage: ${w}`),
   ].join("\n");

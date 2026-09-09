@@ -58,6 +58,7 @@ import { assertAllowedPath, expandHomePath } from "./roots.js";
 import { runProjectCommand } from "./project-tools.js";
 import { readReviewRef } from "./review-checkpoints.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
+import { runUsageReportCommand } from "./token-usage-report.js";
 
 type Command =
   | "serve"
@@ -66,6 +67,7 @@ type Command =
   | "config"
   | "agents"
   | "project"
+  | "usage"
   | "show-changes"
   | "help"
   | "version";
@@ -96,6 +98,9 @@ async function main(argv: string[]): Promise<void> {
     case "agents":
       await runAgentsCommand(args);
       return;
+    case "usage":
+      console.log(await runUsageReportCommand(args));
+      return;
     case "project": {
       const config = loadConfig();
       const context = resolveCliWorkspaceContext(config.allowedRoots);
@@ -123,6 +128,7 @@ function normalizeCommand(command: string | undefined): Command {
     || command === "config"
     || command === "agents"
     || command === "project"
+    || command === "usage"
     || command === "show-changes"
   ) return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
@@ -464,6 +470,7 @@ function printHelp(): void {
       "  devspace show-changes <review-ref> [--json]",
       "  devspace project <files|search|read|read-batch|patch> [--path path] [--query literal] [--cursor token] [--offset n] [--limit n] [--expected-sha256 hash] [--include-ignored] [--request-file path --dry-run] [--json]",
       "  devspace agents ls       List subagent sessions",
+      "  devspace usage report --rollout <path> [--turn-id <id>] [--json]",
       "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] (<prompt> | --prompt-file <path>)",
       "  devspace agents continue <id> [--model <model>] [--effort <level>] (<prompt> | --prompt-file <path>)",
       "  devspace agents show <id>",

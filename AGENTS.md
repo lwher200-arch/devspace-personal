@@ -107,6 +107,29 @@ For UI changes, include before/after images and a short interaction video when b
 
 Start at the boundary named by the problem and follow the data. Keep policy in DevSpace, provider translation in adapters, and important behavior in schemas, types, checks, or explicit tool results rather than hidden prompt conventions.
 
+## Task scope and token accounting
+
+Use direct tools for scoped reads, searches, guarded edits and deterministic
+checks. Give each complex scope one primary executor; reuse its task and pass
+paths, acceptance criteria and concise evidence instead of full histories.
+Preserve required verification and permission boundaries.
+
+- Record every edit, write, test and other tool invocation, including failures
+  and retries, with the operation, observed outcome and available receipt.
+- End work reports with token accounting for the controller, delegated agents
+  and subagents separately: input, cached input, cache-write input when supplied,
+  output, reasoning output and total, plus sampling time and receipt coverage.
+- Use actual response receipts, deduplicate response IDs, and do not add their
+  totals to provider cumulative totals. Cache and reasoning counts are details
+  of parent counters. A receipt shared by several operations is counted once;
+  without a separate per-call receipt, mark that operation's token cost unavailable.
+- Use [the usage report](docs/token-usage.md) only with an explicitly authorized
+  controller rollout path. Do not discover or read unrelated sessions. Visible
+  call batches are not proof of every nested operation or its success.
+- Mark missing sources and unfinished snapshots explicitly. Do not call an
+  active-turn snapshot the completed turn's exact total, infer Chat usage from
+  delegated receipts, or claim savings without both usage and billing evidence.
+
 ## Project taste
 
 - Prefer explicit lifecycle and state over hidden autonomy.

@@ -64,3 +64,99 @@ API invoice. This field alone does not establish total cost or a savings rate.
 Protocol reference: [Codex App Server turn events](https://learn.chatgpt.com/docs/app-server#turn-events).
 The adapter was checked against locally generated Codex CLI 0.153.4 bindings;
 fixture tests do not establish real model billing or live ChatGPT acceptance.
+
+## Report controller receipts from an explicit rollout
+
+A local Codex controller can report its recorded turn usage without starting
+another model or contacting the DevSpace server:
+
+```powershell
+devspace usage report --rollout 'C:\authorized\rollout.jsonl'
+devspace usage report --rollout 'C:\authorized\rollout.jsonl' --turn-id '<turn-id>' --json
+```
+
+Use a rollout path already identified and authorized for the current task.
+The command reads a UTF-8 snapshot of the supplied regular JSONL file, at most
+64 MiB and 100,000 JSONL records, using one file handle. It does not search session
+folders, load credentials, start inference, or change a project or service.
+Run the matching built CLI when testing a source checkout; an older installed
+binary may not contain this command. Capture the JSON report outside tracked
+files if you need to keep a receipt artifact. Do not commit raw rollout logs.
+
+By default, the report selects the latest `task_started` turn in that file.
+Use `--turn-id` to select an earlier known turn. If no start event exists, it
+falls back to the latest canonical receipt turn, marks coverage partial and
+does not assign tool calls to that turn. It collects canonical
+`token_usage_record` receipts and deduplicates them by `response_id` before
+summing input and output counters. A provider turn total is a reconciliation
+check, not another amount to add. Legacy `token_count` events alone cannot
+establish these response receipts: missing accounting remains unavailable.
+
+The report includes visible outer tool-call batches and whether each has a
+recorded result (`resultRecorded`). This is an operation inventory, not a
+per-tool invoice. `independentTokens` is `null` without independent receipts.
+A batch can contain several reads, edits or tests; the report does not inspect
+raw arguments or guess those nested operations. A recorded result also does
+not prove success. Preserve a concise operation/outcome log, including failed
+commands and retries, alongside the report when those details are required.
+Do not charge a shared response's full usage to each operation in that batch.
+
+The selected controller turn can be complete only after `task_complete` is
+recorded within its start/next-turn boundaries, every accepted receipt belongs
+to those boundaries and the unique controller `session_meta.id`, and the
+canonical receipt sum reconciles with the provider turn total without warnings.
+Missing or mismatched receipt `thread_id` values and receipts outside a known
+turn boundary are omitted with coverage warnings. A missing or ambiguous
+controller session identity cannot produce a complete report.
+An active turn is partial, even when currently observed counters reconcile.
+Malformed JSONL, an unfinished final record, missing results or conflicting
+thread identities prevent complete coverage. Conflicting duplicate response
+receipts are rejected; invalid UTF-8 is rejected rather than silently repaired.
+A snapshot taken before the final response excludes any usage recorded later,
+including the final response itself. Use the report's sampling time and
+coverage status; do not relabel a partial snapshot as the final bill.
+
+The output omits raw prompts, tool arguments and tool output. It is a usage
+summary for the supplied controller log, not automatic access to ChatGPT's
+web-host billing. If that host exposes no receipt, its usage is unavailable.
+The delegated `usage` snapshot described above does not replace a controller
+receipt, and the controller report does not automatically read subagent logs.
+Read only explicitly authorized additional receipt sources, label them
+separately and avoid duplicate counting across sources.
+
+The JSON report identifies `scope: "controller_turn"`, `turnId`, `sampledAt`,
+`status` (`complete`, `partial` or `unavailable`) and `complete`. It includes
+`responseCount`, `duplicateResponseCount`, `providerTurnTotalMatches`, `warnings`
+and `operations`. Each operation contains `callId`, `tool`, `resultRecorded`
+and `independentTokens: null`. `usage` contains `input_tokens`,
+`cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`,
+`reasoning_output_tokens` and `total_tokens`; missing detail counters are `null`.
+Without usable receipts, `usage` itself is `null`. `uncachedInputTokens` is
+available only when both cache counters are known. The text report uses
+`unavailable` for missing counters and prints coverage warnings.
+
+## End each work report with accounting
+
+After the work outcome and validation evidence, include a footer with the
+sampling time, receipt coverage and one set of counters for each available
+source. Use actual values or `unavailable`; never estimate a tool's token cost
+from its runtime, response length or the number of tool calls.
+
+```text
+Token accounting (sampled at <UTC timestamp>)
+Controller: <partial / complete / unavailable>; <receipt and turn coverage>
+  Input: <value>; cached input: <value or unavailable>
+  Cache-write input: <value or unavailable>
+  Output: <value>; reasoning output: <value or unavailable>; total: <value>
+Delegated agents: <separately identified receipt counters / not invoked / unavailable>
+Subagents: <separately identified receipt counters / not invoked / unavailable>
+Operations: <observed calls, failures, retries and result coverage; log path>
+Independent per-operation tokens: unavailable unless a separate receipt exists
+Missing/excluded usage: <sources and responses not covered, including later final response>
+```
+
+Cache counts are already included in input and reasoning counts in output.
+Do not sum them again. `Not invoked` requires evidence that no such execution
+occurred; it is different from a missing receipt for an invoked agent. A report
+may be complete for the selected local controller turn while still lacking
+Chat-host or delegated usage, so it is not necessarily a complete workflow bill.

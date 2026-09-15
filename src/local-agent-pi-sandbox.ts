@@ -9,6 +9,7 @@ import {
   type SandboxRuntimeConfig,
 } from "@anthropic-ai/sandbox-runtime";
 import {
+  createExtensionRuntime,
   createBashTool,
   createEditTool,
   createFindTool,
@@ -19,6 +20,8 @@ import {
   type BashOperations,
   type EditOperations,
   type ExtensionFactory,
+  type ResourceLoader,
+  type ToolDefinition,
   type FindOperations,
   type GrepOperations,
   type LsOperations,
@@ -78,40 +81,67 @@ export function createPiSandboxModeRef(value: PiSandboxWriteMode): PiSandboxMode
   return { value };
 }
 
-export function createPiSandboxExtension(
-  workspace: string,
-  modeRef: PiSandboxModeRef,
-): ExtensionFactory {
+export function createPiSandboxTools(workspace: string, modeRef: PiSandboxModeRef): ToolDefinition[] {
+  const tools: ToolDefinition[] = [];
+  const localRead = createReadTool(workspace);
+  const restrictedRead = createReadTool(workspace, { operations: createReadOperations(workspace) });
+  tools.push(dynamicTool(localRead, restrictedRead, modeRef));
+
+  const localWrite = createWriteTool(workspace);
+  const restrictedWrite = createWriteTool(workspace, { operations: createWriteOperations(workspace) });
+  tools.push(dynamicTool(localWrite, restrictedWrite, modeRef, true));
+
+  const localEdit = createEditTool(workspace);
+  const restrictedEdit = createEditTool(workspace, { operations: createEditOperations(workspace) });
+  tools.push(dynamicTool(localEdit, restrictedEdit, modeRef, true));
+
+  const localGrep = createGrepTool(workspace);
+  const restrictedGrep = createGrepTool(workspace, { operations: createGrepOperations(workspace) });
+  tools.push(dynamicTool(localGrep, restrictedGrep, modeRef));
+
+  const localFind = createFindTool(workspace);
+  const restrictedFind = createFindTool(workspace, { operations: createFindOperations(workspace) });
+  tools.push(dynamicTool(localFind, restrictedFind, modeRef));
+
+  const localLs = createLsTool(workspace);
+  const restrictedLs = createLsTool(workspace, { operations: createLsOperations(workspace) });
+  tools.push(dynamicTool(localLs, restrictedLs, modeRef));
+
+  const localBash = createBashTool(workspace);
+  const restrictedBash = createBashTool(workspace, {
+    operations: createSandboxedBashOperations(),
+  });
+  tools.push(dynamicTool(localBash, restrictedBash, modeRef, true));
+  return tools;
+}
+
+export function createPiSandboxExtension(workspace: string, modeRef: PiSandboxModeRef): ExtensionFactory {
   return (pi) => {
-    const localRead = createReadTool(workspace);
-    const restrictedRead = createReadTool(workspace, { operations: createReadOperations(workspace) });
-    pi.registerTool(dynamicTool(localRead, restrictedRead, modeRef));
+    for (const tool of createPiSandboxTools(workspace, modeRef)) pi.registerTool(tool);
+  };
+}
 
-    const localWrite = createWriteTool(workspace);
-    const restrictedWrite = createWriteTool(workspace, { operations: createWriteOperations(workspace) });
-    pi.registerTool(dynamicTool(localWrite, restrictedWrite, modeRef, true));
-
-    const localEdit = createEditTool(workspace);
-    const restrictedEdit = createEditTool(workspace, { operations: createEditOperations(workspace) });
-    pi.registerTool(dynamicTool(localEdit, restrictedEdit, modeRef, true));
-
-    const localGrep = createGrepTool(workspace);
-    const restrictedGrep = createGrepTool(workspace, { operations: createGrepOperations(workspace) });
-    pi.registerTool(dynamicTool(localGrep, restrictedGrep, modeRef));
-
-    const localFind = createFindTool(workspace);
-    const restrictedFind = createFindTool(workspace, { operations: createFindOperations(workspace) });
-    pi.registerTool(dynamicTool(localFind, restrictedFind, modeRef));
-
-    const localLs = createLsTool(workspace);
-    const restrictedLs = createLsTool(workspace, { operations: createLsOperations(workspace) });
-    pi.registerTool(dynamicTool(localLs, restrictedLs, modeRef));
-
-    const localBash = createBashTool(workspace);
-    const restrictedBash = createBashTool(workspace, {
-      operations: createSandboxedBashOperations(),
-    });
-    pi.registerTool(dynamicTool(localBash, restrictedBash, modeRef, true));
+/** Only DevSpace-owned tools enter the session; disk resources are never discovered or reloaded. */
+export function createPiSandboxSessionResources(workspace: string, modeRef: PiSandboxModeRef): {
+  customTools: ToolDefinition[];
+  resourceLoader: ResourceLoader;
+} {
+  const extensions = { extensions: [], errors: [], runtime: createExtensionRuntime() };
+  return {
+    customTools: createPiSandboxTools(workspace, modeRef),
+    resourceLoader: {
+      getExtensions: () => extensions,
+      getSkills: () => ({ skills: [], diagnostics: [] }),
+      getPrompts: () => ({ prompts: [], diagnostics: [] }),
+      getThemes: () => ({ themes: [], diagnostics: [] }),
+      getAgentsFiles: () => ({ agentsFiles: [] }),
+      getSystemPrompt: () => undefined,
+      getSystemPromptSource: () => undefined,
+      getAppendSystemPrompt: () => [],
+      getAppendSystemPromptSources: () => [],
+      extendResources: () => {},
+      reload: async () => {},
+    },
   };
 }
 

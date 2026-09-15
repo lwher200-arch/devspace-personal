@@ -3,10 +3,12 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express, { type Express } from 'express';
+import * as z from 'zod/v4';
 import type { ServerConfig } from './config.js';
 import type { WorkspaceRegistry } from './workspaces.js';
 import { assertAllowedPath, canonicalAllowedPath, PRIVATE_CREDENTIAL_DIRECTORIES } from './roots.js';
 import { parsePatch } from './apply-patch.js';
+import { projectReadBatchInputSchema } from './project-read-batch.js';
 import { selectExecutionModel } from './local-agent-execution.js';
 import { logEvent } from './logger.js';
 import { openAiConversationScopeId } from './request-meta.js';
@@ -14,6 +16,16 @@ import { APPROVAL_TTL_SECONDS, type ApprovalState, type ApprovalView } from './a
 import { readOwnerSession, establishOwnerSession } from './owner-session.js';
 
 type Arguments = Record<string, unknown>;
+export class InvalidToolArgumentsError extends Error {
+  constructor(message: string) { super(message); this.name = 'InvalidToolArgumentsError'; }
+}
+
+function parseToolInput<T>(schema: z.ZodType<T>, input: unknown): T {
+  const result = schema.safeParse(input);
+  if (!result.success) throw new InvalidToolArgumentsError(result.error.message);
+  return result.data;
+}
+
 export interface ApprovalOperation { principal: string; tool: string; args: Arguments; context: unknown; reason: string }
 interface SubmissionReceipt { agentId: string; workspaceId: string }
 interface Approval extends ApprovalOperation {
@@ -159,11 +171,9 @@ export function classifyMcpOperation(config: ServerConfig, workspaces: Pick<Work
   else if (tool === 'run_process') reason = 'Native process execution uses the service OS account authority; literal arguments do not provide a sandbox.';
   else if (tool === 'process_cancel') reason = 'Cancel one running process with the service OS account authority.';
   else if (tool === 'project_read_batch') {
-    if (!Array.isArray(args.items) || args.items.length < 1 || args.items.length > 8) throw new Error('Batch read requires one to eight items.');
-    for (const item of args.items) {
-      if (!item || typeof item !== 'object' || typeof (item as Arguments).path !== 'string' || !(item as Arguments).path) throw new Error('Every batch item requires a path.');
-      paths.push((item as { path: string }).path);
-    }
+    const { items } = parseToolInput(projectReadBatchInputSchema,
+      { items: args.items, maxResultBytes: args.maxResultBytes });
+    for (const item of items) paths.push(item.path);
   }
   else if (tool === 'write_stdin') { if (args.chars !== undefined && args.chars !== '') reason = 'Interactive process input can execute additional commands.'; }
   else if (tool === 'codex_task_start' || tool === 'codex_task_continue') {
@@ -171,8 +181,7 @@ export function classifyMcpOperation(config: ServerConfig, workspaces: Pick<Work
   } else if (tool === 'show_changes') {
     reason = 'Aggregate differences can include protected file contents and need explicit owner approval.';
   } else if (tool === 'apply_patch') {
-    if (typeof args.patch !== 'string') throw new Error('Patch must be a string.');
-    const actions = parsePatch(args.patch);
+    const actions = parsePatch(parseToolInput(z.string(), args.patch));
     mutation = args.dryRun !== true;
     for (const action of actions) { paths.push(action.path); if (action.kind === 'update' && action.moveTo) paths.push(action.moveTo); }
     if (mutation && (actions.length > 20 || actions.some(action => action.kind === 'delete' || action.kind === 'update' && action.moveTo))) reason = 'Deletion, move or large batch mutation requires owner approval.';

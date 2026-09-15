@@ -55,6 +55,7 @@ export interface WorkspaceStore {
   }): WorkspaceConversationBinding;
   touchConversationBinding(conversationScopeId: string, targetKey: string): void;
   deleteConversationBinding(conversationScopeId: string, targetKey: string): void;
+  checkReady?(): void;
   close?(): void;
 }
 
@@ -213,6 +214,10 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         ),
       )
       .run();
+  }
+
+  checkReady(): void {
+    this.database.sqlite.prepare("SELECT 1").get();
   }
 
   close(): void {

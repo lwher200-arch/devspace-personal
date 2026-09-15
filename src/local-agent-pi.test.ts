@@ -11,7 +11,11 @@ import type { LocalAgentRuntimeContext } from "./local-agent-runtime.js";
 class FakePiSession implements PiSessionLike {
   readonly sessionId = "pi_session_1";
   readonly messages: any[] = [];
-  readonly modelRegistry = { find: () => ({ id: "model" }) } as unknown as PiSessionLike["modelRegistry"];
+  readonly modelLookups: Array<[string, string]> = [];
+  readonly modelRuntime = {
+    getModel: (provider: string, id: string) => { this.modelLookups.push([provider, id]); return { id: "model" }; },
+    getModels: () => [{ id: "bare-model" }],
+  } as unknown as PiSessionLike["modelRuntime"];
   private readonly listeners = new Set<AgentSessionEventListener>();
   disposeCount = 0;
   model?: unknown;
@@ -100,6 +104,7 @@ if (second.isErr()) throw second.error;
 assert.equal(first.value.providerSessionId, "pi_session_1");
 assert.equal(second.value.finalResponse, "response:second");
 assert.deepEqual(sessions[0]?.model, { id: "model" });
+assert.deepEqual(sessions[0]?.modelLookups, [["provider", "model"]]);
 assert.equal(sessions[0]?.effort, "high");
 assert.deepEqual(sessionIds, ["pi_session_1"]);
 assert.deepEqual(sessions[0]?.activeTools, ["read", "grep", "find", "ls"]);
@@ -132,7 +137,7 @@ assert.deepEqual(sessions[1]?.activeTools, ["read", "grep", "find", "ls", "edit"
 await pool.close();
 
 const missingModelSession = new FakePiSession();
-Object.defineProperty(missingModelSession, "modelRegistry", { value: { find: () => undefined } });
+Object.defineProperty(missingModelSession, "modelRuntime", { value: { getModel: () => undefined, getModels: () => [] } });
 const missingModelDriver = new PiLocalAgentDriver(async () => missingModelSession);
 const missingModelRuntime = await missingModelDriver.createRuntime(context);
 assert.equal(missingModelRuntime.isOk(), true);
@@ -148,4 +153,24 @@ if (missingModel.isErr()) {
   assert.equal(missingModel.error.retryable, false);
   assert.match(missingModel.error.message, /provider\/missing-model/);
 }
+const missingBareModel = await missingModelRuntime.value.run({
+  prompt: "must not fall back",
+  workspaceRoot: "/tmp/project",
+  model: "missing-bare-model",
+});
+assert.equal(missingBareModel.isErr(), true);
+if (missingBareModel.isErr()) {
+  assert.equal(missingBareModel.error.code, "PROVIDER_PROTOCOL_ERROR");
+  assert.equal(missingBareModel.error.retryable, false);
+}
+assert.equal(missingModelSession.messages.length, 0, "missing models never submit a prompt");
 await missingModelRuntime.value.close();
+
+const bareSession = new FakePiSession();
+const bareDriver = new PiLocalAgentDriver(async () => bareSession);
+const bareRuntime = await bareDriver.createRuntime(context);
+if (bareRuntime.isErr()) throw bareRuntime.error;
+const bareResult = await bareRuntime.value.run({ prompt: "bare", workspaceRoot: "/tmp/project", model: "bare-model" });
+assert.equal(bareResult.isOk(), true);
+assert.deepEqual(bareSession.model, { id: "bare-model" });
+await bareRuntime.value.close();

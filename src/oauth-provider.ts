@@ -280,6 +280,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     this.oauthStore.deleteRefreshToken(hashed);
   }
 
+  checkReady(): void {
+    this.oauthStore.checkReady();
+  }
+
   close(): void {
     this.oauthStore.close();
   }

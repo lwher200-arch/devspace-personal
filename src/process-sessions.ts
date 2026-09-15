@@ -285,6 +285,10 @@ export class ProcessSessionManager {
     this.completedSessionTtlMs = options.completedSessionTtlMs ?? COMPLETED_SESSION_TTL_MS;
   }
 
+  get activeProcessCount(): number {
+    return [...this.sessions.values()].filter(session => session.running).length;
+  }
+
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
     const session = this.createSession(input);
     this.sessions.set(session.id, session);

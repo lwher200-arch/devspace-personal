@@ -51,8 +51,15 @@ type StagedTextFile = TextFile | null;
 type FileIdentity = Pick<Stats, "dev" | "ino">;
 type FileIdentityReader = (path: string) => Promise<FileIdentity>;
 
+export class InvalidPatchError extends Error {
+  constructor(message: string) {
+    super(`Invalid patch: ${message}`);
+    this.name = "InvalidPatchError";
+  }
+}
+
 function patchError(message: string): Error {
-  return new Error(`Invalid patch: ${message}`);
+  return new InvalidPatchError(message);
 }
 
 export function parsePatch(patch: string): PatchAction[] {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import test from "node:test";
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -12,12 +13,17 @@ import {
   releasePiSandboxSession,
 } from "./local-agent-pi-sandbox.js";
 
-const dependencies = await SandboxManager.checkDependenciesAsync();
-if (process.env.DEVSPACE_REQUIRE_PI_SANDBOX === "1") {
-  assert.equal(SandboxManager.isSupportedPlatform(), true, "Pi sandbox integration is required on this CI lane");
-  assert.deepEqual(dependencies.errors, [], "Pi sandbox dependencies must be available on this CI lane");
-}
-if (SandboxManager.isSupportedPlatform() && dependencies.errors.length === 0) {
+test("Pi sandbox enforces workspace writes, symlink containment and read-only mode", async (t) => {
+  const dependencies = await SandboxManager.checkDependenciesAsync();
+  const supported = SandboxManager.isSupportedPlatform();
+  if (process.env.DEVSPACE_REQUIRE_PI_SANDBOX === "1") {
+    assert.equal(supported, true, "Pi sandbox integration is required on this CI lane");
+    assert.deepEqual(dependencies.errors, [], "Pi sandbox dependencies must be available on this CI lane");
+  }
+  if (!supported || dependencies.errors.length > 0) {
+    t.skip(!supported ? "Pi sandbox is unsupported on this platform." : `Pi sandbox dependencies unavailable: ${dependencies.errors.join(", ")}`);
+    return;
+  }
   const root = await mkdtemp(join(tmpdir(), "devspace-pi-sandbox-test-"));
   const workspace = join(root, "workspace");
   mkdirSync(workspace);
@@ -95,6 +101,4 @@ if (SandboxManager.isSupportedPlatform() && dependencies.errors.length === 0) {
     await releasePiSandboxSession(session);
     await rm(root, { recursive: true, force: true });
   }
-} else {
-  console.log("Pi sandbox integration test skipped: sandbox-runtime dependencies are unavailable.");
-}
+});

@@ -98,6 +98,15 @@ interface CachedWorkspace {
 
 const MAX_CACHED_WORKSPACES = 32;
 
+export class WorkspaceUnavailableError extends AccessDeniedError {
+  constructor(readonly code: "WORKSPACE_NOT_FOUND" | "WORKSPACE_INACTIVE", workspaceId: string) {
+    super(code === "WORKSPACE_NOT_FOUND"
+      ? `Unknown workspaceId: ${workspaceId}. Call open_workspace with the current project path and use the returned workspaceId.`
+      : "This workspace is no longer active. Call open_workspace with the current project path and use the new workspaceId.");
+    this.name = "WorkspaceUnavailableError";
+  }
+}
+
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, CachedWorkspace>();
   private readonly pendingCheckoutOpens = new Map<string, Promise<WorkspaceContext>>();
@@ -127,6 +136,13 @@ export class WorkspaceRegistry {
     openOptions: OpenWorkspaceOptions = {},
   ): Promise<WorkspaceContext> {
     const workspaceInput = typeof input === "string" ? { path: input } : input;
+    // POSIX resolution would treat a Windows absolute path as a local directory name.
+    if (process.platform !== "win32" &&
+      (/^[a-z]:[\\/]/i.test(workspaceInput.path) || workspaceInput.path.startsWith("\\\\"))) {
+      throw new AccessDeniedError(
+        "Windows absolute paths cannot be opened on this operating system. Use an allowed path on this computer.",
+      );
+    }
     if (openOptions.refreshContext && workspaceInput.mode === "worktree") {
       throw new Error("Context refresh must not create a worktree. Read the existing worktree instructions with its workspaceId.");
     }
@@ -281,6 +297,11 @@ export class WorkspaceRegistry {
   }
 
   getWorkspace(workspaceId: string): Workspace {
+    const session = this.store?.getSession(workspaceId);
+    if (session && session.status !== "active") {
+      this.workspaces.delete(workspaceId);
+      throw new WorkspaceUnavailableError("WORKSPACE_INACTIVE", workspaceId);
+    }
     const cached = this.workspaces.get(workspaceId);
     if (cached) {
       const { workspace, canonicalRoot } = cached;
@@ -293,11 +314,8 @@ export class WorkspaceRegistry {
       return workspace;
     }
 
-    const session = this.store?.getSession(workspaceId);
     if (!session) {
-      throw new Error(
-        `Unknown workspaceId: ${workspaceId}. Open the target project or worktree again and continue with the new workspaceId.`,
-      );
+      throw new WorkspaceUnavailableError("WORKSPACE_NOT_FOUND", workspaceId);
     }
 
     const root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);

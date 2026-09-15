@@ -34,6 +34,8 @@ export class CodexBridge {
     )`));
   }
 
+  checkReady(): void { this.database.sqlite.prepare("SELECT 1").get(); }
+
   close(): void { this.database.close(); }
 
   preflight() {

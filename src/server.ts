@@ -26,7 +26,7 @@ import {
 import { loadConfig, type ServerConfig } from "./config.js";
 import { CodexBridge, parseCodexSubmission, registerCodexBridgeTools, submitCodexTool } from "./codex-bridge.js";
 import { registerProjectTools } from "./project-tools.js";
-import { OwnerApprovals, approvalPrincipal, classifyMcpOperation, installOwnerApprovalRoutes } from './mcp-authorization.js';
+import { InvalidToolArgumentsError, OwnerApprovals, approvalPrincipal, classifyMcpOperation, installOwnerApprovalRoutes } from './mcp-authorization.js';
 import { registerApprovalTools, isApprovalUiTool, chatApprovalEnabled, chatApprovalMode } from './approval-tools.js';
 import { APPROVAL_TTL_SECONDS, REVIEW_APPROVAL_TOOL } from './approval-protocol.js';
 import {
@@ -46,6 +46,7 @@ import {
   type McpSessionCloseResult,
 } from "./mcp-sessions.js";
 import { ProcessSessionManager } from "./process-sessions.js";
+import { createExecutorReadiness, type ExecutorReadiness } from "./runtime-readiness.js";
 import { registerNativeProcessTools } from "./native-process-tools.js";
 import { AccessDeniedError } from "./roots.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
@@ -53,7 +54,8 @@ import { openAiConversationScopeId } from "./request-meta.js";
 import { closeResourcesInOrder, shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
-import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
+import { formatAgentsPath, WorkspaceRegistry, WorkspaceUnavailableError } from "./workspaces.js";
+import { InvalidPatchError } from "./apply-patch.js";
 import {
   getLocalAgentProviderAvailabilitySnapshot,
 } from "./local-agent-availability.js";
@@ -83,8 +85,8 @@ import {
 type Transport = StreamableHTTPServerTransport;
 // MCP clients can reconnect without closing the previous transport. Bound stale
 // session retention so abandoned MCP servers do not accumulate for the life of the process.
-const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
-const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
+const MCP_SESSION_IDLE_TIMEOUT_MS = 5 * 60 * 1_000;
+const MCP_SESSION_CLEANUP_INTERVAL_MS = 30 * 1_000;
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
 
 interface RunningServer {
@@ -299,6 +301,8 @@ export function createMcpServer(
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
   codexBridge?: CodexBridge,
   approvals?: OwnerApprovals,
+  beginRequest?: () => (() => void) | undefined,
+  cancelledRequest?: (requestId: string | number) => void,
 ): McpServer {
   const toolSurface = getToolSurface(config.toolMode);
   const server = new McpServer(
@@ -313,6 +317,23 @@ export function createMcpServer(
       instructions: serverInstructions(config, toolSurface),
     },
   );
+
+  // Protect actual RPC work even if its HTTP stream is disconnected or cancelled.
+  // Install before registering tools/resources; the SDK installs their handlers eagerly.
+  if (beginRequest) {
+    const setRequestHandler = server.server.setRequestHandler.bind(server.server);
+    server.server.setRequestHandler = (schema, handler) => setRequestHandler(schema, async (request, extra) => {
+      const release = beginRequest();
+      // Cancellation can arrive after the handler settles but before the SDK
+      // sends its response. Keep listening for the SDK controller's lifetime.
+      // The handler lease still protects work if cancellation arrives earlier.
+      const cancelled = () => cancelledRequest?.(extra.requestId);
+      extra.signal.addEventListener("abort", cancelled, { once: true });
+      if (extra.signal.aborted) cancelled();
+      try { return await handler(request, extra); }
+      finally { release?.(); }
+    });
+  }
 
   registerAppResource(
     server,
@@ -734,6 +755,8 @@ export function createMcpServer(
 export interface CreateServerOptions {
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
   codexBridgeFactory?: (config: ServerConfig) => CodexBridge;
+  executorReadiness?: () => ExecutorReadiness;
+  mcpSessions?: { maxSessions?: number; now?: () => number; idleTimeoutMs?: number; cleanupIntervalMs?: number };
 }
 
 export function createServer(
@@ -768,7 +791,7 @@ function initializeServer(
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
   });
-  const transports = new McpSessionRegistry<Transport>();
+  const transports = new McpSessionRegistry<Transport>(options.mcpSessions);
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
@@ -783,6 +806,8 @@ function initializeServer(
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
+  const executorReadiness = options.executorReadiness ?? createExecutorReadiness();
+  let shuttingDown = false;
   const approvals = config.toolAuthorization === 'owner_approval'
     ? new OwnerApprovals(undefined, (config.approvalTtlSeconds ?? APPROVAL_TTL_SECONDS.default) * 1000) : undefined;
   if (approvals) installOwnerApprovalRoutes(app, config, approvals);
@@ -798,7 +823,7 @@ function initializeServer(
   );
 
   const logSessionCloseResults = (
-    reason: "idle_timeout" | "server_shutdown",
+    reason: "idle_timeout" | "capacity" | "server_shutdown",
     results: McpSessionCloseResult[],
   ) => {
     for (const result of results) {
@@ -823,9 +848,9 @@ function initializeServer(
 
   const sessionCleanupTimer = setInterval(() => {
     void transports
-      .closeIdle(MCP_SESSION_IDLE_TIMEOUT_MS)
+      .closeIdle(options.mcpSessions?.idleTimeoutMs ?? MCP_SESSION_IDLE_TIMEOUT_MS)
       .then((results) => logSessionCloseResults("idle_timeout", results));
-  }, MCP_SESSION_CLEANUP_INTERVAL_MS);
+  }, options.mcpSessions?.cleanupIntervalMs ?? MCP_SESSION_CLEANUP_INTERVAL_MS);
   rollback.push(() => clearInterval(sessionCleanupTimer));
   sessionCleanupTimer.unref();
 
@@ -898,6 +923,34 @@ function initializeServer(
     res.json({ ok: true, name: "devspace" });
   });
 
+  app.get("/readyz", (_req, res) => {
+    const checks: Record<string, boolean> = { lifecycle: !shuttingDown };
+    for (const [name, check] of [
+      ["oauthDatabase", () => oauthProvider.checkReady()],
+      ["workspaceDatabase", () => workspaceStore.checkReady?.()],
+      ...(codexBridge ? [["bridgeDatabase", () => codexBridge.checkReady()]] : []),
+    ] as Array<[string, () => void]>) {
+      try { check(); checks[name] = true; }
+      catch { checks[name] = false; }
+    }
+    let executors: ExecutorReadiness;
+    try { executors = executorReadiness(); }
+    catch { executors = { native: false, shell: false, pty: false }; }
+    checks.nativeExecutor = executors.native;
+    checks.shellExecutor = executors.shell;
+    const ok = Object.values(checks).every(Boolean);
+    res.setHeader("Cache-Control", "no-store");
+    res.status(ok ? 200 : 503).json({
+      ok, name: "devspace", status: ok ? "ready" : "degraded", checks,
+      capabilities: { pty: executors.pty },
+      // Independent agent daemons cannot be counted here without querying/starting them.
+      // Unknown activity must never be interpreted as permission to restart their work.
+      activityKnown: !config.subagents.enabled && !config.bridge?.enabled,
+      activeProcesses: config.subagents.enabled || config.bridge?.enabled ? null : processSessions.activeProcessCount,
+      processSessions: processSessions.activeProcessCount,
+    });
+  });
+
   app.all("/mcp", async (req, res) => {
     const requestId = res.locals.requestId as string | undefined;
     const sessionId = req.header("mcp-session-id");
@@ -931,8 +984,22 @@ function initializeServer(
       isInitialize: initializeRequest,
     });
 
+    let finishHttpRequest: (() => void) | undefined;
+    let reservation: Awaited<ReturnType<typeof transports.reserve>>;
+    let transport: Transport | undefined;
+    let initializedSession = false;
+    const requestIds: Array<string | number> = [];
+    for (const message of Array.isArray(req.body) ? req.body : [req.body]) {
+      if (message && typeof message.method === "string" &&
+        (typeof message.id === "string" || typeof message.id === "number")) requestIds.push(message.id);
+    }
     try {
-      let transport: Transport | undefined;
+      if (shuttingDown) { sendJsonRpcError(res, 503, -32000, "Server is shutting down"); return; }
+      if (sessionId) {
+        transport = transports.get(sessionId);
+        if (!transport) { sendJsonRpcError(res, 404, -32000, "Unknown MCP session"); return; }
+        if (req.method === "POST") finishHttpRequest = transports.beginHttpRequest(sessionId, requestIds);
+      }
 
       if (approvals && Array.isArray(req.body)) { sendJsonRpcError(res, 400, -32600, 'Batch requests are not supported by the approval boundary.'); return; }
       if (approvals && req.method === 'POST' && req.body?.method === 'tools/call') {
@@ -942,13 +1009,28 @@ function initializeServer(
         const automatic = codexBridge && ['codex_task_start', 'codex_task_continue'].includes(tool);
         // Review the same normalized inputs the MCP schema will execute (for
         // example, whitespace must not route the reviewed and actual models differently).
-        const executionArgs = automatic ? parseCodexSubmission(tool, args) : args;
+        let executionArgs: Record<string, unknown>;
         let assessment: { reason?: string; context: unknown };
         try {
+          try {
+            executionArgs = automatic ? parseCodexSubmission(tool, args) : args;
+          } catch (error) {
+            if (error instanceof z.ZodError) throw new InvalidToolArgumentsError(error.message);
+            throw error;
+          }
           assessment = isApprovalUiTool(tool)
             ? { reason: undefined, context: {} }
             : classifyMcpOperation(config, workspaces, tool, executionArgs);
         } catch (error) {
+          if (error instanceof WorkspaceUnavailableError || error instanceof InvalidToolArgumentsError || error instanceof InvalidPatchError) {
+            const detail = error instanceof WorkspaceUnavailableError
+              ? { code: error.code, instruction: error.message }
+              : { code: 'INVALID_TOOL_ARGUMENTS', message: error.message,
+                instruction: 'Correct the tool arguments before retrying. This request did not execute and does not require Owner approval.' };
+            logEvent(config.logging, 'warn', 'tool_request_rejected', { tool, requestId, code: detail.code });
+            res.json({ jsonrpc: '2.0', id: req.body.id, result: { isError: true,
+              content: [textBlock(JSON.stringify(detail))] } }); return;
+          }
           if (!(error instanceof AccessDeniedError)) throw error;
           // A root-boundary rejection is an expected tool failure. Do not expose
           // configured private roots or turn it into a misleading server fault.
@@ -1012,10 +1094,26 @@ function initializeServer(
           return;
         }
       } else if (initializeRequest) {
+        reservation = await transports.reserve();
+        if (!reservation) {
+          res.setHeader("Retry-After", "1");
+          sendJsonRpcError(res, 503, -32000, "MCP session capacity is busy; retry initialization shortly.");
+          return;
+        }
+        logSessionCloseResults("capacity", reservation.closed);
+        if (shuttingDown || res.destroyed) {
+          if (!res.destroyed) sendJsonRpcError(res, 503, -32000, "Server is shutting down");
+          return;
+        }
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
-            if (transport) transports.register(newSessionId, transport);
+            if (transport) {
+              if (shuttingDown) throw new Error("Server is shutting down");
+              reservation!.register(newSessionId, transport);
+              initializedSession = true;
+              finishHttpRequest = transports.beginHttpRequest(newSessionId, requestIds);
+            }
             logEvent(config.logging, "info", "mcp_session_created", {
               requestId,
               sessionIdPrefix: sessionIdPrefix(newSessionId),
@@ -1023,6 +1121,17 @@ function initializeServer(
             });
           },
         });
+
+        const send = transport.send.bind(transport);
+        transport.send = async (message, sendOptions) => {
+          try { await send(message, sendOptions); }
+          finally {
+            if (transport?.sessionId && "id" in message && !("method" in message) &&
+              (typeof message.id === "string" || typeof message.id === "number")) {
+              transports.settleRequest(transport.sessionId, message.id);
+            }
+          }
+        };
 
         transport.onclose = () => {
           const closedSessionId = transport?.sessionId;
@@ -1043,6 +1152,8 @@ function initializeServer(
           incomingArtifactAdapters,
           codexBridge,
           approvals,
+          () => transport?.sessionId ? transports.beginRequest(transport.sessionId) : undefined,
+          (id) => { if (transport?.sessionId) transports.settleRequest(transport.sessionId, id, true); },
         );
         await server.connect(transport);
       } else {
@@ -1059,6 +1170,11 @@ function initializeServer(
       if (!res.headersSent) {
         sendJsonRpcError(res, 500, -32603, "Internal server error");
       }
+    } finally {
+      finishHttpRequest?.();
+      reservation?.release();
+      // A rejected/aborted initialize never reached registry ownership.
+      if (reservation && transport && !initializedSession) await transport.close();
     }
   });
 
@@ -1068,6 +1184,7 @@ function initializeServer(
     config,
     localAgentProviders,
     close: () => {
+      shuttingDown = true;
       closePromise ??= closeResourcesInOrder([
         () => clearInterval(sessionCleanupTimer),
         async () => {

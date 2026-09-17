@@ -22,16 +22,16 @@ This phase does not add model-facing tools, UI, automatic compaction, semantic h
 TaskSession
     |
     +-- task_events                  append-only operational truth
-    |      |
-    |      +-- bounded summary/preview
-    |      +-- optional payload_id --------+
-    |      +-- optional external_ref       |
-    |                                      v
-    +-- task_event_payloads          exact large UTF-8 evidence
-                                           |
-                                           +-- sha256
-                                           +-- byte_count
-                                           +-- exact text
+           |
+           +-- bounded summary
+           +-- bounded inline_text
+           +-- optional external_ref
+           |
+           +-- event_id -------------------+
+                                            v
+                                   task_event_payloads
+                                   exact large UTF-8 evidence
+                                   sha256 + byte_count
 ```
 
 `Logger` remains diagnostics. `TaskEvent` is durable task evidence. Neither is authorization.
@@ -40,29 +40,7 @@ TaskSession
 
 ### Migration v9: `task-event-journal`
 
-Add `task_event_payloads` and `task_events`.
-
-### `task_event_payloads`
-
-```sql
-create table task_event_payloads (
-  id text primary key,
-  task_session_id text not null,
-  sha256 text not null,
-  byte_count integer not null check (byte_count >= 0),
-  encoding text not null default 'utf8' check (encoding = 'utf8'),
-  content text not null,
-  created_at text not null,
-  foreign key (task_session_id)
-    references task_sessions(id)
-    on delete cascade
-);
-
-create index task_event_payloads_task_idx
-  on task_event_payloads(task_session_id, created_at);
-```
-
-The payload store is intentionally text-only in Phase 2. Binary evidence remains in its owning system and is referenced externally.
+Add `task_events` and `task_event_payloads`.
 
 ### `task_events`
 
@@ -77,8 +55,8 @@ create table task_events (
   actor_id text,
   request_id text,
   summary text not null,
-  preview text,
-  payload_id text,
+  inline_text text,
+  text_truncated integer not null default 0 check (text_truncated in (0, 1)),
   payload_sha256 text,
   payload_byte_count integer,
   external_ref_json text,
@@ -87,13 +65,10 @@ create table task_events (
   foreign key (task_session_id)
     references task_sessions(id)
     on delete cascade,
-  foreign key (payload_id)
-    references task_event_payloads(id)
-    on delete restrict,
   check (
-    (payload_id is null and payload_sha256 is null and payload_byte_count is null)
+    (text_truncated = 0 and payload_sha256 is null and payload_byte_count is null)
     or
-    (payload_id is not null and payload_sha256 is not null and payload_byte_count is not null and payload_byte_count >= 0)
+    (text_truncated = 1 and payload_sha256 is not null and payload_byte_count is not null and payload_byte_count > 0)
   )
 );
 
@@ -104,7 +79,27 @@ create index task_events_conversation_idx
   on task_events(conversation_scope_id, task_session_id, seq);
 ```
 
-`task_events` has no update/delete API. Event immutability is enforced by access policy and tests in Phase 2; SQLite cannot prevent arbitrary direct writers without triggers, which are intentionally deferred unless a concrete bypass appears.
+### `task_event_payloads`
+
+```sql
+create table task_event_payloads (
+  event_id text primary key,
+  sha256 text not null,
+  byte_count integer not null check (byte_count > 0),
+  encoding text not null default 'utf8' check (encoding = 'utf8'),
+  content text not null,
+  created_at text not null,
+  foreign key (event_id)
+    references task_events(event_id)
+    on delete cascade
+);
+```
+
+The payload row belongs to an event, not the reverse. This removes delete-order coupling: deleting a task cascades to events, and deleting an event cascades to its large payload. Phase 2 exposes no event delete API, but the FK direction keeps parent cleanup deterministic.
+
+The payload store is intentionally text-only in Phase 2. Binary evidence remains in its owning system and is referenced externally.
+
+`task_events` has no update/delete API. Event immutability is enforced by the store boundary and tests in Phase 2; SQLite cannot prevent arbitrary direct writers without triggers, which are intentionally deferred unless a concrete bypass appears.
 
 ## Event Shape
 
@@ -121,8 +116,8 @@ interface TaskEventRecord {
   actorId?: string;
   requestId?: string;
   summary: string;
-  preview?: string;
-  payloadId?: string;
+  inlineText?: string;
+  textTruncated: boolean;
   payloadSha256?: string;
   payloadByteCount?: number;
   externalRef?: TaskEvidenceRef;
@@ -136,17 +131,25 @@ interface TaskEvidenceRef {
 }
 ```
 
-`kind` and `source` remain open strings in Phase 2 so the journal does not force unrelated subsystems into a premature global enum. Store validation still requires non-empty bounded strings. A later integration phase may standardize well-known kinds.
+`kind` and `source` remain open strings in Phase 2 so the journal does not force unrelated subsystems into a premature global enum. Store validation applies these bounds:
+
+- kind: non-empty, at most 128 characters.
+- source: non-empty, at most 128 characters.
+- summary: non-empty UTF-8 text, at most 4 KiB.
+- `external_ref_json`: serialized typed reference, at most 4 KiB.
+- actor/request/conversation identifiers: non-empty after trimming when supplied; no arbitrary normalization or identity guessing.
+
+A later integration phase may standardize well-known event kinds.
 
 ## Payload Policy
 
-Phase 2 uses a single bounded inline threshold:
+Phase 2 uses one bounded inline threshold:
 
 - `MAX_INLINE_EVENT_TEXT_BYTES = 8 * 1024`.
-- If exact payload text is at or below the threshold, it is retained only in the event preview field and no payload row is created.
-- If exact payload text exceeds the threshold, `preview` contains a bounded UTF-8-safe prefix, and the complete text is stored in `task_event_payloads`.
-- The SHA-256 and byte count are calculated from the exact UTF-8 bytes before persistence.
-- Payload integrity is checked on read: stored byte count and SHA-256 must match the retrieved content. Mismatch returns a structured corruption error; it is never silently accepted.
+- If exact payload text is at or below the threshold, `inline_text` stores the complete text, `text_truncated = 0`, and no payload row is created.
+- If exact payload text exceeds the threshold, `inline_text` stores a UTF-8-safe prefix no larger than the threshold, `text_truncated = 1`, and the complete text is stored in `task_event_payloads` under the same `event_id`.
+- SHA-256 and byte count are calculated from the exact UTF-8 bytes before persistence.
+- Large-payload integrity is checked on read: event metadata, payload metadata, and recomputed content digest/byte count must agree. Mismatch returns a structured corruption error and is never silently accepted.
 - Empty payload is treated as no payload rather than creating an empty payload row.
 
 The 8 KiB threshold is a storage/inspection bound, not a context-window estimate.
@@ -159,12 +162,13 @@ Within one `better-sqlite3` `BEGIN IMMEDIATE` transaction:
 
 1. Read the `task_sessions` row.
 2. Reject missing or closed tasks.
-3. Validate source metadata and external reference structure.
-4. Read `next_event_seq` as the event sequence.
-5. If the payload is large, compute digest/bytes and insert the exact payload row.
-6. Insert the event row with that sequence.
-7. Advance `task_sessions.next_event_seq` from `seq` to `seq + 1` using compare-and-set (`where next_event_seq = ?`).
-8. If any step fails, the payload row, event row, and sequence advance all roll back together.
+3. Validate event metadata, optional provenance, and external reference structure.
+4. Read `next_event_seq` as the new event sequence.
+5. Generate one event id and compute bounded inline text plus large-payload digest/bytes when needed.
+6. Insert the event row with that sequence and payload metadata.
+7. If the text is large, insert its payload row referencing the new `event_id`.
+8. Advance `task_sessions.next_event_seq` from `seq` to `seq + 1` using compare-and-set (`where next_event_seq = ?`).
+9. If any step fails, event insertion, payload insertion, and sequence advance all roll back together.
 
 No timestamp is used to define event order.
 
@@ -176,7 +180,7 @@ No timestamp is used to define event order.
 - `limit?: number`, default 100, hard maximum 500
 - `kinds?: string[]`, bounded list
 
-Payload bodies are not hydrated by default. Event reads return preview/digest/byte count and references. Exact large text is retrieved only through `readPayload(payloadId)`.
+Payload bodies are not hydrated by default. Event reads return inline text, truncation state, digest/byte count, and external references. Exact large text is retrieved only through `readPayload(eventId)`.
 
 This avoids making an ordinary history read proportional to the largest historical command output.
 
@@ -184,7 +188,7 @@ This avoids making an ordinary history read proportional to the largest historic
 
 A task event may record `conversation_scope_id` from either the current or a superseded conversation because late evidence can legitimately arrive after a rebind. Recording a stale source is not authority to move the task.
 
-The event store therefore follows this rule:
+The event store follows this rule:
 
 ```text
 conversation_scope_id = provenance
@@ -228,11 +232,11 @@ No error path mutates approval or conversation attachment state.
 1. Event sequence is strictly increasing per task.
 2. `(task_session_id, seq)` is unique.
 3. `event_id` is globally unique.
-4. Sequence allocation, payload insertion, event insertion, and `next_event_seq` advance are one transaction.
-5. A failed append consumes no sequence and leaves no orphan payload.
+4. Sequence allocation, event insertion, optional payload insertion, and `next_event_seq` advance are one transaction.
+5. A failed append consumes no sequence and leaves no orphan event or payload.
 6. Existing event rows are immutable through the store API.
 7. Large exact payload text is recoverable and digest-verifiable.
-8. Small payload text does not create a payload row.
+8. Small payload text is exact inline evidence and creates no payload row.
 9. Event history reads are bounded and do not hydrate large payloads by default.
 10. Conversation id is provenance only and cannot rebind a task.
 11. A provided conversation id must already belong to the task lineage.
@@ -249,9 +253,9 @@ RED tests are written before production changes for each behavior:
 2. Fresh v9 schema creates both journal tables with expected constraints.
 3. First append gets seq 1 and advances `next_event_seq` to 2.
 4. Repeated appends allocate contiguous sequence numbers.
-5. Failed payload/event insertion rolls back sequence and payload.
-6. Small text stays inline and creates no payload row.
-7. Large UTF-8 text creates one payload, bounded preview, correct digest, and exact round-trip.
+5. Failed payload/event insertion rolls back sequence, event, and payload.
+6. Small text stays exact inline and creates no payload row.
+7. Large UTF-8 text creates one payload, bounded inline prefix, correct digest, and exact round-trip.
 8. Payload digest/byte-count corruption is detected on read.
 9. Reads are ascending, `afterSeq` works, and limits are enforced.
 10. Current and superseded conversation provenance is accepted; unrelated conversation provenance is rejected.

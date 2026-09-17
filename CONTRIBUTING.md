@@ -27,10 +27,20 @@
 
 ## 验证与提交
 
+完整源码候选优先运行统一验证入口：
+
 ```sh
-pnpm typecheck
-pnpm test
+pnpm verify
 ```
+
+它依次执行类型检查、文档契约、源码测试、部署/打包契约和构建。需要定位失败时，
+再单独运行 `pnpm typecheck`、`pnpm test:docs`、`pnpm test`、`pnpm test:deploy`
+或 `pnpm build`，不要用局部通过替代完整候选验证。
+
+浏览器授权回归仍需显式提供 `DEVSPACE_TEST_BROWSER`；GitHub CI 会在 Windows runner
+上独立执行源码与构建后的审批 UI 回归。仓库声明支持 Node `>=22.19 <27`，CI 除三平台
+Node 22.19 主门禁外，还会在 Linux 上验证 Node 24 与 26。远端 CI 未实际进入 runner
+或未执行步骤时，不能计作测试通过。
 
 构建产物不应提交到源码仓库。涉及运行服务时，先确认不会覆盖正在使用的
 构建或中断活动任务。

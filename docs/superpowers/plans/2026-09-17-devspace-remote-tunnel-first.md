@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a read-only `devspace doctor --remote [--json]` flow that deterministically validates DevSpace's tunnel-first remote MCP readiness without managing tunnels, changing configuration, or weakening existing security boundaries.
+**Goal:** Add a read-only `devspace doctor --remote [--json]` flow that validates DevSpace's tunnel-first remote MCP readiness without managing tunnels, changing configuration, or weakening existing security boundaries.
 
-**Architecture:** Extract one shared public-endpoint contract used by both the HTTP server and diagnostics. Implement remote readiness as a typed module with three static configuration checks and five bounded network/protocol probes, all assembled into one stable eight-check report. Keep `src/cli.ts` limited to argument parsing, existing local-doctor compatibility, presentation, and exit codes.
+**Architecture:** Extract one shared public-endpoint contract used by both the HTTP server and diagnostics. Implement remote readiness as a typed module with three static configuration checks and five bounded network/protocol probes, assembled into one stable eight-check report. Keep `src/cli.ts` limited to argument parsing, existing local-doctor compatibility, presentation, and exit codes.
 
 **Tech Stack:** TypeScript 6, Node.js `>=22.19 <27`, built-in `fetch`/`AbortController`, `@modelcontextprotocol/sdk`, Node `node:test`, existing DevSpace config/test helpers.
 
@@ -39,7 +39,7 @@
 - Modify `src/cli.test.ts` — child-process regression tests for compatibility, output shape, and exit codes.
 - Modify `docs/setup.md` — document remote doctor workflow and real-host acceptance boundary.
 - Modify `docs/security.md` — document what remote readiness proves and does not prove.
-- Modify `CHANGELOG.md` — add one dated engineering entry with verified tests/limits after implementation.
+- Modify `CHANGELOG.md` only after final verification evidence exists.
 
 ---
 
@@ -52,11 +52,8 @@
 - Test: `src/oauth-endpoints.test.ts`, `src/server.test.ts`
 
 **Interfaces:**
-- Consumes: `@modelcontextprotocol/sdk/server/auth/router.js#getOAuthProtectedResourceMetadataUrl`, `@modelcontextprotocol/sdk/shared/auth-utils.js#resourceUrlFromServerUrl`.
-- Produces:
-  - `PublicMcpEndpoints`
-  - `publicMcpEndpoints(publicBaseUrl: string): PublicMcpEndpoints`
-- `src/server.ts` must use this helper for `mcpUrl`, `resourceServerUrl`, and `protectedResourceMetadataUrl`.
+- Consumes: `getOAuthProtectedResourceMetadataUrl`, `resourceUrlFromServerUrl` from the current MCP SDK.
+- Produces: `PublicMcpEndpoints` and `publicMcpEndpoints(publicBaseUrl: string): PublicMcpEndpoints`.
 
 - [ ] **Step 1: Write the failing endpoint-contract test**
 
@@ -89,8 +86,6 @@ test("publicMcpEndpoints derives one canonical remote origin contract", () => {
 ```
 
 - [ ] **Step 2: Run the new test and verify RED**
-
-Run:
 
 ```sh
 pnpm exec tsx --test src/oauth-endpoints.test.ts
@@ -131,32 +126,15 @@ export function publicMcpEndpoints(publicBaseUrl: string): PublicMcpEndpoints {
 }
 ```
 
-Modify `src/server.ts` to replace the local construction:
-
-```ts
-import { publicMcpEndpoints } from "./oauth-endpoints.js";
-
-const endpoints = publicMcpEndpoints(config.publicBaseUrl);
-const { mcpUrl, resourceServerUrl } = endpoints;
-```
-
-and use:
-
-```ts
-resourceMetadataUrl: endpoints.protectedResourceMetadataUrl,
-```
-
-Do not change route behavior, scopes, rate limits, or OAuth provider construction.
+Modify `src/server.ts` to import `publicMcpEndpoints`, construct it once from `config.publicBaseUrl`, reuse `mcpUrl` and `resourceServerUrl`, and pass `endpoints.protectedResourceMetadataUrl` to bearer auth. Do not change scopes, rate limits, OAuth provider construction, route order, or authorization behavior.
 
 - [ ] **Step 4: Verify GREEN and server compatibility**
-
-Run:
 
 ```sh
 pnpm exec tsx --test src/oauth-endpoints.test.ts src/server.test.ts
 ```
 
-Expected: all selected tests PASS.
+Expected: PASS.
 
 - [ ] **Step 5: Commit Task 1**
 
@@ -174,22 +152,12 @@ git commit -m "refactor: centralize public MCP endpoints"
 - Create: `src/remote-readiness.test.ts`
 
 **Interfaces:**
-- Consumes: `ServerConfig` fields `host`, `port`, `publicBaseUrl`, `allowedHosts`; `publicMcpEndpoints()` from Task 1.
-- Produces:
-  - `REMOTE_READINESS_CHECK_IDS`
-  - `RemoteReadinessCheckId`
-  - `RemoteCheckStatus`
-  - `RemoteReadinessCheck`
-  - `RemoteReadinessReport`
-  - `RemoteReadinessConfig`
-  - `evaluateRemoteConfiguration(config)`
-  - `finalizeRemoteReadinessReport(config, checks)`
-  - `formatRemoteReadinessReport(report)`
-  - `remoteReadinessExitCode(report)`
+- Consumes: `ServerConfig` fields `host`, `port`, `publicBaseUrl`, `allowedHosts`; `publicMcpEndpoints()`.
+- Produces: `REMOTE_READINESS_CHECK_IDS`, `RemoteReadinessCheckId`, `RemoteCheckStatus`, `RemoteReadinessCheck`, `RemoteReadinessReport`, `RemoteReadinessConfig`, `evaluateRemoteConfiguration`, `finalizeRemoteReadinessReport`, `formatRemoteReadinessReport`, `remoteReadinessExitCode`.
 
 - [ ] **Step 1: Write failing static-policy tests**
 
-Start `src/remote-readiness.test.ts` with:
+Create `src/remote-readiness.test.ts` with:
 
 ```ts
 import assert from "node:assert/strict";
@@ -218,7 +186,7 @@ const networkPasses: RemoteReadinessCheck[] = [
   { id: "remote.mcp_boundary", status: "pass", summary: "mcp is protected" },
 ];
 
-test("remote readiness keeps the stable check order and warnings do not fail readiness", () => {
+test("warnings preserve ready when all required checks are observed", () => {
   const staticChecks = evaluateRemoteConfiguration({ ...baseConfig, allowedHosts: ["*"] });
   assert.deepEqual(staticChecks.map(check => check.id), REMOTE_READINESS_CHECK_IDS.slice(0, 3));
   assert.equal(staticChecks[2].status, "warn");
@@ -228,7 +196,7 @@ test("remote readiness keeps the stable check order and warnings do not fail rea
   assert.equal(remoteReadinessExitCode(report), 0);
 });
 
-test("invalid tunnel-first configuration fails the correct static checks", () => {
+test("invalid tunnel-first config fails the corresponding static checks", () => {
   const checks = evaluateRemoteConfiguration({
     ...baseConfig,
     host: "0.0.0.0",
@@ -240,7 +208,7 @@ test("invalid tunnel-first configuration fails the correct static checks", () =>
   assert.equal(checks.find(check => check.id === "remote.host_allowlist")?.status, "fail");
 });
 
-test("missing or skipped required checks force ready=false", () => {
+test("missing required observations become skipped and block readiness", () => {
   const report = finalizeRemoteReadinessReport(baseConfig, evaluateRemoteConfiguration(baseConfig));
   assert.equal(report.ready, false);
   assert.ok(report.checks.slice(3).every(check => check.status === "skipped"));
@@ -254,11 +222,11 @@ test("missing or skipped required checks force ready=false", () => {
 pnpm exec tsx --test src/remote-readiness.test.ts
 ```
 
-Expected: FAIL because `remote-readiness.ts` does not exist.
+Expected: FAIL because `src/remote-readiness.ts` does not exist.
 
 - [ ] **Step 3: Implement the report model and static checks**
 
-Create `src/remote-readiness.ts` with these exact exported contracts:
+Create these exact contracts in `src/remote-readiness.ts`:
 
 ```ts
 import type { ServerConfig } from "./config.js";
@@ -295,38 +263,21 @@ export interface RemoteReadinessReport {
 }
 ```
 
-Static rules:
+Implement `evaluateRemoteConfiguration()` with these exact rules:
 
 ```ts
-export function evaluateRemoteConfiguration(config: RemoteReadinessConfig): RemoteReadinessCheck[] {
-  const publicUrl = new URL(config.publicBaseUrl);
-  const publicHost = publicUrl.hostname.toLowerCase();
-  const loopbackPublic = publicHost === "localhost" || publicHost === "127.0.0.1" || publicHost === "::1";
-  const publicOrigin = publicUrl.protocol === "https:" && !loopbackPublic
-    ? pass("remote.public_origin", "public HTTPS origin is configured")
-    : fail("remote.public_origin", "configured publicBaseUrl is not a remote HTTPS origin",
-        "Set server.publicBaseUrl to the HTTPS origin owned by your tunnel or reverse proxy.");
-
-  const localBind = ["127.0.0.1", "::1", "localhost"].includes(config.host.toLowerCase())
-    ? pass("remote.local_bind", "DevSpace is bound to loopback")
-    : fail("remote.local_bind", "DevSpace is not bound to loopback",
-        "Bind DevSpace to loopback and let the user-managed tunnel provide the public boundary.");
-
-  const hostAllowlist = config.allowedHosts.includes("*")
-    ? warn("remote.host_allowlist", "Host allowlist is disabled with '*'",
-        "Replace '*' with the public hostname after verifying the tunnel route.")
-    : config.allowedHosts.map(value => value.toLowerCase()).includes(publicHost)
-      ? pass("remote.host_allowlist", "public hostname is accepted by the Host allowlist")
-      : fail("remote.host_allowlist", "public hostname is not accepted by the Host allowlist",
-          "Add the configured public hostname to server.allowedHosts or reload effective configuration.");
-
-  return [publicOrigin, localBind, hostAllowlist];
-}
+const publicUrl = new URL(config.publicBaseUrl);
+const publicHost = publicUrl.hostname.toLowerCase();
+const loopbackPublic = ["localhost", "127.0.0.1", "::1"].includes(publicHost);
 ```
 
-Implement `finalizeRemoteReadinessReport()` so it creates a map by ID, inserts a `skipped` check for any missing required ID, then emits the eight checks in `REMOTE_READINESS_CHECK_IDS` order. `ready` is `true` only when every status is `pass` or `warn`. Derive `publicBaseUrl`/`mcpUrl` only through `publicMcpEndpoints()`.
+- `remote.public_origin`: pass only for `https:` and non-loopback host.
+- `remote.local_bind`: pass only for `127.0.0.1`, `::1`, or `localhost`.
+- `remote.host_allowlist`: `*` => `warn`; exact normalized public hostname => `pass`; otherwise `fail`.
 
-Implement presentation from the same report object:
+Implement `finalizeRemoteReadinessReport()` by mapping checks by ID, inserting `skipped` entries for every absent ID, emitting exactly `REMOTE_READINESS_CHECK_IDS` order, and setting `ready=true` only when all statuses are `pass` or `warn`. Derive `publicBaseUrl` and `mcpUrl` only through `publicMcpEndpoints()`.
+
+Implement:
 
 ```ts
 export function remoteReadinessExitCode(report: RemoteReadinessReport): 0 | 1 {
@@ -348,22 +299,23 @@ export function formatRemoteReadinessReport(report: RemoteReadinessReport): stri
 }
 ```
 
-Private `pass/warn/fail/skipped` helpers must accept only the fields above; do not accept or retain the full config object.
+Keep private result-construction helpers limited to `id`, `summary`, bounded `detail`, and `remediation`; never pass a complete auth/config object into a report helper.
 
-- [ ] **Step 4: Add secret-redaction-by-construction assertion and verify GREEN**
+- [ ] **Step 4: Add redaction-by-construction regression and verify GREEN**
 
 Append:
 
 ```ts
-test("report serialization contains no unrelated secret-bearing config fields", () => {
+test("report serialization exposes no unrelated security fields", () => {
   const report = finalizeRemoteReadinessReport(baseConfig, [
     ...evaluateRemoteConfiguration(baseConfig),
     ...networkPasses,
   ]);
   const serialized = JSON.stringify(report);
-  assert.equal(serialized.includes("test-owner-token-that-is-long-enough"), false);
+  assert.equal(serialized.includes("ownerToken"), false);
   assert.equal(serialized.includes("allowedRoots"), false);
   assert.equal(serialized.includes("Authorization"), false);
+  assert.equal(serialized.includes("cookie"), false);
 });
 ```
 
@@ -391,13 +343,10 @@ git commit -m "feat: define remote readiness contract"
 - Modify: `src/remote-readiness.test.ts`
 
 **Interfaces:**
-- Consumes: Task 1 endpoint helper and Task 2 report/static-check contracts.
-- Produces:
-  - `RemoteReadinessOptions`
-  - `runRemoteReadiness(config, options?): Promise<RemoteReadinessReport>`
-- Production default uses global `fetch`; tests may inject `fetchImpl`.
+- Consumes: endpoint helper and Task 2 contracts.
+- Produces: `RemoteReadinessOptions` and `runRemoteReadiness(config, options?): Promise<RemoteReadinessReport>`.
 
-- [ ] **Step 1: Write failing success-path and layer-specific probe tests**
+- [ ] **Step 1: Write failing success-path and mismatch tests**
 
 Add to `src/remote-readiness.test.ts`:
 
@@ -405,10 +354,10 @@ Add to `src/remote-readiness.test.ts`:
 import { publicMcpEndpoints } from "./oauth-endpoints.js";
 import { runRemoteReadiness } from "./remote-readiness.js";
 
-function jsonResponse(status: number, body: unknown, headers: Record<string, string> = {}) {
+function jsonResponse(status: number, body: unknown) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json", ...headers },
+    headers: { "content-type": "application/json" },
   });
 }
 
@@ -422,7 +371,7 @@ function routeFetch(routes: Map<string, Response | Error>): typeof fetch {
   };
 }
 
-test("runRemoteReadiness passes all eight checks for coherent DevSpace endpoints", async () => {
+test("coherent endpoints pass all eight readiness checks", async () => {
   const endpoints = publicMcpEndpoints(baseConfig.publicBaseUrl);
   const routes = new Map<string, Response | Error>([
     ["http://127.0.0.1:7676/healthz", jsonResponse(200, { ok: true, name: "devspace" })],
@@ -441,13 +390,12 @@ test("runRemoteReadiness passes all eight checks for coherent DevSpace endpoints
       headers: { "www-authenticate": "Bearer" },
     })],
   ]);
-
   const report = await runRemoteReadiness(baseConfig, { fetchImpl: routeFetch(routes), timeoutMs: 50 });
   assert.equal(report.ready, true);
   assert.deepEqual(report.checks.map(check => check.status), Array(8).fill("pass"));
 });
 
-test("origin mismatches and an open MCP endpoint fail their own checks", async () => {
+test("metadata origin mismatch and open MCP endpoint fail independently", async () => {
   const endpoints = publicMcpEndpoints(baseConfig.publicBaseUrl);
   const routes = new Map<string, Response | Error>([
     ["http://127.0.0.1:7676/healthz", jsonResponse(200, { ok: true, name: "devspace" })],
@@ -470,7 +418,7 @@ test("origin mismatches and an open MCP endpoint fail their own checks", async (
 });
 ```
 
-Also add one failure-layer test where local health throws, public health returns HTML, and assertions verify `remote.local_service` and `remote.public_service` fail independently instead of collapsing into one generic error.
+Add one more test where local health throws a connection error and public health returns HTML; assert `remote.local_service` and `remote.public_service` each fail with their own IDs.
 
 - [ ] **Step 2: Run and verify RED**
 
@@ -478,7 +426,7 @@ Also add one failure-layer test where local health throws, public health returns
 pnpm exec tsx --test src/remote-readiness.test.ts
 ```
 
-Expected: FAIL because `runRemoteReadiness` is not exported/implemented.
+Expected: FAIL because `runRemoteReadiness` is not implemented.
 
 - [ ] **Step 3: Implement bounded probe orchestration**
 
@@ -493,14 +441,10 @@ export interface RemoteReadinessOptions {
 const DEFAULT_REMOTE_PROBE_TIMEOUT_MS = 2_000;
 ```
 
-Implement a private timeout wrapper using `AbortController`:
+Implement bounded fetch:
 
 ```ts
-async function fetchBounded(
-  fetchImpl: typeof fetch,
-  input: string | URL,
-  timeoutMs: number,
-): Promise<Response> {
+async function fetchBounded(fetchImpl: typeof fetch, input: string | URL, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -513,22 +457,22 @@ async function fetchBounded(
 
 `runRemoteReadiness()` must:
 
-1. Start with `evaluateRemoteConfiguration(config)`.
-2. Probe local `http://<loopback-host>:<port>/healthz`; pass only on `200` JSON `{ ok: true, name: "devspace" }`.
-3. Probe public `<public-origin>/healthz` with TLS verification left to native fetch; pass only on the same DevSpace JSON identity.
-4. Probe `authorizationServerMetadataUrl`; require `issuer`, `authorization_endpoint`, and `token_endpoint` to resolve to the configured public origin.
-5. Probe `protectedResourceMetadataUrl`; require `resource === resourceServerUrl.toString()` and, when `authorization_servers` exists, require it to include the configured public origin.
-6. Probe public `/mcp` without Authorization; pass only when status is `401` and the response is not a generic successful HTML/tool response.
-7. Preserve each failure at its own check ID with bounded detail and remediation; never include response bodies wholesale.
-8. Call `finalizeRemoteReadinessReport(config, checks)` exactly once at the end.
+1. start with `evaluateRemoteConfiguration(config)`;
+2. probe local `http://<loopback-host>:<port>/healthz`, requiring `200` JSON `{ ok: true, name: "devspace" }`;
+3. probe public `<public-origin>/healthz`, requiring the same DevSpace identity;
+4. probe authorization-server metadata, requiring `issuer`, `authorization_endpoint`, and `token_endpoint` to resolve to the configured public origin;
+5. probe protected-resource metadata, requiring `resource === resourceServerUrl.toString()` and, when `authorization_servers` exists, inclusion of the configured public origin;
+6. probe public `/mcp` with no Authorization header, requiring status `401` and a Bearer challenge or equivalent protected-resource response rather than generic successful HTML;
+7. retain each failure under its own check ID and only bounded error details; never include full response bodies;
+8. call `finalizeRemoteReadinessReport(config, checks)` once at the end.
 
-For IPv6 loopback, format the local host as `[::1]`; do not special-case a public wildcard bind into a local probe target.
+For `::1`, construct the local URL using `[::1]`. A non-loopback configured bind still fails `remote.local_bind`; do not invent a different local target that hides the misconfiguration.
 
-If `remote.public_origin` fails, still run `remote.local_service`, but mark the four public-dependent checks (`remote.public_service`, `remote.oauth_discovery`, `remote.protected_resource`, `remote.mcp_boundary`) as `skipped` with an explicit invalid-public-origin reason rather than probing a known-invalid remote target.
+If `remote.public_origin` fails, continue the local service probe but create `skipped` results for `remote.public_service`, `remote.oauth_discovery`, `remote.protected_resource`, and `remote.mcp_boundary` instead of probing the invalid public target.
 
-- [ ] **Step 4: Add timeout/abort regression**
+- [ ] **Step 4: Add timeout/abort regression and verify GREEN**
 
-Add a fetch implementation that waits for `signal.abort` and rejects with an `AbortError`; run with `timeoutMs: 10`. Assert the affected check fails (or is skipped only where the spec explicitly allows inability to verify) and the report returns promptly without throwing the raw abort exception.
+Add an injected fetch that waits for `signal.abort` and rejects with an `AbortError`; run with `timeoutMs: 10`. Assert the relevant check is bounded, returns `fail` or the spec-defined `skipped`, and `runRemoteReadiness()` resolves a report rather than throwing the raw abort.
 
 Run:
 
@@ -555,15 +499,11 @@ git commit -m "feat: probe remote MCP readiness"
 
 **Interfaces:**
 - Consumes: `runRemoteReadiness`, `formatRemoteReadinessReport`, `remoteReadinessExitCode`.
-- Produces CLI forms:
-  - `devspace doctor`
-  - `devspace doctor --remote`
-  - `devspace doctor --remote --json`
-- Invalid doctor invocation returns exit `2`; failed readiness returns exit `1`; ready returns exit `0`.
+- Produces: `devspace doctor`, `devspace doctor --remote`, `devspace doctor --remote --json`.
 
 - [ ] **Step 1: Write child-process CLI regressions first**
 
-Extend `src/cli.test.ts` with an isolated config fixture using `writeTestDevspaceConfig()`:
+Extend `src/cli.test.ts` with an isolated config created via `writeTestDevspaceConfig()` and assertions for:
 
 ```ts
 const remoteDoctorRoot = mkdtempSync(join(tmpdir(), "devspace-cli-remote-doctor-"));
@@ -580,9 +520,7 @@ try {
   let jsonFailure: unknown;
   try {
     await execFileAsync("node", ["--import", "tsx", "src/cli.ts", "doctor", "--remote", "--json"], {
-      cwd: process.cwd(),
-      encoding: "utf8",
-      env: { ...process.env, ...remoteConfigEnv },
+      cwd: process.cwd(), encoding: "utf8", env: { ...process.env, ...remoteConfigEnv },
     });
   } catch (error) {
     jsonFailure = error;
@@ -592,11 +530,6 @@ try {
   const report = JSON.parse((jsonFailure as { stdout?: string }).stdout ?? "{}");
   assert.equal(report.ready, false);
   assert.equal(report.checks.length, 8);
-  assert.deepEqual(report.checks.map((check: { id: string }) => check.id), [
-    "remote.public_origin", "remote.local_bind", "remote.host_allowlist",
-    "remote.local_service", "remote.public_service", "remote.oauth_discovery",
-    "remote.protected_resource", "remote.mcp_boundary",
-  ]);
 
   await assert.rejects(
     execFileAsync("node", ["--import", "tsx", "src/cli.ts", "doctor", "--json"], {
@@ -613,11 +546,11 @@ try {
 }
 ```
 
-Also add:
+Also assert:
 
-- A `doctor --remote` human-output invocation against the same intentionally failing fixture and assert stdout includes `Remote readiness: NOT READY` and at least one stable check ID.
-- `doctor --wat` exits `2`.
-- Existing `doctor` with no flags still prints existing lines including `Config dir:`, `Local MCP URL:`, `Public MCP URL:`, `Allowed roots:`, and `Allowed hosts:`.
+- `doctor --remote` on the failing fixture writes `Remote readiness: NOT READY` and stable check IDs to stdout and exits `1`;
+- `doctor --wat` exits `2` with one usage/unknown-option error;
+- plain `doctor` still prints its existing local fields including `Config dir:`, `Local MCP URL:`, `Public MCP URL:`, `Allowed roots:`, and `Allowed hosts:`.
 
 - [ ] **Step 2: Run and verify RED**
 
@@ -625,11 +558,11 @@ Also add:
 pnpm exec tsx --test src/cli.test.ts
 ```
 
-Expected: new doctor-flag assertions FAIL because `case "doctor"` currently ignores/does not implement the new contract.
+Expected: new doctor flag tests FAIL.
 
-- [ ] **Step 3: Refactor local doctor and add strict doctor-argument routing**
+- [ ] **Step 3: Implement strict doctor argument routing without changing local doctor**
 
-In `src/cli.ts`, change only the doctor branch:
+Change the switch to:
 
 ```ts
 case "doctor":
@@ -637,7 +570,7 @@ case "doctor":
   return;
 ```
 
-Keep old output in a separate `runLocalDoctor()` containing the previous no-argument implementation verbatim.
+Move the existing no-argument body verbatim into `runLocalDoctor()`.
 
 Add:
 
@@ -655,24 +588,17 @@ function parseDoctorArgs(args: string[]): DoctorOptions {
 }
 ```
 
-Implement `runDoctor(args)` so malformed arguments set `process.exitCode = 2`, print one error to stderr, and return without falling through to global error handling. With no `--remote`, call `runLocalDoctor()` and preserve prior output.
-
-For remote mode:
+`runDoctor(args)` must catch only its own invocation/diagnostic boundary so exit code `2` is distinguishable from readiness failure. With no `--remote`, call `runLocalDoctor()` unchanged. In remote mode:
 
 ```ts
-try {
-  const report = await runRemoteReadiness(loadConfig());
-  console.log(options.json ? JSON.stringify(report) : formatRemoteReadinessReport(report));
-  process.exitCode = remoteReadinessExitCode(report);
-} catch (error) {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 2;
-}
+const report = await runRemoteReadiness(loadConfig());
+console.log(options.json ? JSON.stringify(report) : formatRemoteReadinessReport(report));
+process.exitCode = remoteReadinessExitCode(report);
 ```
 
-Do not write config or auto-start the server.
+On doctor argument/internal diagnostic failure, print one bounded error to stderr and set `process.exitCode = 2`. Do not write configuration or start/restart a server.
 
-- [ ] **Step 4: Verify CLI GREEN plus static/probe regression**
+- [ ] **Step 4: Verify CLI GREEN plus related regression**
 
 ```sh
 pnpm exec tsx --test src/cli.test.ts src/remote-readiness.test.ts src/oauth-endpoints.test.ts
@@ -689,103 +615,80 @@ git commit -m "feat: add remote doctor diagnostics"
 
 ---
 
-### Task 5: Document the Tunnel-First Diagnostic and Record the Engineering Change
+### Task 5: Document the Tunnel-First Diagnostic
 
 **Files:**
 - Modify: `docs/setup.md`
 - Modify: `docs/security.md`
-- Modify: `CHANGELOG.md`
-- Test: documentation checker
 
 **Interfaces:**
 - Consumes: exact CLI/check semantics from Tasks 1–4.
-- Produces: user-facing setup/security guidance; no runtime behavior.
+- Produces: user-facing setup/security guidance only.
 
-- [ ] **Step 1: Add setup documentation before changing changelog**
+- [ ] **Step 1: Add setup documentation**
 
-In `docs/setup.md`, under `## 接入 ChatGPT 网页`, add a subsection `### 远程就绪诊断` containing these commands and meanings:
+Under `## 接入 ChatGPT 网页` in `docs/setup.md`, add `### 远程就绪诊断` and document these exact commands:
 
-```text
-# Human-readable diagnostics
+```sh
 node bin/devspace.js doctor --remote
-
-# Machine-readable diagnostics
 node bin/devspace.js doctor --remote --json
 ```
 
-Document:
+State:
 
-- Exit `0`: all required checks are `pass` or `warn`.
-- Exit `1`: at least one required check is `fail` or `skipped`.
-- Exit `2`: invocation/configuration/internal diagnostic could not be evaluated safely.
-- The command checks configuration, local listener identity, public HTTPS identity, OAuth metadata, protected-resource metadata, and unauthenticated MCP protection.
-- It never creates/restarts/configures a tunnel and never performs OAuth/Owner approval.
-- Forward the whole DevSpace service, not only `/mcp`.
-- A green result still requires the real-host acceptance flow before claiming ChatGPT/Claude compatibility.
+- exit `0`: every required check is `pass` or `warn`;
+- exit `1`: at least one required check is `fail` or `skipped`;
+- exit `2`: invocation/configuration/internal diagnostic could not be evaluated safely;
+- the diagnostic checks configuration, local listener identity, public HTTPS identity, OAuth metadata, protected-resource metadata, and unauthenticated MCP protection;
+- it never creates/restarts/configures a tunnel and never performs OAuth or Owner approval;
+- the tunnel/reverse proxy must forward the whole DevSpace service, not only `/mcp`;
+- a green result still requires real-host acceptance before claiming ChatGPT/Claude compatibility.
 
 - [ ] **Step 2: Add security-boundary documentation**
 
-In `docs/security.md`, add `## Remote readiness diagnostics` explaining:
+Add `## Remote readiness diagnostics` to `docs/security.md` with this contract:
 
 ```text
-Passing `devspace doctor --remote` proves coherence/reachability of the configured transport/auth surface from the diagnostic machine. It does not make Shell sandboxed, expand workspace roots, approve a client, grant Owner approval, prove the host UI refreshed, or make a compromised AI client trustworthy.
+Passing `devspace doctor --remote` proves coherence and reachability of the configured transport/auth surface from the diagnostic machine. It does not make Shell sandboxed, expand workspace roots, approve a client, grant Owner approval, prove the host UI refreshed, or make a compromised AI client trustworthy.
 ```
 
-State that TLS validation remains enabled and that diagnostic output never includes Owner/OAuth/tunnel credentials or full allowed-root lists.
+Also state that TLS validation remains enabled and that diagnostic output excludes Owner/OAuth/tunnel credentials and full allowed-root lists.
 
-- [ ] **Step 3: Run documentation tests before writing a success log entry**
+- [ ] **Step 3: Verify documentation before commit**
 
 ```sh
 npm run test:docs
 ```
 
-Expected: PASS. If it fails, fix only documentation/link/fence issues caused by this change before proceeding.
+Expected: PASS.
 
-- [ ] **Step 4: Add the dated changelog entry using only verified evidence**
-
-Insert at the top of `CHANGELOG.md`, below `# Development Log`:
-
-```markdown
-## 2026-09-17 - Add tunnel-first remote readiness diagnostics (L2)
-
-- Current State: DevSpace already supported user-managed HTTPS exposure, OAuth, Host allowlists and remote MCP access, but readiness was distributed across setup guidance and manual checks.
-- Changes: Added one shared public MCP/OAuth endpoint contract and a read-only `devspace doctor --remote [--json]` diagnostic with eight stable checks for remote origin, loopback binding, Host allowlist, local/public service identity, OAuth metadata, protected-resource metadata and unauthenticated MCP protection. Tunnel lifecycle remains external.
-- Root Cause: A public URL or healthy local listener alone cannot prove that the tunnel, OAuth metadata and MCP resource identity agree on one external origin.
-- Impact: Additive CLI diagnostics only. No new MCP tool, database migration, runtime dependency, tunnel control, approval bypass, workspace expansion or agent-routing change.
-- Tests: <replace this line during implementation with the exact targeted and full regression commands/results actually observed>.
-- Compatibility: Existing `devspace doctor` remains; `--remote` is additive. Remote diagnostics are read-only and do not modify configuration.
-- Known Risks: Repository tests do not prove a real ChatGPT/Claude connector or external tunnel. Phase A is not a hosted relay and does not provide device pairing, reconnect or multi-device routing.
-- Next Highest-Leverage Step: Complete the real remote-host acceptance flow against a user-managed HTTPS endpoint before deciding whether Phase B needs a self-hosted relay/device agent.
-```
-
-Do **not** commit the literal `<replace this line...>` placeholder. Replace it with actual test evidence from Tasks 1–5 before committing.
-
-- [ ] **Step 5: Commit Task 5 after docs verification**
+- [ ] **Step 4: Commit Task 5**
 
 ```sh
-git add docs/setup.md docs/security.md CHANGELOG.md
+git add docs/setup.md docs/security.md
 git commit -m "docs: document remote readiness workflow"
 ```
 
 ---
 
-### Task 6: Full Regression, Diff Review, and Real-Host Acceptance Gate
+### Task 6: Full Regression, Evidence Log, Diff Review, and Real-Host Acceptance Gate
 
 **Files:**
-- Modify only if verification reveals a defect in files from Tasks 1–5.
-- No new Phase B files/types/tables are permitted in this task.
+- Modify: `CHANGELOG.md` after verification only.
+- Modify other Phase A files only if verification exposes a defect.
+- Do not add any Phase B file/type/table/dependency.
 
 **Interfaces:**
 - Consumes: completed Phase A implementation.
-- Produces: verified repository candidate plus a separately reported real-host acceptance result.
+- Produces: verified repository candidate and separately reported real-host acceptance status.
 
-- [ ] **Step 1: Run focused tests once more from the final code state**
+- [ ] **Step 1: Run focused tests fresh from final code state**
 
 ```sh
 pnpm exec tsx --test src/oauth-endpoints.test.ts src/remote-readiness.test.ts src/cli.test.ts src/server.test.ts
 ```
 
-Expected: PASS.
+Record the exact command result and test counts shown by the runner.
 
 - [ ] **Step 2: Run all repository gates fresh**
 
@@ -796,42 +699,58 @@ npm test
 npm run test:deploy
 ```
 
-Record exact pass/fail/skip counts and any existing warnings separately. Do not add overlapping test counts as if they were one total.
+Record each command's exit status and any pass/fail/skip counts it actually reports. Keep overlapping suites separate rather than summing them into a synthetic total.
 
-- [ ] **Step 3: Inspect the complete branch diff against the base**
+- [ ] **Step 3: Inspect the complete branch diff against `codex/personal`**
 
 ```sh
 git diff --check
 git diff --stat codex/personal...HEAD
-git diff codex/personal...HEAD -- src/oauth-endpoints.ts src/remote-readiness.ts src/cli.ts src/server.ts docs/setup.md docs/security.md CHANGELOG.md
+git diff codex/personal...HEAD -- src/oauth-endpoints.ts src/remote-readiness.ts src/cli.ts src/server.ts docs/setup.md docs/security.md
 ```
 
-Verify manually from the diff:
+Verify from the diff:
 
-- no config/database/tunnel mutation was added;
-- no secret-bearing field is included in report objects;
-- the server and diagnostic use the same endpoint helper;
-- exactly eight stable check IDs exist and remain ordered;
-- no Phase B device/relay type or dependency was introduced;
-- existing local doctor body remains intact in `runLocalDoctor()`.
+- no config/database/tunnel mutation exists;
+- no secret-bearing field enters report objects;
+- server and diagnostic share one endpoint helper;
+- exactly eight stable check IDs remain ordered;
+- no Phase B device/relay type or dependency exists;
+- the original local doctor body remains intact under `runLocalDoctor()`.
 
-- [ ] **Step 4: Update the changelog Tests line with the fresh evidence**
+- [ ] **Step 4: Create the changelog entry from observed evidence**
 
-Replace the Task 5 provisional Tests line with exact observed results only, then rerun:
+Only after Steps 1–3 have completed, insert a new entry immediately below `# Development Log` with this fixed structure and factual content:
+
+```markdown
+## 2026-09-17 - Add tunnel-first remote readiness diagnostics (L2)
+
+- Current State: DevSpace already supported user-managed HTTPS exposure, OAuth, Host allowlists and remote MCP access, but readiness was distributed across setup guidance and manual checks.
+- Changes: Added one shared public MCP/OAuth endpoint contract and a read-only `devspace doctor --remote [--json]` diagnostic with eight stable checks for remote origin, loopback binding, Host allowlist, local/public service identity, OAuth metadata, protected-resource metadata and unauthenticated MCP protection. Tunnel lifecycle remains external.
+- Root Cause: A public URL or healthy local listener alone cannot prove that the tunnel, OAuth metadata and MCP resource identity agree on one external origin.
+- Impact: Additive CLI diagnostics only. No new MCP tool, database migration, runtime dependency, tunnel control, approval bypass, workspace expansion or agent-routing change.
+- Compatibility: Existing `devspace doctor` remains unchanged without flags; `--remote` is additive and read-only.
+- Known Risks: Repository tests do not prove a real ChatGPT/Claude connector or external tunnel. Phase A is not a hosted relay and does not provide device pairing, reconnect or multi-device routing.
+- Next Highest-Leverage Step: Complete the real remote-host acceptance flow against a user-managed HTTPS endpoint before deciding whether Phase B needs a self-hosted relay/device agent.
+```
+
+Between `Impact` and `Compatibility`, add one `Tests` bullet built only from the outputs recorded in Steps 1–2. Name every command executed. For a command that reports counts, copy those counts exactly; for a command that reports only success, state `exit 0`. Do not infer missing counts or write a success claim for any command that did not finish successfully.
+
+Then run:
 
 ```sh
 npm run test:docs
 git diff --check
 ```
 
-Commit the evidence-only update if needed:
+Commit only after both succeed:
 
 ```sh
 git add CHANGELOG.md
 git commit -m "docs: record remote readiness verification"
 ```
 
-- [ ] **Step 5: Execute the real-host acceptance gate only when a user-managed HTTPS endpoint is available**
+- [ ] **Step 5: Execute the real-host acceptance gate when a user-managed HTTPS endpoint is available**
 
 Run:
 
@@ -839,23 +758,23 @@ Run:
 node bin/devspace.js doctor --remote
 ```
 
-Require `Remote readiness: READY`, then complete the spec's nine steps in a real remote MCP host:
+Require `Remote readiness: READY`, then complete the spec's real-host sequence:
 
 1. remote host discovers OAuth metadata from the same public origin;
 2. user completes normal OAuth/Owner consent;
 3. MCP initialize succeeds;
 4. open one allowed workspace;
-5. read one known instruction file and verify exact real content;
-6. modify one disposable test file using the existing guarded patch/edit contract;
+5. read one known instruction file and verify its real content;
+6. modify one disposable test file using the existing guarded edit/patch contract;
 7. read it back and verify hash/content evidence;
 8. run one harmless project validation command through existing process tooling;
 9. inspect the resulting aggregate review surface.
 
-If any of these cannot be executed, record the exact unverified boundary and describe the result only as **repository-level remote-readiness support**. Do not claim a proven hosted Remote Desktop Commander replacement.
+If any step cannot be executed, record that exact boundary as unverified and describe the result only as **repository-level remote-readiness support**. Do not claim a proven hosted Remote Desktop Commander replacement.
 
 - [ ] **Step 6: Request final code review before integration**
 
-Generate a full branch review package from the base `codex/personal` commit to `HEAD` and run the project's required review workflow. Critical/Important findings must be fixed and reverified before the branch is offered for merge/PR.
+Generate a full branch review package from the `codex/personal` merge base to `HEAD`. Run the required code-review workflow. Fix and reverify every Critical or Important finding before offering the branch for merge or PR.
 
 ---
 
@@ -866,6 +785,7 @@ Before execution begins, the controller must verify:
 - Every design acceptance criterion maps to Tasks 1–6.
 - `PublicMcpEndpoints`, `RemoteReadinessConfig`, check IDs, and CLI forms use the same names in all tasks.
 - No task requires a real tunnel until Task 6 real-host acceptance.
-- No task adds a database migration, dependency, DeviceIdentity, relay, pairing, heartbeat, or multi-device routing.
-- All production changes have an explicit RED test before implementation.
-- No changelog completion claim is written before its verification command actually runs.
+- No task adds a database migration, runtime dependency, DeviceIdentity, relay, pairing, heartbeat, or multi-device routing.
+- All production behaviors have an explicit RED test before implementation.
+- Changelog completion claims are created only after fresh verification evidence exists.
+- The plan contains no unfinished implementation placeholder or deferred design decision.

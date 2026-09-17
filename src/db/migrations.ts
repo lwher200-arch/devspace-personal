@@ -297,9 +297,6 @@ function migrateTaskSessionKernel(sqlite: Database.Database): void {
         on delete cascade
     );
 
-    create index if not exists task_session_bindings_task_idx
-      on task_session_bindings(task_session_id, generation);
-
     create unique index if not exists task_session_bindings_task_generation_idx
       on task_session_bindings(task_session_id, generation);
 

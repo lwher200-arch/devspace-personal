@@ -28,6 +28,7 @@ export type TaskSessionConflictCode =
   | "TASK_NOT_FOUND"
   | "TASK_CLOSED"
   | "SOURCE_MISMATCH"
+  | "INVALID_DESTINATION"
   | "DESTINATION_OWNED"
   | "DESTINATION_RETIRED"
   | "CORRUPT_BINDING";
@@ -137,7 +138,7 @@ export class SqliteTaskSessionStore {
   ): TaskSessionRecord {
     const destination = normalizedConversation(destinationConversationScopeId);
     if (!destination) {
-      throw new TaskSessionConflictError("DESTINATION_OWNED", "Destination conversation must be non-empty.");
+      throw new TaskSessionConflictError("INVALID_DESTINATION", "Destination conversation must be non-empty.");
     }
 
     const rebind = this.database.sqlite.transaction(() => {
@@ -245,13 +246,13 @@ export class SqliteTaskSessionStore {
   private assertDestinationAvailable(taskSessionId: string, conversationScopeId: string): void {
     const owner = this.database.sqlite.prepare(`
       select task_session_id from task_session_bindings
-      where conversation_scope_id = ? and state = 'current'
+      where conversation_scope_id = ?
       limit 1
     `).get(conversationScopeId) as { task_session_id: string } | undefined;
     if (owner && owner.task_session_id !== taskSessionId) {
       throw new TaskSessionConflictError(
         "DESTINATION_OWNED",
-        `Conversation ${conversationScopeId} is already current for task session ${owner.task_session_id}.`,
+        `Conversation ${conversationScopeId} already belongs to task session ${owner.task_session_id}.`,
       );
     }
   }

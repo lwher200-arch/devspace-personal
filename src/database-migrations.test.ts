@@ -13,43 +13,96 @@ function journal(sqlite: Database.Database) {
   return sqlite.prepare("select version, name, applied_at from devspace_schema_migrations order by version").all();
 }
 
-function useVersionSix(sqlite: Database.Database) {
+function useVersionSeven(sqlite: Database.Database) {
   migrateDatabase(sqlite);
+  sqlite.exec("drop table task_session_bindings");
+  sqlite.exec("drop table task_sessions");
+  sqlite.exec("delete from devspace_schema_migrations where version = 8");
+}
+
+function useVersionSix(sqlite: Database.Database) {
+  useVersionSeven(sqlite);
   sqlite.exec("alter table local_agent_sessions drop column execution_json");
   sqlite.exec("delete from devspace_schema_migrations where version = 7");
 }
 
-test("fresh migration and repeat startup retain the personal v7 contract", () => {
+test("fresh migration and repeat startup retain the personal v8 contract", () => {
   const sqlite = new Database(":memory:");
   try {
     migrateDatabase(sqlite);
     const before = journal(sqlite);
-    assert.equal(before.length, 7);
-    assert.deepEqual(sqlite.prepare("select version, name from devspace_schema_migrations where version = 7").get(),
-      { version: 7, name: "local-agent-execution-contract" });
+    assert.equal(before.length, 8);
+    assert.deepEqual(sqlite.prepare("select version, name from devspace_schema_migrations where version = 8").get(),
+      { version: 8, name: "task-session-kernel" });
     migrateDatabase(sqlite);
     assert.deepEqual(journal(sqlite), before);
     assert.equal(sqlite.prepare("select execution_json from local_agent_sessions").all().length, 0);
+    assert.deepEqual(sqlite.prepare("select name from sqlite_master where type = 'table' and name in ('task_sessions', 'task_session_bindings') order by name").pluck().all(),
+      ["task_session_bindings", "task_sessions"]);
   } finally { sqlite.close(); }
 });
 
-test("a recognized v6 database upgrades without replacing stored agent data", () => {
+test("a recognized v7 database upgrades to task sessions without replacing stored data", () => {
   const sqlite = new Database(":memory:");
   try {
-    useVersionSix(sqlite);
+    useVersionSeven(sqlite);
+    sqlite.exec(`insert into workspace_sessions
+      (id, root, status, mode, managed, created_at, last_used_at)
+      values ('ws_fixture', 'fixture-root', 'active', 'checkout', 'false', 'before', 'before')`);
     sqlite.exec(`insert into local_agent_sessions
-      (id, workspace_root, profile_name, provider, status, created_at, updated_at)
-      values ('agt_fixture', 'fixture-root', 'reviewer', 'codex', 'completed', 'before', 'before')`);
+      (id, workspace_id, workspace_root, profile_name, provider, status, created_at, updated_at)
+      values ('agt_fixture', 'ws_fixture', 'fixture-root', 'reviewer', 'codex', 'completed', 'before', 'before')`);
     const before = journal(sqlite);
     migrateDatabase(sqlite);
-    assert.deepEqual(journal(sqlite).slice(0, 6), before);
+    assert.deepEqual(journal(sqlite).slice(0, 7), before);
     assert.deepEqual(sqlite.prepare("select id, status, execution_json from local_agent_sessions").get(),
       { id: "agt_fixture", status: "completed", execution_json: null });
+    assert.deepEqual(sqlite.prepare("select name from sqlite_master where type = 'table' and name in ('task_sessions', 'task_session_bindings') order by name").pluck().all(),
+      ["task_session_bindings", "task_sessions"]);
+  } finally { sqlite.close(); }
+});
+
+test("task-session migration enforces one current binding per task and conversation", () => {
+  const sqlite = new Database(":memory:");
+  try {
+    sqlite.pragma("foreign_keys = ON");
+    migrateDatabase(sqlite);
+    sqlite.exec(`insert into workspace_sessions
+      (id, root, status, mode, managed, created_at, last_used_at)
+      values ('ws_fixture', 'fixture-root', 'active', 'checkout', 'false', 'before', 'before')`);
+    sqlite.exec(`insert into task_sessions
+      (id, workspace_session_id, created_at, updated_at)
+      values ('task_a', 'ws_fixture', 'before', 'before')`);
+    assert.deepEqual(sqlite.prepare(`select status, current_conversation_scope_id, lineage_version, next_event_seq
+      from task_sessions where id = 'task_a'`).get(), {
+      status: "active",
+      current_conversation_scope_id: null,
+      lineage_version: 1,
+      next_event_seq: 1,
+    });
+    sqlite.exec(`insert into task_session_bindings
+      (task_session_id, conversation_scope_id, state, generation, bound_at)
+      values ('task_a', 'chat_a', 'current', 1, 'before')`);
+    assert.throws(() => sqlite.exec(`insert into task_session_bindings
+      (task_session_id, conversation_scope_id, state, generation, bound_at)
+      values ('task_a', 'chat_b', 'current', 2, 'after')`), /UNIQUE constraint failed/);
+    sqlite.exec(`insert into task_sessions
+      (id, workspace_session_id, created_at, updated_at)
+      values ('task_b', 'ws_fixture', 'before', 'before')`);
+    assert.throws(() => sqlite.exec(`insert into task_session_bindings
+      (task_session_id, conversation_scope_id, state, generation, bound_at)
+      values ('task_b', 'chat_a', 'current', 1, 'after')`), /UNIQUE constraint failed/);
+    assert.throws(() => sqlite.exec(`insert into task_session_bindings
+      (task_session_id, conversation_scope_id, state, generation, bound_at)
+      values ('task_b', 'chat_bad', 'invented', 1, 'after')`), /CHECK constraint failed/);
+    sqlite.exec("delete from workspace_sessions where id = 'ws_fixture'");
+    assert.equal(sqlite.prepare("select count(*) from task_sessions").pluck().get(), 0);
+    assert.equal(sqlite.prepare("select count(*) from task_session_bindings").pluck().get(), 0);
   } finally { sqlite.close(); }
 });
 
 for (const scenario of ["unknown-version", "unknown-low-version", "wrong-name"] as const) {
-  test(`migration rejects ${scenario} before applying pending v7`, () => {
+  test(`migration rejects ${scenario} before applying pending migrations`, () => {
     const sqlite = new Database(":memory:");
     try {
       useVersionSix(sqlite);
@@ -72,15 +125,15 @@ test("a failed migration rolls back all pending schema and journal writes", () =
   try {
     sqlite.exec(`create table devspace_schema_migrations
       (version integer primary key, name text not null, applied_at text not null);
-      create trigger reject_fixture_v7 before insert on devspace_schema_migrations
-      when new.version = 7 begin select raise(abort, 'fixture migration failure'); end;`);
+      create trigger reject_fixture_v8 before insert on devspace_schema_migrations
+      when new.version = 8 begin select raise(abort, 'fixture migration failure'); end;`);
     const before = sqlite.serialize();
     assert.throws(() => migrateDatabase(sqlite), /fixture migration failure/);
     assert.deepEqual(sqlite.serialize(), before);
     assert.equal(sqlite.inTransaction, false);
-    sqlite.exec("drop trigger reject_fixture_v7");
+    sqlite.exec("drop trigger reject_fixture_v8");
     migrateDatabase(sqlite);
-    assert.equal(journal(sqlite).length, 7);
+    assert.equal(journal(sqlite).length, 8);
   } finally { sqlite.close(); }
 });
 
@@ -105,7 +158,7 @@ test("openDatabase closes its handle when initialization fails", (t) => {
   }
 });
 
-test("backup and reopen retain the v7 execution payload", async () => {
+test("backup and reopen retain the v8 execution payload", async () => {
   const root = mkdtempSync(join(tmpdir(), "devspace-db-backup-"));
   const backup = join(root, "backup");
   const source = openDatabase(root);
@@ -133,7 +186,7 @@ test("concurrent process startup upgrades an existing WAL database once", async 
   const root = mkdtempSync(join(tmpdir(), "devspace-db-concurrent-"));
   const fixture = new Database(databasePath(root));
   fixture.pragma("journal_mode = WAL");
-  useVersionSix(fixture);
+  useVersionSeven(fixture);
   fixture.close();
   const source = `import { openDatabase } from ${JSON.stringify(new URL("./db/client.ts", import.meta.url).href)};
     const handle = openDatabase(process.argv[1]);
@@ -145,7 +198,7 @@ test("concurrent process startup upgrades an existing WAL database once", async 
       { timeout: 30000, windowsHide: true })));
     for (const result of results) {
       if (result.status === "rejected") throw result.reason;
-      assert.deepEqual(JSON.parse(result.value.stdout), [1, 2, 3, 4, 5, 6, 7]);
+      assert.deepEqual(JSON.parse(result.value.stdout), [1, 2, 3, 4, 5, 6, 7, 8]);
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

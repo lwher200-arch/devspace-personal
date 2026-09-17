@@ -116,8 +116,8 @@ Unknown doctor flags fail with a usage error. `--json` without `--remote` is out
 
 The command exit status is:
 
-- `0`: all required remote checks pass; warnings may exist.
-- `1`: at least one required remote check fails.
+- `0`: no required remote check is `fail` or `skipped`; warnings may exist.
+- `1`: at least one required remote check is `fail` or `skipped`.
 - `2`: diagnostic invocation/configuration cannot be evaluated safely, for example malformed arguments or an unexpected internal diagnostic error.
 
 The command never writes configuration.
@@ -128,6 +128,16 @@ Introduce one canonical report model:
 
 ```ts
 export type RemoteCheckStatus = "pass" | "warn" | "fail" | "skipped";
+
+export type RemoteReadinessCheckId =
+  | "remote.public_origin"
+  | "remote.local_bind"
+  | "remote.host_allowlist"
+  | "remote.local_service"
+  | "remote.public_service"
+  | "remote.oauth_discovery"
+  | "remote.protected_resource"
+  | "remote.mcp_boundary";
 
 export interface RemoteReadinessCheck {
   id: RemoteReadinessCheckId;
@@ -145,7 +155,7 @@ export interface RemoteReadinessReport {
 }
 ```
 
-`ready` is `true` only when every required check is `pass`. `warn` and `skipped` never turn a failing required check into success.
+All eight Phase A checks are required. `ready` is `true` when none of them is `fail` or `skipped`. A `warn` status is compatible with `ready=true`, but must remain visible in both human and JSON output.
 
 The report must never contain:
 
@@ -195,7 +205,7 @@ The check must use a short bounded timeout and must not start a server.
 
 Required. The configured HTTPS public origin must be reachable from the diagnostic machine and must resolve to a DevSpace service response rather than an unrelated web application or tunnel error page.
 
-TLS verification remains enabled. Certificate failures are failures, not warnings.
+TLS verification remains enabled. Certificate failures are failures, not warnings. If the diagnostic machine itself is prevented from reaching the public origin by local egress policy or split-network behavior, this check is `skipped` with an explicit "could not verify from this machine" explanation; readiness remains false because the public path was not proven.
 
 ### 8.6 `remote.oauth_discovery`
 
@@ -262,7 +272,7 @@ Cover:
 - HTTPS public origin passes; local HTTP fallback fails remote mode.
 - loopback bind passes; wildcard/public bind fails the tunnel-first profile.
 - effective public hostname is accepted by the Host allowlist.
-- `*` produces a warning rather than a silent pass.
+- `*` produces a warning while still allowing `ready=true` when every other check passes.
 - secret-bearing configuration values never appear in report serialization.
 - `ready` calculation is deterministic.
 - check ordering is stable.

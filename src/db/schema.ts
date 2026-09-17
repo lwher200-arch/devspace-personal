@@ -1,4 +1,5 @@
-import { index, integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
+import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const workspaceSessions = sqliteTable(
   "workspace_sessions",
@@ -52,6 +53,51 @@ export const workspaceConversationBindings = sqliteTable(
   (table) => [
     primaryKey({ columns: [table.conversationScopeId, table.targetKey] }),
     index("workspace_conversation_bindings_workspace_idx").on(table.workspaceSessionId),
+  ],
+);
+
+export const taskSessions = sqliteTable(
+  "task_sessions",
+  {
+    id: text("id").primaryKey(),
+    workspaceSessionId: text("workspace_session_id")
+      .notNull()
+      .references(() => workspaceSessions.id, { onDelete: "cascade" }),
+    status: text("status").notNull().default("active"),
+    currentConversationScopeId: text("current_conversation_scope_id"),
+    lineageVersion: integer("lineage_version").notNull().default(1),
+    nextEventSeq: integer("next_event_seq").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    index("task_sessions_workspace_idx").on(table.workspaceSessionId, table.updatedAt),
+    index("task_sessions_current_conversation_idx").on(table.currentConversationScopeId),
+  ],
+);
+
+export const taskSessionBindings = sqliteTable(
+  "task_session_bindings",
+  {
+    taskSessionId: text("task_session_id")
+      .notNull()
+      .references(() => taskSessions.id, { onDelete: "cascade" }),
+    conversationScopeId: text("conversation_scope_id").notNull(),
+    state: text("state").notNull(),
+    generation: integer("generation").notNull(),
+    boundAt: text("bound_at").notNull(),
+    supersededAt: text("superseded_at"),
+  },
+  (table) => [
+    primaryKey({ columns: [table.taskSessionId, table.conversationScopeId] }),
+    index("task_session_bindings_task_idx").on(table.taskSessionId, table.generation),
+    uniqueIndex("task_session_bindings_task_generation_idx").on(table.taskSessionId, table.generation),
+    uniqueIndex("task_session_bindings_current_task_idx")
+      .on(table.taskSessionId)
+      .where(sql`${table.state} = 'current'`),
+    uniqueIndex("task_session_bindings_current_conversation_idx")
+      .on(table.conversationScopeId)
+      .where(sql`${table.state} = 'current'`),
   ],
 );
 
@@ -123,5 +169,9 @@ export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;
 export type NewLoadedAgentFileRow = typeof loadedAgentFiles.$inferInsert;
 export type WorkspaceConversationBindingRow = typeof workspaceConversationBindings.$inferSelect;
 export type NewWorkspaceConversationBindingRow = typeof workspaceConversationBindings.$inferInsert;
+export type TaskSessionRow = typeof taskSessions.$inferSelect;
+export type NewTaskSessionRow = typeof taskSessions.$inferInsert;
+export type TaskSessionBindingRow = typeof taskSessionBindings.$inferSelect;
+export type NewTaskSessionBindingRow = typeof taskSessionBindings.$inferInsert;
 export type LocalAgentSessionRow = typeof localAgentSessions.$inferSelect;
 export type NewLocalAgentSessionRow = typeof localAgentSessions.$inferInsert;

@@ -62,7 +62,7 @@ test("a recognized v7 database upgrades to task sessions without replacing store
   } finally { sqlite.close(); }
 });
 
-test("task-session migration enforces one current binding per task and conversation", () => {
+test("task-session migration enforces durable task and conversation lineage", () => {
   const sqlite = new Database(":memory:");
   try {
     sqlite.pragma("foreign_keys = ON");
@@ -92,6 +92,13 @@ test("task-session migration enforces one current binding per task and conversat
     assert.throws(() => sqlite.exec(`insert into task_session_bindings
       (task_session_id, conversation_scope_id, state, generation, bound_at)
       values ('task_b', 'chat_a', 'current', 1, 'after')`), /UNIQUE constraint failed/);
+    sqlite.exec(`update task_session_bindings
+      set state = 'superseded', superseded_at = 'after'
+      where task_session_id = 'task_a' and conversation_scope_id = 'chat_a'`);
+    assert.throws(() => sqlite.exec(`insert into task_session_bindings
+      (task_session_id, conversation_scope_id, state, generation, bound_at)
+      values ('task_b', 'chat_a', 'current', 1, 'later')`), /UNIQUE constraint failed/,
+      "a historical conversation remains owned by its original task lineage");
     assert.throws(() => sqlite.exec(`insert into task_session_bindings
       (task_session_id, conversation_scope_id, state, generation, bound_at)
       values ('task_b', 'chat_bad', 'invented', 1, 'after')`), /CHECK constraint failed/);

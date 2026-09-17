@@ -1,0 +1,19 @@
+name: Runner Probe
+
+on:
+  push:
+    branches:
+      - fix/ci-verification-20260917
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Hosted runner probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Confirm runner execution
+        run: echo "GitHub-hosted runner started"

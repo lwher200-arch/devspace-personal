@@ -42,6 +42,11 @@ const migrations: Migration[] = [
     name: "local-agent-execution-contract",
     up: (sqlite) => addColumnIfMissing(sqlite, "local_agent_sessions", "execution_json", "text"),
   },
+  {
+    version: 8,
+    name: "task-session-kernel",
+    up: migrateTaskSessionKernel,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -250,6 +255,62 @@ function migrateLocalAgentEffortRename(sqlite: Database.Database): void {
     return;
   }
   sqlite.exec("alter table local_agent_sessions rename column thinking to effort");
+}
+
+function migrateTaskSessionKernel(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists task_sessions (
+      id text primary key,
+      workspace_session_id text not null,
+      status text not null default 'active'
+        check (status in ('active', 'checkpointing', 'rebinding', 'degraded', 'closed')),
+      current_conversation_scope_id text,
+      lineage_version integer not null default 1
+        check (lineage_version >= 1),
+      next_event_seq integer not null default 1
+        check (next_event_seq >= 1),
+      created_at text not null,
+      updated_at text not null,
+      foreign key (workspace_session_id)
+        references workspace_sessions(id)
+        on delete cascade
+    );
+
+    create index if not exists task_sessions_workspace_idx
+      on task_sessions(workspace_session_id, updated_at desc);
+
+    create index if not exists task_sessions_current_conversation_idx
+      on task_sessions(current_conversation_scope_id);
+
+    create table if not exists task_session_bindings (
+      task_session_id text not null,
+      conversation_scope_id text not null,
+      state text not null
+        check (state in ('current', 'superseded', 'abandoned')),
+      generation integer not null
+        check (generation >= 1),
+      bound_at text not null,
+      superseded_at text,
+      primary key (task_session_id, conversation_scope_id),
+      foreign key (task_session_id)
+        references task_sessions(id)
+        on delete cascade
+    );
+
+    create index if not exists task_session_bindings_task_idx
+      on task_session_bindings(task_session_id, generation);
+
+    create unique index if not exists task_session_bindings_task_generation_idx
+      on task_session_bindings(task_session_id, generation);
+
+    create unique index if not exists task_session_bindings_current_task_idx
+      on task_session_bindings(task_session_id)
+      where state = 'current';
+
+    create unique index if not exists task_session_bindings_current_conversation_idx
+      on task_session_bindings(conversation_scope_id)
+      where state = 'current';
+  `);
 }
 
 function addColumnIfMissing(

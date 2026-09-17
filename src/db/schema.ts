@@ -96,9 +96,7 @@ export const taskSessionBindings = sqliteTable(
     uniqueIndex("task_session_bindings_current_task_idx")
       .on(table.taskSessionId)
       .where(sql`${table.state} = 'current'`),
-    uniqueIndex("task_session_bindings_current_conversation_idx")
-      .on(table.conversationScopeId)
-      .where(sql`${table.state} = 'current'`),
+    uniqueIndex("task_session_bindings_conversation_idx").on(table.conversationScopeId),
   ],
 );
 

@@ -304,9 +304,8 @@ function migrateTaskSessionKernel(sqlite: Database.Database): void {
       on task_session_bindings(task_session_id)
       where state = 'current';
 
-    create unique index if not exists task_session_bindings_current_conversation_idx
-      on task_session_bindings(conversation_scope_id)
-      where state = 'current';
+    create unique index if not exists task_session_bindings_conversation_idx
+      on task_session_bindings(conversation_scope_id);
   `);
 }
 

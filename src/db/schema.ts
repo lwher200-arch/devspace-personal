@@ -63,7 +63,9 @@ export const taskSessions = sqliteTable(
     workspaceSessionId: text("workspace_session_id")
       .notNull()
       .references(() => workspaceSessions.id, { onDelete: "cascade" }),
-    status: text("status").notNull().default("active"),
+    status: text("status", { enum: ["active", "checkpointing", "rebinding", "degraded", "closed"] })
+      .notNull()
+      .default("active"),
     currentConversationScopeId: text("current_conversation_scope_id"),
     lineageVersion: integer("lineage_version").notNull().default(1),
     nextEventSeq: integer("next_event_seq").notNull().default(1),
@@ -83,14 +85,13 @@ export const taskSessionBindings = sqliteTable(
       .notNull()
       .references(() => taskSessions.id, { onDelete: "cascade" }),
     conversationScopeId: text("conversation_scope_id").notNull(),
-    state: text("state").notNull(),
+    state: text("state", { enum: ["current", "superseded", "abandoned"] }).notNull(),
     generation: integer("generation").notNull(),
     boundAt: text("bound_at").notNull(),
     supersededAt: text("superseded_at"),
   },
   (table) => [
     primaryKey({ columns: [table.taskSessionId, table.conversationScopeId] }),
-    index("task_session_bindings_task_idx").on(table.taskSessionId, table.generation),
     uniqueIndex("task_session_bindings_task_generation_idx").on(table.taskSessionId, table.generation),
     uniqueIndex("task_session_bindings_current_task_idx")
       .on(table.taskSessionId)

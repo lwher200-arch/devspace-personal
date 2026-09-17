@@ -33,11 +33,15 @@ The phase is intentionally limited to persistence and the transaction seam. It d
 
 Test-first contracts were added to `src/database-migrations.test.ts` and `src/task-session-store.test.ts` before or ahead of their matching production changes.
 
-A SQLite 3.46.1 proxy executed the exact Phase 1 table/index constraints and verified defaults, invalid-state CHECK rejection, one-current-task enforcement, permanent conversation ownership, workspace cascade, stale-source rejection, destination-owner rejection, retired-destination rejection, and rollback-preserved state. This is SQL/transaction contract evidence, not a substitute for executing the repository's TypeScript suite.
+A SQLite 3.46.1 proxy executed the exact Phase 1 table/index constraints and verified defaults, invalid-state CHECK rejection, one-current-task enforcement, permanent conversation ownership, workspace cascade, stale-source rejection, destination-owner rejection, retired-destination rejection, and rollback-preserved state.
+
+A second bounded verification pass used the actual `src/task-session-store.ts` and `src/db/migrations.ts` source from this branch. Global TypeScript transpilation reported zero syntax diagnostics. The store source was executed through a temporary Node 22 `node:sqlite` compatibility adapter: 6/6 behavior checks passed for create, atomic rebind, stale-source rollback, permanent cross-task conversation ownership, retired-conversation fencing, and first attachment of an unbound task. The migration source was executed through the same adapter: 5/5 checks passed for fresh/idempotent v8 migration, v7 preservation, incompatible-history refusal, rollback when the v8 journal write fails, and lineage/state constraints. A strict `tsc --noEmit` pass over the changed store and migration sources also exited successfully using minimal local declaration stubs for unavailable external packages.
+
+These proxy runs exercise the branch's production store/migration logic, but they are not a substitute for the repository's native `better-sqlite3`, `drizzle-orm`, `tsx`, full typecheck, build, or complete test suite. The adapter intentionally exists only outside the repository and was not committed.
 
 The repository's `codex/personal` baseline GitHub CI was already failing on all three OS jobs before this candidate. A temporary branch-only targeted workflow was tried, but GitHub returned jobs with no executed steps / no assigned runner, so those workflow failures are not treated as test failures or passes. The temporary workflow was removed from the candidate.
 
-The current execution environment cannot install the repository dependencies because registry DNS access fails, so `pnpm`, `tsx`, the targeted TypeScript tests, full typecheck, and build have not been executed for this candidate yet.
+The current execution environment cannot install the repository dependencies because DNS access to GitHub/npm is unavailable, and it contains no cached `better-sqlite3`, `drizzle-orm`, `tsx`, or `pnpm`. Therefore the native focused tests, repository-level typecheck, build, and full regression suite remain unexecuted for this candidate.
 
 ## Known Risks / Debt
 
@@ -45,8 +49,8 @@ The current execution environment cannot install the repository dependencies bec
 - The store is not connected to the MCP/server conversation lifecycle yet. No current production call creates or rebinds a task session.
 - No task event log exists yet; `next_event_seq` is reserved for Phase 2 and is intentionally unused.
 - No recovery/checkpoint layer exists yet. Rebind here is only the durable local attachment transaction, not cross-chat handoff orchestration.
-- Repository-level TypeScript compilation and tests remain unverified until an executable dependency environment or working hosted runner is available.
+- Native repository compilation and tests remain unverified until an executable dependency environment or working hosted runner is available.
 
 ## Next Highest-Leverage Step
 
-First execute the two focused test files and typecheck in a working repository environment. Fix any concrete compile/runtime failures without expanding scope. Once Phase 1 is green, Phase 2 should add an append-only `task_events` evidence journal with bounded inline payloads and existing artifact references. Do not implement auto-compact, Goal/Loop behavior, browser DOM control, or approval inheritance as part of that phase.
+Run `src/database-migrations.test.ts`, `src/task-session-store.test.ts`, `pnpm typecheck`, and the relevant database/workspace regressions in the real repository dependency environment. Fix only concrete failures. Phase 2 (`task_events` with bounded inline payloads and existing artifact references) should begin only after that native gate is green. Do not implement auto-compact, Goal/Loop behavior, browser DOM control, or approval inheritance as part of that phase.

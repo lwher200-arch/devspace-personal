@@ -99,6 +99,22 @@ test("a conversation already current for another task cannot be claimed", () => 
   } finally { ctx.close(); }
 });
 
+test("a conversation remains owned by its original task after it is superseded", () => {
+  const ctx = fixture();
+  try {
+    const first = ctx.store.create({ workspaceSessionId: "ws_fixture", conversationScopeId: "chat_a" });
+    ctx.store.rebind(first.id, "chat_a", "chat_b");
+    const second = ctx.store.create({ workspaceSessionId: "ws_fixture" });
+    assert.throws(
+      () => ctx.store.rebind(second.id, null, "chat_a"),
+      (error: unknown) => error instanceof TaskSessionConflictError && error.code === "DESTINATION_OWNED",
+    );
+    assert.equal(ctx.store.get(first.id)?.currentConversationScopeId, "chat_b");
+    assert.equal(ctx.store.get(second.id)?.currentConversationScopeId, undefined);
+    assert.equal(ctx.store.get(second.id)?.lineageVersion, 1);
+  } finally { ctx.close(); }
+});
+
 test("a superseded conversation cannot be revived into the same task", () => {
   const ctx = fixture();
   try {

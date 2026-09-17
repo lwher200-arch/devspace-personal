@@ -3,7 +3,23 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { runProjectCommand } from "./project-tools.js";
+import { projectToolCatalog, runProjectCommand } from "./project-tools.js";
+
+test("project read tools share one canonical MCP and CLI catalog", () => {
+  const contracts = projectToolCatalog.map(({ command, toolName }) => ({ command, toolName }));
+  assert.deepEqual(contracts, [
+    { command: "files", toolName: "project_files" },
+    { command: "search", toolName: "project_search" },
+    { command: "read", toolName: "project_read" },
+    { command: "read-batch", toolName: "project_read_batch" },
+  ]);
+  assert.equal(new Set(projectToolCatalog.map(tool => tool.command)).size, projectToolCatalog.length);
+  assert.equal(new Set(projectToolCatalog.map(tool => tool.toolName)).size, projectToolCatalog.length);
+  for (const tool of projectToolCatalog) {
+    assert.ok(tool.description.length > 0);
+    assert.ok(tool.inputSchema.shape);
+  }
+});
 
 test("CLI project commands provide a guarded workflow for hosts with cached old schemas", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-project-cli-"));

@@ -5,46 +5,101 @@ import { applyPatch } from "./apply-patch.js";
 import { resultOutputSchema, runLoggedToolOperation, textBlock } from "./tool-surfaces/shared.js";
 import { workspaceIdDescription, type ToolRegistrationContext } from "./tool-surfaces/types.js";
 
+type CliValues = Record<string, string | number | boolean>;
+
+type ProjectToolDefinition = {
+  command: "files" | "search" | "read" | "read-batch";
+  toolName: "project_files" | "project_search" | "project_read" | "project_read_batch";
+  description: string;
+  inputSchema: z.ZodObject;
+  cliInput(root: string, values: CliValues): Promise<unknown>;
+  execute(root: string, input: unknown): Promise<unknown>;
+};
+
+const discoveryInputSchema = z.object({
+  path: z.string().optional().describe("Workspace-relative directory. Defaults to the whole project; narrow it if coverage is incomplete."),
+  cursor: z.string().optional().describe("Opaque nextCursor from the same operation and scope; never invent or edit it."),
+  limit: z.number().int().min(1).max(100).optional(),
+  includeIgnored: z.boolean().optional().describe("Scan Git-ignored files too. Prefer a narrow path; dependency, credential and symlink exclusions still apply."),
+}).strict();
+
+const projectFilesInputSchema = discoveryInputSchema.extend({
+  limit: z.number().int().min(1).max(500).optional(),
+}).strict();
+
+const projectSearchInputSchema = discoveryInputSchema.extend({
+  query: z.string().min(1).max(1000),
+}).strict();
+
+const projectReadInputSchema = z.object({
+  path: z.string(),
+  offset: z.number().int().nonnegative().optional(),
+  limit: z.number().int().min(2).max(20000).optional(),
+  expectedSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+}).strict();
+
+const requestFileInputSchema = z.object({ requestFile: z.string() }).strict();
+const directCliInput = async (_root: string, values: CliValues): Promise<unknown> => values;
+
+export const projectToolCatalog: readonly ProjectToolDefinition[] = [
+  {
+    command: "files",
+    toolName: "project_files",
+    description: "List the complete eligible project file inventory in bounded pages, including untracked files. Follow nextCursor and check coverage.complete. Dependencies, generated output, likely credential filenames and junctions are excluded and reported. This lists paths, not file contents.",
+    inputSchema: projectFilesInputSchema,
+    cliInput: directCliInput,
+    execute: async (root, input) => projectFiles(root, projectFilesInputSchema.parse(input)),
+  },
+  {
+    command: "search",
+    toolName: "project_search",
+    description: "Search project UTF-8 text using a case-sensitive literal, not a shell or regex. Returns paths, line numbers and bounded snippets. Continue nextCursor even on empty pages; inspect skipped files and coverage before claiming complete coverage.",
+    inputSchema: projectSearchInputSchema,
+    cliInput: directCliInput,
+    execute: async (root, input) => projectSearch(root, projectSearchInputSchema.parse(input)),
+  },
+  {
+    command: "read",
+    toolName: "project_read",
+    description: "Read exact UTF-8 content in character pages with SHA-256, including very long lines. Follow nextOffset and supply expectedSha256 from the first page to detect changed files. Offset is a zero-based UTF-16 character position, not a line number. Read relevant project instructions first. Binary or over-8-MiB files require a format-specific reader. Use the hash with apply_patch expectedHashes for guarded edits.",
+    inputSchema: projectReadInputSchema,
+    cliInput: directCliInput,
+    execute: async (root, input) => projectRead(root, projectReadInputSchema.parse(input)),
+  },
+  {
+    command: "read-batch",
+    toolName: "project_read_batch",
+    description: "Read one to eight UTF-8 project files in request order using project_read character offsets and SHA-256. All paths are checked before any body is read. maxResultBytes bounds the complete result JSON in UTF-8, including metadata, escaping and continuation. Follow continuation.items with the supplied hashes; inspect per-item errors separately. Each file is observed separately, not an atomic snapshot. Read applicable project instructions first.",
+    inputSchema: projectReadBatchInputSchema,
+    cliInput: async (root, values) => {
+      const options = requestFileInputSchema.parse(values);
+      return readProjectRequest(root, options.requestFile);
+    },
+    execute: async (root, input) => projectReadBatch(root, projectReadBatchInputSchema.parse(input)),
+  },
+];
+
 export function registerProjectTools({ server, config, workspaces }: ToolRegistrationContext): void {
   const scope = { workspaceId: z.string().describe(workspaceIdDescription) };
-  const discovery = {
-    path: z.string().optional().describe("Workspace-relative directory. Defaults to the whole project; narrow it if coverage is incomplete."),
-    cursor: z.string().optional().describe("Opaque nextCursor from the same operation and scope; never invent or edit it."),
-    limit: z.number().int().min(1).max(100).optional(),
-    includeIgnored: z.boolean().optional().describe("Scan Git-ignored files too. Prefer a narrow path; dependency, credential and symlink exclusions still apply."),
-  };
   const response = async (name: string, workspaceId: string, action: (root: string) => Promise<unknown>) => {
     const data = await runLoggedToolOperation(config, { tool: name, workspaceId }, performance.now(),
       () => action(workspaces.getWorkspace(workspaceId).root));
     const result = JSON.stringify(data);
     return { content: [textBlock(result)], structuredContent: { result } };
   };
-  server.registerTool("project_files", {
-    description: "List the complete eligible project file inventory in bounded pages, including untracked files. Follow nextCursor and check coverage.complete. Dependencies, generated output, likely credential filenames and junctions are excluded and reported. This lists paths, not file contents.",
-    inputSchema: { ...scope, ...discovery, limit: z.number().int().min(1).max(500).optional() },
-    outputSchema: resultOutputSchema(), annotations: { readOnlyHint: true, openWorldHint: false },
-  }, ({ workspaceId, ...input }) => response("project_files", workspaceId, root => projectFiles(root, input)));
-  server.registerTool("project_search", {
-    description: "Search project UTF-8 text using a case-sensitive literal, not a shell or regex. Returns paths, line numbers and bounded snippets. Continue nextCursor even on empty pages; inspect skipped files and coverage before claiming complete coverage.",
-    inputSchema: { ...scope, ...discovery, query: z.string().min(1).max(1000) },
-    outputSchema: resultOutputSchema(), annotations: { readOnlyHint: true, openWorldHint: false },
-  }, ({ workspaceId, ...input }) => response("project_search", workspaceId, root => projectSearch(root, input)));
-  server.registerTool("project_read", {
-    description: "Read exact UTF-8 content in character pages with SHA-256, including very long lines. Follow nextOffset and supply expectedSha256 from the first page to detect changed files. Offset is a zero-based UTF-16 character position, not a line number. Read relevant project instructions first. Binary or over-8-MiB files require a format-specific reader. Use the hash with apply_patch expectedHashes for guarded edits.",
-    inputSchema: { ...scope, path: z.string(), offset: z.number().int().nonnegative().optional(),
-      limit: z.number().int().min(2).max(20000).optional(), expectedSha256: z.string().regex(/^[a-f0-9]{64}$/).optional() },
-    outputSchema: resultOutputSchema(), annotations: { readOnlyHint: true, openWorldHint: false },
-  }, ({ workspaceId, ...input }) => response("project_read", workspaceId, root => projectRead(root, input)));
-  server.registerTool("project_read_batch", {
-    description: "Read one to eight UTF-8 project files in request order using project_read character offsets and SHA-256. All paths are checked before any body is read. maxResultBytes bounds the complete result JSON in UTF-8, including metadata, escaping and continuation. Follow continuation.items with the supplied hashes; inspect per-item errors separately. Each file is observed separately, not an atomic snapshot. Read applicable project instructions first.",
-    inputSchema: { ...scope, ...projectReadBatchInputSchema.shape },
-    outputSchema: resultOutputSchema(), annotations: { readOnlyHint: true, openWorldHint: false },
-  }, ({ workspaceId, ...input }) => response("project_read_batch", workspaceId, root => projectReadBatch(root, input)));
+  for (const tool of projectToolCatalog) {
+    server.registerTool(tool.toolName, {
+      description: tool.description,
+      inputSchema: { ...scope, ...tool.inputSchema.shape },
+      outputSchema: resultOutputSchema(),
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    }, ({ workspaceId, ...input }) => response(tool.toolName, workspaceId, root => tool.execute(root, input)));
+  }
 }
 
 export async function runProjectCommand(root: string, args: string[]): Promise<unknown> {
   const [command, ...flags] = args;
-  const values: Record<string, string | number | boolean> = {};
+  const values: CliValues = {};
   const names: Record<string, string> = { "--path": "path", "--query": "query", "--cursor": "cursor",
     "--offset": "offset", "--limit": "limit", "--expected-sha256": "expectedSha256", "--request-file": "requestFile" };
   for (let i = 0; i < flags.length; i++) {
@@ -56,15 +111,8 @@ export async function runProjectCommand(root: string, args: string[]): Promise<u
     const value = flags[++i];
     values[key] = key === "limit" || key === "offset" ? Number(value) : value;
   }
-  const discovery = z.object({ path: z.string().optional(), cursor: z.string().optional(), limit: z.number().optional(), includeIgnored: z.boolean().optional() });
-  if (command === "files") return projectFiles(root, discovery.strict().parse(values));
-  if (command === "search") return projectSearch(root, discovery.extend({ query: z.string() }).strict().parse(values));
-  if (command === "read") return projectRead(root, z.object({ path: z.string(), offset: z.number().optional(),
-    limit: z.number().optional(), expectedSha256: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().parse(values));
-  if (command === "read-batch") {
-    const options = z.object({ requestFile: z.string() }).strict().parse(values);
-    return projectReadBatch(root, projectReadBatchInputSchema.parse(await readProjectRequest(root, options.requestFile)));
-  }
+  const tool = projectToolCatalog.find((tool) => tool.command === command);
+  if (tool) return tool.execute(root, await tool.cliInput(root, values));
   if (command === "patch") {
     const options = z.object({ requestFile: z.string(), dryRun: z.boolean().optional() }).strict().parse(values);
     const request = z.object({ patch: z.string().min(1), expectedHashes: z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/).nullable()) })

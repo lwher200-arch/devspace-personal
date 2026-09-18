@@ -6,6 +6,7 @@ on:
       - main
       - codex/personal
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,7 +19,7 @@ jobs:
   smoke:
     name: Smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -34,12 +35,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup pnpm and Node
-        uses: pnpm/setup@84cb39b217b10273981911c288cd62326dc7c6d2 # v2
+      - name: Setup Node 22.19
+        uses: actions/setup-node@v4
         with:
-          runtime: node@22
-          cache: true
-          install: false
+          node-version: 22.19.0
+
+      - name: Install pinned pnpm
+        run: npm install --global pnpm@11.25.0
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -53,28 +55,16 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
 
-      - name: Typecheck
-        run: pnpm typecheck
-
-      - name: Documentation contracts
-        run: pnpm test:docs
-
-      - name: Test
+      - name: Verify source contracts
         env:
           DEVSPACE_REQUIRE_PI_SANDBOX: ${{ matrix.os == 'ubuntu-latest' && '1' || '0' }}
-        run: pnpm test
-
-      - name: Deployment contracts
-        run: pnpm test:deploy
+        run: pnpm verify
 
       - name: Browser authorization contracts
         if: matrix.os == 'windows-latest'
         env:
           DEVSPACE_TEST_BROWSER: C:\Program Files\Google\Chrome\Application\chrome.exe
         run: pnpm exec tsx --test src/oauth-redirect.browser.test.ts src/mcp-authorization.browser.test.ts src/ui/approval-card.browser.test.ts
-
-      - name: Build
-        run: pnpm build
 
       - name: Built ChatGPT approval UI
         if: matrix.os == 'windows-latest'
@@ -85,3 +75,35 @@ jobs:
 
       - name: Doctor
         run: node dist/cli.js doctor
+
+  runtime-compat:
+    name: Runtime compatibility (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - '24'
+          - '26'
+
+    env:
+      DEVSPACE_OAUTH_OWNER_TOKEN: ci-owner-token-that-is-long-enough
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install pinned pnpm
+        run: npm install --global pnpm@11.25.0
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify declared runtime range
+        run: pnpm verify

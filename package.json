@@ -38,7 +38,8 @@
     "test:deploy": "node --test scripts/deploy.test.mjs scripts/package-privacy.test.mjs",
     "test:docs": "node --test scripts/check-documentation.test.mjs && node scripts/check-documentation.mjs",
     "deploy:local": "node scripts/deploy.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify": "pnpm typecheck && pnpm test:docs && pnpm test && pnpm test:deploy && pnpm build"
   },
   "keywords": [],
   "author": "",

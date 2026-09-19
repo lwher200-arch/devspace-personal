@@ -7,6 +7,10 @@ import { promisify } from "node:util";
 import { assertAllowedPath, canonicalAllowedPath, PRIVATE_CREDENTIAL_DIRECTORIES } from "./roots.js";
 
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_INVENTORY_CACHE_ENTRIES = 8;
+const MAX_INVENTORY_CACHE_FILES = 20_000;
+const MAX_TEXT_CACHE_ENTRIES = 32;
+const MAX_TEXT_CACHE_BYTES = 32 * 1024 * 1024;
 const SKIP_DIRS = new Set([
   ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
   ".pytest_cache", ".mypy_cache", ".ruff_cache", ".next", ".vs", ".claude",
@@ -18,8 +22,122 @@ type Skip = { path: string; reason: string };
 type Coverage = { complete: boolean; source: "git" | "filesystem"; fallbackReason?: string; visited: number; skippedCount: number; skipped: Skip[]; exclusions: string[] };
 type ScopeInput = { path?: string; cursor?: string; limit?: number; includeIgnored?: boolean };
 type Cursor = { version: number; scope: string; snapshot: string; index: number; line?: number; fileHash?: string };
+type InventoryCatalog = { files: string[]; coverage: Coverage; snapshot: string; scope: string };
+type InventoryCacheEntry = {
+  catalog: InventoryCatalog;
+  gitSignature?: string;
+  directoryStamps: Map<string, string>;
+};
+type TextBody = { text: string; sha256: string; bytes: number };
+type TextCacheEntry = { body: TextBody; stamp: string; cost: number };
+
+const inventoryCache = new Map<string, InventoryCacheEntry>();
+const textCache = new Map<string, TextCacheEntry>();
+let textCacheBytes = 0;
+const diagnostics = {
+  inventoryBuilds: 0,
+  inventoryCacheHits: 0,
+  textBodyReads: 0,
+  textCacheHits: 0,
+};
+
+export const projectAccessDiagnosticsForTest = {
+  reset(): void {
+    inventoryCache.clear();
+    textCache.clear();
+    textCacheBytes = 0;
+    diagnostics.inventoryBuilds = 0;
+    diagnostics.inventoryCacheHits = 0;
+    diagnostics.textBodyReads = 0;
+    diagnostics.textCacheHits = 0;
+  },
+  snapshot() {
+    return { ...diagnostics };
+  },
+};
 
 function hash(value: string | Buffer): string { return createHash("sha256").update(value).digest("hex"); }
+async function pathStamp(path: string): Promise<string> {
+  const metadata = await stat(path, { bigint: true });
+  return [
+    metadata.dev,
+    metadata.ino,
+    metadata.mode,
+    metadata.size,
+    metadata.mtimeNs,
+    metadata.ctimeNs,
+  ].join(":");
+}
+function touch<K, V>(cache: Map<K, V>, key: K, value: V): void {
+  cache.delete(key);
+  cache.set(key, value);
+}
+function inventoryCacheKey(root: string, scope: string, includeIgnored: boolean): string {
+  return JSON.stringify([canonicalAllowedPath(root), scope, includeIgnored]);
+}
+async function directoryStamps(paths: Iterable<string>): Promise<Map<string, string> | undefined> {
+  const result = new Map<string, string>();
+  try {
+    for (const path of paths) result.set(path, await pathStamp(path));
+    return result;
+  } catch {
+    return undefined;
+  }
+}
+async function gitCandidates(root: string): Promise<{ candidates?: string[]; signature?: string; fallbackReason?: string }> {
+  try {
+    const git = promisify(execFile);
+    const options = { cwd: root, encoding: "utf8" as const, timeout: 8000, maxBuffer: 16 * 1024 * 1024, windowsHide: true };
+    const top = (await git("git", ["rev-parse", "--show-toplevel"], options)).stdout.trim();
+    if (canonicalAllowedPath(top) !== canonicalAllowedPath(root)) return {};
+    const stdout = (await git("git", ["ls-files", "--cached", "--others", "--exclude-standard", "--deduplicate", "-z"], options)).stdout;
+    return { candidates: stdout.split("\0").filter(Boolean), signature: hash(stdout) };
+  } catch (error) {
+    const message = (error as { stderr?: string }).stderr || (error as Error).message;
+    return { fallbackReason: message.split("\n")[0].slice(0, 240) };
+  }
+}
+async function validInventoryCache(entry: InventoryCacheEntry, root: string): Promise<boolean> {
+  if (entry.gitSignature !== undefined) {
+    const current = await gitCandidates(root);
+    if (current.signature !== entry.gitSignature) return false;
+  }
+  for (const [path, stamp] of entry.directoryStamps) {
+    try {
+      if (await pathStamp(path) !== stamp) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+function storeInventoryCache(key: string, entry: InventoryCacheEntry): void {
+  if (!entry.catalog.coverage.complete || entry.catalog.files.length > MAX_INVENTORY_CACHE_FILES) return;
+  touch(inventoryCache, key, entry);
+  while (inventoryCache.size > MAX_INVENTORY_CACHE_ENTRIES) {
+    const oldest = inventoryCache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    inventoryCache.delete(oldest);
+  }
+}
+function deleteTextCache(key: string): void {
+  const existing = textCache.get(key);
+  if (!existing) return;
+  textCache.delete(key);
+  textCacheBytes = Math.max(0, textCacheBytes - existing.cost);
+}
+function storeTextCache(key: string, body: TextBody, stamp: string): void {
+  deleteTextCache(key);
+  const cost = body.bytes + body.text.length * 2;
+  if (cost > MAX_TEXT_CACHE_BYTES) return;
+  textCache.set(key, { body, stamp, cost });
+  textCacheBytes += cost;
+  while (textCache.size > MAX_TEXT_CACHE_ENTRIES || textCacheBytes > MAX_TEXT_CACHE_BYTES) {
+    const oldest = textCache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    deleteTextCache(oldest);
+  }
+}
 function bounded(value: number | undefined, fallback: number, max: number, min = 1): number {
   const result = value ?? fallback;
   if (!Number.isSafeInteger(result) || result < min || result > max) throw new Error(`Expected integer between ${min} and ${max}.`);
@@ -52,24 +170,27 @@ async function inventory(root: string, path = ".", includeIgnored = false) {
   const safe = guard(root);
   const scope = safe(path);
   if (!(await stat(scope)).isDirectory()) throw new Error("Project discovery path must be a directory.");
+  const cacheKey = inventoryCacheKey(root, scope, includeIgnored);
+  const cached = inventoryCache.get(cacheKey);
+  if (cached) {
+    if (await validInventoryCache(cached, root)) {
+      diagnostics.inventoryCacheHits++;
+      touch(inventoryCache, cacheKey, cached);
+      return cached.catalog;
+    }
+    inventoryCache.delete(cacheKey);
+  }
+  diagnostics.inventoryBuilds++;
   const files: string[] = [];
+  const observedDirectories = new Set<string>([scope]);
   const coverage: Coverage = { complete: true, source: "filesystem", visited: 0, skippedCount: 0, skipped: [],
     exclusions: [...SKIP_DIRS, "root logs/outputs", "likely credential filenames", "symlinks/junctions"] };
   const prefix = relative(canonicalAllowedPath(root), scope).replace(/\\/g, "/");
   const explicitlyExcludedScope = prefix.split("/").some(part => SKIP_DIRS.has(part.toLowerCase()) || SKIP_ROOT_DIRS.has(part));
   if (!includeIgnored && !explicitlyExcludedScope) {
-    let candidates: string[] | undefined;
-    try {
-      const git = promisify(execFile);
-      const options = { cwd: root, encoding: "utf8" as const, timeout: 8000, maxBuffer: 16 * 1024 * 1024, windowsHide: true };
-      const top = (await git("git", ["rev-parse", "--show-toplevel"], options)).stdout.trim();
-      if (canonicalAllowedPath(top) === canonicalAllowedPath(root)) {
-        candidates = (await git("git", ["ls-files", "--cached", "--others", "--exclude-standard", "--deduplicate", "-z"], options)).stdout.split("\0").filter(Boolean);
-      }
-    } catch (error) {
-      const message = (error as { stderr?: string }).stderr || (error as Error).message;
-      coverage.fallbackReason = message.split("\n")[0].slice(0, 240);
-    }
+    const gitInventory = await gitCandidates(root);
+    const candidates = gitInventory.candidates;
+    coverage.fallbackReason = gitInventory.fallbackReason;
     if (candidates) {
       coverage.source = "git";
       coverage.exclusions.push("Git-ignored untracked files (use includeIgnored on a narrow path when needed)");
@@ -90,6 +211,7 @@ async function inventory(root: string, path = ".", includeIgnored = false) {
             if (!safeDirectories.has(directory)) {
               const metadata = lstatSync(join(root, directory));
               safeDirectories.set(directory, metadata.isDirectory() && !metadata.isSymbolicLink());
+              if (safeDirectories.get(directory)) observedDirectories.add(canonicalAllowedPath(join(root, directory)));
             }
             if (!safeDirectories.get(directory)) { valid = false; break; }
           }
@@ -105,7 +227,10 @@ async function inventory(root: string, path = ".", includeIgnored = false) {
       }
       safe(path);
       files.sort();
-      return { files, coverage, snapshot: hash(JSON.stringify([scope, files])), scope };
+      const catalog = { files, coverage, snapshot: hash(JSON.stringify([scope, files])), scope };
+      const stamps = await directoryStamps(observedDirectories);
+      if (stamps) storeInventoryCache(cacheKey, { catalog, gitSignature: gitInventory.signature, directoryStamps: stamps });
+      return catalog;
     }
   }
   const deadline = Date.now() + 10000;
@@ -114,7 +239,9 @@ async function inventory(root: string, path = ".", includeIgnored = false) {
     if (coverage.visited >= 100000 || Date.now() >= deadline) { coverage.complete = false; break; }
     const directory = pending.pop()!;
     try {
-      for await (const entry of await opendir(safe(directory))) {
+      const absoluteDirectory = safe(directory);
+      observedDirectories.add(absoluteDirectory);
+      for await (const entry of await opendir(absoluteDirectory)) {
         if (++coverage.visited > 100000 || Date.now() >= deadline) { coverage.complete = false; break; }
         const name = relative(resolve(root), resolve(root, directory, entry.name)).replace(/\\/g, "/");
         if (entry.isSymbolicLink()) { skip(coverage, name, "symlink"); continue; }
@@ -134,7 +261,10 @@ async function inventory(root: string, path = ".", includeIgnored = false) {
   }
   safe(path);
   files.sort();
-  return { files, coverage, snapshot: hash(JSON.stringify([scope, files])), scope };
+  const catalog = { files, coverage, snapshot: hash(JSON.stringify([scope, files])), scope };
+  const stamps = await directoryStamps(observedDirectories);
+  if (stamps) storeInventoryCache(cacheKey, { catalog, directoryStamps: stamps });
+  return catalog;
 }
 function encode(cursor: Cursor): string { return Buffer.from(JSON.stringify(cursor)).toString("base64url"); }
 function decode(value: string | undefined, scope: string, snapshot: string): Cursor {
@@ -173,8 +303,22 @@ export async function projectFiles(root: string, input: ScopeInput) {
 async function readText(root: string, path: string) {
   const safe = guard(root);
   const absolute = safe(path);
+  const cached = textCache.get(absolute);
+  if (cached) {
+    try {
+      if (safe(path) === absolute && await pathStamp(absolute) === cached.stamp) {
+        diagnostics.textCacheHits++;
+        touch(textCache, absolute, cached);
+        return cached.body;
+      }
+    } catch {
+      // Fall through to the guarded full read below.
+    }
+    deleteTextCache(absolute);
+  }
   const handle = await open(absolute, "r");
   try {
+    diagnostics.textBodyReads++;
     const before = await handle.stat();
     if (!before.isFile()) throw new Error("Not a regular file.");
     if (before.size > MAX_FILE_BYTES) throw new Error("File exceeds the 8 MiB text limit; use a format-specific bounded reader.");
@@ -193,7 +337,9 @@ async function readText(root: string, path: string) {
     let text: string;
     try { text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); }
     catch { throw new Error("File is not valid UTF-8 text; use a format-specific reader."); }
-    return { text, sha256: hash(bytes), bytes: count };
+    const body = { text, sha256: hash(bytes), bytes: count };
+    storeTextCache(absolute, body, await pathStamp(absolute));
+    return body;
   } finally { await handle.close(); }
 }
 

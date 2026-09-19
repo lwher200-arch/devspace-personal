@@ -49,7 +49,9 @@ test('options and runtime versions are explicit and bounded',()=>{
   assert.throws(()=>parseOptions(['--check','--rebuild']),/combined/);
   assert.equal(parseOptions(['--config-dir','folder with spaces']).configDir,resolve('folder with spaces'));
   assert.equal(parseOptions(['--config-dir','~/private-config']).configDir,join(homedir(),'private-config'));
-  assert.throws(()=>parseOptions(['--prepare-only','--no-start']),/not both/);
+  assert.throws(()=>parseOptions(['--check','--candidate-only']),/combined/);
+  assert.throws(()=>parseOptions(['--candidate-only','--prepare-only']),/only one/);
+  assert.throws(()=>parseOptions(['--prepare-only','--no-start']),/only one/);
 });
 
 test('dependency preflight supports import-only package exports in the target checkout',async t=>{
@@ -74,11 +76,24 @@ test('check mode performs no initialization, migration or file writes',async t=>
   assert.deepEqual(readdirSync(root).sort(),before);
 });
 
+test('candidate-only bypasses runtime configuration and leaves dist untouched',async t=>{
+  const root=fixture(t);built(root);writeFileSync(join(root,'dist/old.txt'),'old-build');const configDir=configured(root);
+  const candidate=join(root,'.runtime','candidate-fixture');let buildOptions;
+  const result=await deploy(parseOptions(['--candidate-only','--yes','--config-dir',configDir]),effects(root,{
+    load:async()=>{throw Error('candidate-only must not load runtime configuration');},
+    busy:async()=>{throw Error('candidate-only must not inspect the running service port');},
+    prepare:async(_r,_p,_e,_run,_verify,_before,options)=>{buildOptions=options;mkdirSync(candidate,{recursive:true});return {candidate};},
+  }));
+  assert.equal(result.status,'candidate');assert.equal(result.candidate,candidate);assert.deepEqual(buildOptions,{promote:false});
+  assert.equal(readFileSync(join(root,'dist/old.txt'),'utf8'),'old-build');
+  assert.equal(existsSync(join(root,'.devspace-deploy.lock')),false);
+});
+
 test('existing configuration and credentials survive reuse byte-for-byte',async t=>{
   const root=fixture(t); built(root); const configDir=configured(root);
   const before=['config.jsonc','auth.json'].map(f=>readFileSync(join(configDir,f),'utf8'));
   let starts=0;
-  await deploy(parseOptions(['--config-dir',configDir]),effects(root,{start:async(_r,env)=>{assert.equal(env.KEEP,'original');assert.equal(env.CODEX_COMMAND,'unchanged');starts++;return {status:'stopped'};}}));
+  await deploy(parseOptions(['--config-dir',configDir]),effects(root,{start:async(_r,env)=>{assert.equal(env.KEEP,'original');assert.equal(env.CODEX_COMMAND,'unchanged');assert.equal(env.DEVSPACE_SOURCE_FINGERPRINT,sourceFingerprint(root));starts++;return {status:'stopped'};}}));
   assert.equal(starts,1);assert.deepEqual(['config.jsonc','auth.json'].map(f=>readFileSync(join(configDir,f),'utf8')),before);
   assert.equal(existsSync(join(root,'.devspace-deploy.lock')),false);
 });
@@ -170,13 +185,25 @@ test('failed build retains old dist, successful candidate has a rollback directo
   const root=fixture(t);built(root);writeFileSync(join(root,'dist/old.txt'),'old-build');
   await assert.rejects(buildCandidate(root,'pnpm@11.25.0',{},async()=>{throw Error('install failed')},async()=>{}),/install failed/);
   assert.equal(readFileSync(join(root,'dist/old.txt'),'utf8'),'old-build');
-  const result=await buildCandidate(root,'pnpm@11.25.0',{},async(_cmd,args)=>{
+  let installArgs;
+  const fakeBuild=async(_cmd,args)=>{
+    if(args.includes('install')&&args.includes('--frozen-lockfile')) installArgs??=args;
     if (args.includes('--outDir')) {
       const output=args[args.indexOf('--outDir')+1];
       if (args.includes('build')) {mkdirSync(join(output,'.vite'),{recursive:true});writeFileSync(join(output,'.vite/manifest.json'),'{}');}
       else for(const file of required.filter(f=>!f.startsWith('ui/'))) writeFileSync(join(output,file),'// built');
     }
-  },async()=>{});
+  };
+  const isolated=await buildCandidate(root,'pnpm@11.25.0',{},fakeBuild,async()=>{},async()=>{throw Error('must not promote');},{promote:false});
+  assert.equal(readFileSync(join(root,'dist/old.txt'),'utf8'),'old-build');
+  assert.ok(installArgs);
+  const storeIndex=installArgs.indexOf('--store-dir');
+  assert.ok(storeIndex>=0);
+  assert.equal(installArgs[storeIndex+1],join(root,'.runtime','pnpm-store'));
+  assert.equal(existsSync(join(root,'.runtime','pnpm-store')),true);
+  assert.ok(isolated.candidate.startsWith(join(root,'.runtime')));
+  assert.equal(JSON.parse(readFileSync(join(isolated.candidate,'.deploy-manifest.json'),'utf8')).fingerprint,sourceFingerprint(root));
+  const result=await buildCandidate(root,'pnpm@11.25.0',{},fakeBuild,async()=>{});
   assert.equal(readFileSync(join(result.backup,'old.txt'),'utf8'),'old-build');
   assert.equal(existsSync(join(root,'dist/old.txt')),false);
   assert.equal(JSON.parse(readFileSync(join(root,'dist/.deploy-manifest.json'),'utf8')).fingerprint,sourceFingerprint(root));
@@ -192,10 +219,19 @@ test('actual occupied TCP endpoint is detected without terminating it',async()=>
 test('owned service requires IPC readiness and stops only its child',async t=>{
   const root=fixture(t);
   const reserve=createServer();await new Promise(r=>reserve.listen(0,'127.0.0.1',r));const port=reserve.address().port;await new Promise(r=>reserve.close(r));
-  writeFileSync(join(root,'scripts/local-server.mjs'),`import http from 'node:http';const s=http.createServer((q,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify({ok:true,name:'devspace'}))});s.listen(${port},'127.0.0.1',()=>process.send({type:'devspace.ready',host:'127.0.0.1',port:${port}}));process.on('message',()=>s.close(()=>process.exit(0)));`);
+  writeFileSync(join(root,'scripts/local-server.mjs'),`import http from 'node:http';const f=process.env.DEVSPACE_SOURCE_FINGERPRINT;const s=http.createServer((q,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify(q.url==='/runtimez'?{ok:true,name:'devspace',freshness:'verified',buildFingerprint:f,startupSourceFingerprint:f}:{ok:true,name:'devspace'}))});s.listen(${port},'127.0.0.1',()=>process.send({type:'devspace.ready',host:'127.0.0.1',port:${port}}));process.on('message',()=>s.close(()=>process.exit(0)));`);
   const controller=new AbortController();let ready=false;
-  const result=await startOwnedService(root,process.env,{host:'127.0.0.1',port},{say:line=>{if(line.startsWith('[5/5]')){ready=true;controller.abort();}},signal:controller.signal,timeoutMs:5000});
+  const env={...process.env,DEVSPACE_SOURCE_FINGERPRINT:'a'.repeat(64)};
+  const result=await startOwnedService(root,env,{host:'127.0.0.1',port},{say:line=>{if(line.startsWith('[5/5]')){ready=true;controller.abort();}},signal:controller.signal,timeoutMs:5000});
   assert.ok(ready);assert.equal(result.status,'stopped');assert.equal(await portBusy({host:'127.0.0.1',port}),false);
+});
+
+test('owned service rejects a runtime build identity mismatch',async t=>{
+  const root=fixture(t);
+  const reserve=createServer();await new Promise(r=>reserve.listen(0,'127.0.0.1',r));const port=reserve.address().port;await new Promise(r=>reserve.close(r));
+  writeFileSync(join(root,'scripts/local-server.mjs'),`import http from 'node:http';const s=http.createServer((q,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify(q.url==='/runtimez'?{ok:false,name:'devspace',freshness:'mismatch',buildFingerprint:'${'b'.repeat(64)}',startupSourceFingerprint:process.env.DEVSPACE_SOURCE_FINGERPRINT}:{ok:true,name:'devspace'}))});s.listen(${port},'127.0.0.1',()=>process.send({type:'devspace.ready',host:'127.0.0.1',port:${port}}));process.on('message',()=>s.close(()=>process.exit(0)));`);
+  await assert.rejects(startOwnedService(root,{...process.env,DEVSPACE_SOURCE_FINGERPRINT:'a'.repeat(64)},{host:'127.0.0.1',port},{timeoutMs:5000}),/runtime build identity/);
+  assert.equal(await portBusy({host:'127.0.0.1',port}),false);
 });
 
 test('startup failure and readiness timeout never report ready',async t=>{

@@ -8,10 +8,14 @@ import test from 'node:test';
 import { Result } from 'better-result';
 import { CodexBridge } from './codex-bridge.js';
 import type { LocalAgentRecord } from './local-agent-store.js';
-import { OwnerApprovals, classifyMcpOperation } from './mcp-authorization.js';
+import { OwnerApprovals, approvalPrincipal, classifyMcpOperation } from './mcp-authorization.js';
+import { REVIEW_APPROVAL_CENTER_COMPAT_ID, REVIEW_APPROVAL_CLAIM_COMPAT_PREFIX } from './approval-protocol.js';
 import { createServer } from './server.js';
 import { loadConfig } from './config.js';
 import { writeTestDevspaceConfig } from './test-support/config.test.js';
+import { WorkspaceLeaseStore } from './workspace-lease/workspace-lease.js';
+import { A2_WORKSPACE_LEASE_POLICY_VERSION } from './workspace-lease/workspace-lease-runtime.js';
+import type { WorkspaceExecutionBoundary } from './workspace-execution-boundary.js';
 
 const owner = 'fixture-only-owner-password-long-enough';
 const operation = { principal: 'client:session', tool: 'exec_command', args: { cmd: 'echo ok' }, context: { root: 'fixture' }, reason: 'shell' };
@@ -34,6 +38,17 @@ test('Chat approval requires a private UI capability bound to the exact principa
   assert.equal(store.require(operation).allowed, false, 'UI approval remains single-use');
   now = 101;
   assert.throws(() => store.reviewUi(other.approval.id, operation.principal), /unavailable/);
+});
+
+test('approval center groups only the current principal and exposes pending decision capabilities privately', () => {
+  const store = new OwnerApprovals(() => 0, 1000);
+  const first = store.require(operation); if (first.allowed) throw Error('unexpected');
+  const second = store.require({ ...operation, args: { cmd: 'echo two' } }); if (second.allowed) throw Error('unexpected');
+  store.require({ ...operation, principal: 'other-principal', args: { cmd: 'echo foreign' } });
+  const center = store.reviewConversationUi(operation.principal);
+  assert.equal(center.approvals.length, 2);
+  assert.ok(center.approvals.every(view => view.state !== 'pending' || Boolean(view.decisionToken)));
+  assert.equal(center.approvals.some(view => view.args.cmd === 'echo foreign'), false);
 });
 
 test('Codex approval submits once without a Chat retry and retains a scoped receipt', async () => {
@@ -97,10 +112,165 @@ test('approval is principal/argument/context bound, single-use, bounded and fail
   const request = store.require(operation); if (request.allowed) throw Error('unexpected');
   assert.equal(store.decide(request.approval.id, store.challenge(request.approval.id), owner, owner, false), true);
   const denied = store.require(operation); assert.equal(denied.allowed, false);
-  if (!denied.allowed) assert.equal(denied.approval.state, 'denied');
+  if (!denied.allowed) {
+    assert.equal(denied.approval.state, 'denied');
+    assert.throws(() => store.prepareRelaunch(denied.approval.id, 'other-principal'), /unavailable/);
+    assert.equal(store.prepareRelaunch(denied.approval.id, operation.principal).state, 'denied');
+    const relaunched = store.require(operation); assert.equal(relaunched.allowed, false);
+    if (!relaunched.allowed) {
+      assert.equal(relaunched.approval.state, 'pending');
+      assert.notEqual(relaunched.approval.id, denied.approval.id, 'relaunch creates a fresh decision record instead of rewriting denial');
+    }
+  }
   store.clear(); assert.equal(store.require(operation).allowed, false);
   for (let i=0;i<19;i++) store.require({ ...operation, args: { cmd: String(i) } });
   assert.throws(() => store.require({ ...operation, args: { cmd: 'overflow' } }), /Too many/);
+});
+
+test('conversation approval leases are narrow, principal-bound, fixed-lifetime and revocable', () => {
+  let now = 0;
+  const store = new OwnerApprovals(() => now, 1000);
+  const review = { principal: 'client:chat', tool: 'show_changes', args: { workspaceId: 'ws-fixture' },
+    context: { root: '/fixture', targets: [] }, reason: 'review' };
+  const pending = store.require(review); if (pending.allowed) throw Error('unexpected');
+  const view = store.reviewUi(pending.approval.id, review.principal);
+  assert.equal(view.conversationLease?.scope, 'safe reviews/worktrees in this project');
+  assert.deepEqual(view.conversationLease?.scopes, ['safe reviews/worktrees in this project', 'worktrees from this project']);
+  const decided = store.decideUiForConversation(view.id, review.principal, view.decisionToken!);
+  assert.equal(decided.state, 'approved');
+  assert.equal(decided.conversationLease?.expiresAt, new Date(1000).toISOString());
+  assert.equal(store.require(review).allowed, true, 'the exact reviewed request keeps its single-use grant');
+  const repeated = store.require(review); assert.equal(repeated.allowed, true);
+  if (!repeated.allowed) throw Error('expected lease');
+  assert.equal(repeated.source, 'conversation_lease');
+  assert.equal(store.require({ ...review, principal: 'client:other-chat' }).allowed, false);
+  assert.equal(store.require({ ...review, args: { workspaceId: 'ws-other' }, context: { root: '/other', targets: [] } }).allowed, false);
+  assert.equal(store.revokeConversationLeases(review.principal), 2, 'review approval creates only safe project review/worktree scopes');
+  assert.equal(store.require(review).allowed, false, 'revocation restores normal approval');
+
+  const native = { principal: 'client:chat', tool: 'run_process',
+    args: { workspaceId: 'ws-fixture', executable: 'node', args: ['--version'], workingDirectory: '.' },
+    context: { root: '/fixture', targets: [] }, reason: 'native' };
+  const nativePending = store.require(native); if (nativePending.allowed) throw Error('unexpected');
+  const nativeView = store.reviewUi(nativePending.approval.id, native.principal);
+  store.decideUiForConversation(nativeView.id, native.principal, nativeView.decisionToken!);
+  assert.equal(store.require(native).allowed, true);
+  assert.equal(store.require(native).allowed, true);
+  assert.equal(store.require({ ...native, args: { ...native.args, args: ['-p', 'process.version'] } }).allowed, false,
+    'native leases require the complete argument set to remain exact');
+
+  const host = { principal: 'client:host-chat', tool: 'host_command',
+    args: { workspaceId: 'ws-fixture', command: 'systemctl --user status fixture', workingDirectory: '.' },
+    context: { root: '/fixture', targets: [] }, reason: 'host maintenance' };
+  const hostPending = store.require(host); if (hostPending.allowed) throw Error('unexpected');
+  const hostView = store.reviewUi(hostPending.approval.id, host.principal);
+  assert.equal(hostView.conversationLease?.scope, 'this exact host maintenance command request');
+  store.decideUiForConversation(hostView.id, host.principal, hostView.decisionToken!);
+  assert.equal(store.require(host).allowed, true, 'the exact host command keeps its one exact grant');
+  const repeatedHost = store.require(host); assert.equal(repeatedHost.allowed, true);
+  if (!repeatedHost.allowed) throw Error('expected exact host command lease');
+  assert.equal(repeatedHost.source, 'conversation_lease');
+  assert.equal(store.require({ ...host, args: { ...host.args, command: 'systemctl --user restart fixture' } }).allowed, false,
+    'host command leases never broaden command text');
+
+  const shellPending = store.require(operation); if (shellPending.allowed) throw Error('unexpected');
+  const shellView = store.reviewUi(shellPending.approval.id, operation.principal);
+  assert.equal(shellView.conversationLease?.scope, 'this exact shell command request');
+  assert.deepEqual(shellView.conversationLease?.scopes, [
+    'this exact shell command request', 'safe reviews/worktrees in this project', 'worktrees from this project',
+  ]);
+  store.decideUiForConversation(shellView.id, operation.principal, shellView.decisionToken!);
+  assert.equal(store.require(operation).allowed, true, 'the explicitly approved shell keeps its one exact grant');
+  const repeatedShell = store.require(operation); assert.equal(repeatedShell.allowed, true, 'the same exact shell request may reuse the bounded conversation lease');
+  if (!repeatedShell.allowed) throw Error('expected exact shell lease');
+  assert.equal(repeatedShell.source, 'conversation_lease');
+  const safeReview = store.require({ ...review, principal: operation.principal, context: { root: 'fixture', targets: [] } });
+  assert.equal(safeReview.allowed, true, 'the same click may still lease safe review/worktree operations for the project');
+  if (!safeReview.allowed) throw Error('expected safe project lease');
+  assert.equal(safeReview.source, 'conversation_lease');
+  assert.equal(store.require({ ...operation, args: { cmd: 'different' } }).allowed, false, 'the shell lease never broadens command arguments');
+
+  const claudeShell = { ...operation, principal: 'client:claude', tool: 'bash', args: { command: 'echo ok' } };
+  const claudeShellPending = store.require(claudeShell); if (claudeShellPending.allowed) throw Error('unexpected');
+  const claudeShellView = store.reviewUi(claudeShellPending.approval.id, claudeShell.principal);
+  assert.equal(claudeShellView.conversationLease?.scope, 'this exact shell command request');
+  store.decideUiForConversation(claudeShellView.id, claudeShell.principal, claudeShellView.decisionToken!);
+  assert.equal(store.require(claudeShell).allowed, true);
+  const repeatedClaudeShell = store.require(claudeShell); assert.equal(repeatedClaudeShell.allowed, true);
+  if (!repeatedClaudeShell.allowed) throw Error('expected exact Claude shell lease');
+  assert.equal(repeatedClaudeShell.source, 'conversation_lease');
+  assert.equal(store.require({ ...claudeShell, args: { command: 'echo changed' } }).allowed, false,
+    'Claude shell leases require the complete command request to remain exact');
+  now = 1000;
+  assert.equal(store.revokeConversationLeases(native.principal), 0, 'expired leases are pruned without renewal');
+});
+
+test('approved receipts can be claimed across host session rotation only within the same OAuth client', () => {
+  const store = new OwnerApprovals(() => 0, 1000);
+  const first = approvalPrincipal('client-a', { 'openai/session': 'turn-a' });
+  const next = approvalPrincipal('client-a', { 'openai/session': 'turn-b' });
+  const foreign = approvalPrincipal('client-b', { 'openai/session': 'turn-b' });
+  const request = { principal: first, tool: 'run_process',
+    args: { workspaceId: 'ws-fixture', executable: 'node', args: ['--version'], workingDirectory: '.' },
+    context: { root: '/fixture', targets: [] }, reason: 'native' };
+  const pending = store.require(request); if (pending.allowed) throw Error('unexpected');
+  const view = store.reviewUi(pending.approval.id, first);
+  store.decideUiForConversation(view.id, first, view.decisionToken!);
+  const driftedRequest = { ...request, principal: next };
+  const driftedPending = store.require(driftedRequest); if (driftedPending.allowed) throw Error('unexpected');
+  assert.throws(() => store.claimApproved(view.id, foreign), /authorized/);
+  const claimed = store.claimApproved(view.id, next);
+  assert.equal(claimed.state, 'approved');
+  assert.equal(store.inspect(driftedPending.approval.id), undefined, 'claim removes only the duplicate undecided request created by session drift');
+  assert.equal(store.require(driftedRequest).allowed, true, 'the exact approved operation is consumable once after claim');
+  const leased = store.require(driftedRequest); assert.equal(leased.allowed, true);
+  if (!leased.allowed) throw Error('expected migrated lease');
+  assert.equal(leased.source, 'conversation_lease');
+  assert.equal(store.require({ ...driftedRequest, args: { ...driftedRequest.args, args: ['-p', 'process.version'] } }).allowed, false,
+    'claim never broadens an exact native-process lease');
+  const third = approvalPrincipal('client-a', { 'openai/session': 'turn-c' });
+  const thirdRequest = { ...request, principal: third };
+  const thirdPending = store.require(thirdRequest); if (thirdPending.allowed) throw Error('unexpected');
+  const reclaimed = store.claimApproved(view.id, third);
+  assert.equal(reclaimed.state, 'approved', 'the active lease lineage survives consumption of the original one-shot grant');
+  assert.equal(store.inspect(thirdPending.approval.id), undefined, 'reclaim removes the duplicate pending request from the later session drift');
+  const thirdLease = store.require(thirdRequest); assert.equal(thirdLease.allowed, true);
+  if (!thirdLease.allowed) throw Error('expected repeatedly migrated lease');
+  assert.equal(thirdLease.source, 'conversation_lease');
+  assert.equal(store.revokeConversationLeases(third), 3, 'revocation removes project review/worktree and exact native scopes');
+  assert.equal(store.inspect(view.id), undefined, 'revocation also removes the consumed lineage receipt');
+});
+
+test('processed approvals do not consume the per-principal pending quota', () => {
+  const store = new OwnerApprovals(() => 0, 1000);
+  for (let i = 0; i < 20; i++) {
+    const request = { ...operation, args: { cmd: `echo denied-${i}` } };
+    const pending = store.require(request); if (pending.allowed) throw Error('unexpected');
+    const view = store.reviewUi(pending.approval.id, request.principal);
+    assert.equal(store.decideUi(view.id, request.principal, view.decisionToken!, false).state, 'denied');
+  }
+  const next = store.require({ ...operation, args: { cmd: 'echo next' } });
+  assert.equal(next.allowed, false, 'processed archive entries must not block a new pending request');
+  if (next.allowed) throw Error('unexpected');
+  assert.equal(next.approval.state, 'pending');
+});
+
+test('terminal approval history can be recycled without revoking active authority', () => {
+  const store = new OwnerApprovals(() => 0, 1000);
+  const denied = store.require(operation); if (denied.allowed) throw Error('unexpected');
+  const deniedView = store.reviewUi(denied.approval.id, operation.principal);
+  const decided = store.decideUi(deniedView.id, operation.principal, deniedView.decisionToken!, false);
+  assert.equal(decided.recyclable, true);
+  assert.equal(store.recycleConversationApprovals(operation.principal), 1);
+  assert.equal(store.inspect(deniedView.id), undefined);
+
+  const review = { principal: operation.principal, tool: 'show_changes', args: { workspaceId: 'ws-fixture' },
+    context: { root: '/fixture', targets: [] }, reason: 'review' };
+  const pending = store.require(review); if (pending.allowed) throw Error('unexpected');
+  const view = store.reviewUi(pending.approval.id, review.principal);
+  const approved = store.decideUiForConversation(view.id, review.principal, view.decisionToken!);
+  assert.equal(approved.recyclable, false, 'an active lease lineage is not recyclable');
+  assert.equal(store.recycleConversationApprovals(review.principal), 0);
 });
 
 test('real OAuth/MCP requires independent Owner approval before command side effects', { timeout: 60000 }, async t => {
@@ -118,11 +288,19 @@ test('real OAuth/MCP requires independent Owner approval before command side eff
   const noWorkspace = { getWorkspace:()=>{throw Error('not needed');}, resolveReadPath:()=>{throw Error('not needed');} };
   assert.ok(classifyMcpOperation(config,noWorkspace,'codex_task_start',{writeMode:'read_only',prompt:'read protected files'}).reason);
   assert.ok(classifyMcpOperation(config,noWorkspace,'show_changes',{}).reason);
+  assert.match(
+    classifyMcpOperation(config, noWorkspace, 'exec_command', { cmd: 'echo bounded' }, 'fixture-boundary-v1').reason ?? '',
+    /confined.*fixture-boundary-v1/,
+  );
+  assert.match(
+    classifyMcpOperation(config, noWorkspace, 'run_process', { executable: 'node' }).reason ?? '',
+    /no configured workspace execution boundary/,
+  );
   const policy = { requiredModel: 'gpt-6-astra', minimumCliVersion: '0.153.0', allowedModels: ['gpt-6-astra', 'gpt-5.6-sol'], routing: { routineModel: 'gpt-5.6-sol', complexModel: 'gpt-6-astra' } };
   config.bridge = { enabled: true, allowWorkspaceWrite: false, executionPolicy: policy };
   const submissions: any[] = [];
   const record: LocalAgentRecord = { id: 'agt-owner-fixture', workspaceRoot: project, profileName: 'codex', provider: 'codex', model: 'gpt-5.6-sol', status: 'running', createdAt: 'now', updatedAt: 'now' };
-  const app = createServer(config, { codexBridgeFactory: configuration => new CodexBridge(configuration, {
+  const app = createServer(config, { executionBoundary: null, codexBridgeFactory: configuration => new CodexBridge(configuration, {
     start: async input => { submissions.push(input); return Result.ok(record); },
     continue: async (agentId, prompt, overrides) => { submissions.push({ agentId, prompt, ...overrides }); return Result.ok(record); },
     get: async () => Result.ok(record), list: async () => Result.ok([]),
@@ -147,20 +325,64 @@ test('real OAuth/MCP requires independent Owner approval before command side eff
   };
   const access = await login('Owner gate fixture');
   let session='', id=0;
+  const notifications: any[] = [];
   const rpc = async (method:string, params:unknown, bearer=access) => {
+    const requestId = id + 1;
     const response = await fetch(resource, {method:'POST',headers:{authorization:`Bearer ${bearer}`,'content-type':'application/json',accept:'application/json, text/event-stream',...(session?{'mcp-session-id':session}:{})},body:JSON.stringify({jsonrpc:'2.0',id:++id,method,params})});
     session = response.headers.get('mcp-session-id') ?? session;
     const text = await response.text();
     assert.equal(response.status,200,text);
-    return JSON.parse(text.startsWith('event:') ? text.split('\n').find(line=>line.startsWith('data:'))!.slice(5) : text);
+    if (!text.startsWith('event:')) return JSON.parse(text);
+    const messages = text.split('\n')
+      .filter(line=>line.startsWith('data:'))
+      .map(line=>JSON.parse(line.slice(5)));
+    notifications.push(...messages.filter(message => message?.method));
+    const reply = messages.find(message => message?.id === requestId);
+    assert.ok(reply, 'missing JSON-RPC response for request ' + requestId + ': ' + text);
+    return reply;
   };
   await rpc('initialize',{protocolVersion:'2025-03-26',capabilities:{},clientInfo:{name:'fixture',version:'1'}});
+  const hostToolList = await rpc('tools/list', {});
+  const hostToolNames = (hostToolList.result.tools as Array<{ name: string }>).map(tool => tool.name);
+  assert.ok(hostToolNames.includes('host_command'), 'authenticated MCP tools/list must expose host_command');
+  assert.ok(hostToolNames.includes('context_fabric'), 'authenticated MCP tools/list must expose context_fabric');
+  assert.ok(hostToolNames.includes('control_hub'), 'authenticated MCP tools/list must expose control_hub');
+  const workspaceAppResource = await rpc('resources/read', { uri: 'ui://devspace/workspace-app-v7.html' });
+  const workspaceAppContent = workspaceAppResource.result.contents?.[0];
+  assert.equal(workspaceAppContent?.uri, 'ui://devspace/workspace-app-v7.html');
+  assert.equal(workspaceAppContent?.mimeType, 'text/html;profile=mcp-app');
+  assert.match(workspaceAppContent?.text ?? '', /\/mcp-app-assets\/assets\/workspace-app-/);
+  assert.deepEqual(workspaceAppContent?._meta?.ui?.csp?.resourceDomains, [origin]);
   const opened=await rpc('tools/call',{name:'open_workspace',arguments:{path:project}});
   const workspaceId=opened.result.structuredContent.workspaceId; assert.ok(workspaceId);
   const conversationMeta={'openai/session':'fixture-logical-chat'};
+  const a2LeaseStore = new WorkspaceLeaseStore(config.stateDir);
+  const activeA2Lease = a2LeaseStore.activate(a2LeaseStore.request({
+    clientId: clientIds.get(access)!,
+    conversationScopeId: 'fixture-logical-chat',
+    workspaceRoot: project,
+    durationSeconds: 14_400,
+    policyVersion: A2_WORKSPACE_LEASE_POLICY_VERSION,
+    boundaryProfile: 'fixture-boundary-v2',
+  }).id, { boundaryVerified: true });
+  assert.equal(activeA2Lease.state, 'active');
+  a2LeaseStore.close();
   const tool=(name:string,args:Record<string,unknown>)=>rpc('tools/call',{name,arguments:{workspaceId,...args},_meta:conversationMeta});
   assert.notEqual((await tool('project_read',{path:'hello.txt'})).result.isError,true);
   assert.notEqual((await tool('project_read_batch', { items: [{ path: 'hello.txt' }] })).result.isError, true);
+  const contextDigest = 'f'.repeat(64);
+  const contextAnchor = { version: 1, anchorId: 'oauth-context', createdAt: '2026-09-19T00:00:00.000+00:00', stateDigest: contextDigest,
+    evidenceRefs: [], statements: [] };
+  const contextStored = await tool('context_fabric', { action: 'put_anchor', anchorJson: JSON.stringify(contextAnchor) });
+  assert.notEqual(contextStored.result.isError, true, 'bounded Context Fabric state must not require execution approval');
+  assert.doesNotMatch(JSON.stringify(contextStored), /OWNER_APPROVAL_REQUIRED/);
+  const contextCapsule = await tool('context_fabric', { action: 'capsule', anchorId: 'oauth-context', objective: 'Continue safely',
+    objectiveEstimatedTokens: 2, maxTokens: 20, reserveTokens: 2, maxStatements: 4 });
+  assert.notEqual(contextCapsule.result.isError, true);
+  assert.equal(JSON.parse(contextCapsule.result.structuredContent.result).anchorId, 'oauth-context');
+  const hubStatus = await rpc('tools/call',{name:'control_hub',arguments:{action:'status'},_meta:conversationMeta});
+  assert.notEqual(hubStatus.result.isError, true, 'bounded Control Hub status must not require execution approval');
+  assert.doesNotMatch(JSON.stringify(hubStatus), /OWNER_APPROVAL_REQUIRED/);
   writeFileSync(join(project, '.env'), 'FIXTURE_BATCH_SECRET_MUST_NOT_LEAK');
   const protectedBatch = await tool('project_read_batch', { items: [{ path: 'hello.txt' }, { path: '.env' }] });
   assert.equal(JSON.parse(protectedBatch.result.content[0].text).code, 'OWNER_APPROVAL_REQUIRED');
@@ -172,6 +394,9 @@ test('real OAuth/MCP requires independent Owner approval before command side eff
     args: ['-e', "require('node:fs').writeFileSync('native-not-approved.txt','bad')"] });
   assert.equal(JSON.parse(nativeBlocked.result.content[0].text).code, 'OWNER_APPROVAL_REQUIRED');
   assert.equal(existsSync(join(project, 'native-not-approved.txt')), false);
+  const hostBlocked = await tool('host_command', { command: "printf blocked > host-not-approved.txt" });
+  assert.equal(JSON.parse(hostBlocked.result.content[0].text).code, 'OWNER_APPROVAL_REQUIRED');
+  assert.equal(existsSync(join(project, 'host-not-approved.txt')), false);
   const cancelBlocked = await tool('process_cancel', { sessionId: 12345 });
   assert.equal(JSON.parse(cancelBlocked.result.content[0].text).code, 'OWNER_APPROVAL_REQUIRED');
   const absentStatus = await tool('process_status', { sessionId: 12345, yieldTimeMs: 0 });
@@ -181,6 +406,12 @@ test('real OAuth/MCP requires independent Owner approval before command side eff
   const args={cmd:'echo approved> approved.txt',yieldTimeMs:10000};
   const blocked=await tool('exec_command',args); assert.equal(blocked.result.isError,true);
   const approval=JSON.parse(blocked.result.content[0].text); assert.equal(approval.code,'OWNER_APPROVAL_REQUIRED');
+  assert.deepEqual(approval.a2WorkspaceLease, {
+    state: 'suspended',
+    reason: 'boundary_unverified',
+    expiresAt: activeA2Lease.expiresAt,
+    executionEligible: false,
+  }, 'ACTIVE persisted A2 authority must fail closed and remain distinct from legacy exact approval');
   assert.ok(Date.parse(approval.expiresAt) >= approvalStartedAt + 7200_000);
   assert.ok(Date.parse(approval.expiresAt) <= Date.now() + 7200_000);
   assert.equal(existsSync(join(project,'approved.txt')),false);
@@ -280,9 +511,55 @@ test('real OAuth/MCP requires independent Owner approval before command side eff
   const cardRequest = JSON.parse((await tool('codex_task_start', cardArgs)).result.content[0].text);
   assert.equal(cardRequest.chatApproval.enabled, false, 'Chat approval is opt-in for each authenticated OAuth client');
   assert.equal(cardRequest.chatApproval.clientId, clientIds.get(access));
+  assert.equal(cardRequest.chatApproval.reviewTool, 'review_approval', 'approval responses advertise one model-facing approval entry for both center and single-card review');
+  assert.equal(cardRequest.chatApproval.singleReviewTool, 'review_approval');
   const reviewArgs = { name: 'review_approval', arguments: { approvalId: cardRequest.approvalId }, _meta: conversationMeta };
   assert.equal((await rpc('tools/call', reviewArgs)).result.isError, true);
   config.chatApprovalClientIds = [clientIds.get(access)!];
+  const compatClaimArgs = { cmd: 'echo compat-claimed> compat-claimed.txt', yieldTimeMs: 10000 };
+  const compatClaimBlocked = await tool('exec_command', compatClaimArgs);
+  const compatClaimApproval = JSON.parse(compatClaimBlocked.result.content[0].text);
+  assert.equal(compatClaimApproval.code, 'OWNER_APPROVAL_REQUIRED');
+  const compatClaimPage = await fetch(compatClaimApproval.approvalUrl);
+  const compatClaimHtml = await compatClaimPage.text();
+  const compatClaimNonce = /name="nonce" value="([^"]+)"/.exec(compatClaimHtml)![1];
+  const compatClaimCookie = compatClaimPage.headers.get('set-cookie')!.split(';')[0];
+  assert.equal((await fetch(compatClaimApproval.approvalUrl, {
+    method: 'POST',
+    headers: { origin, cookie: compatClaimCookie },
+    body: new URLSearchParams({ nonce: compatClaimNonce, owner_token: owner, decision: 'approve' }),
+  })).status, 200);
+  const driftedConversationMeta = { 'openai/session': 'fixture-logical-chat-drifted' };
+  const compatClaimId = `${REVIEW_APPROVAL_CLAIM_COMPAT_PREFIX}${compatClaimApproval.approvalId}`;
+  const foreignCompatClaim = await rpc('tools/call', {
+    name: 'review_approval',
+    arguments: { approvalId: compatClaimId },
+    _meta: driftedConversationMeta,
+  }, otherClient);
+  assert.equal(foreignCompatClaim.result.isError, true, 'cached-host claim compatibility must not cross OAuth clients');
+  const compatClaim = await rpc('tools/call', {
+    name: 'review_approval',
+    arguments: { approvalId: compatClaimId },
+    _meta: driftedConversationMeta,
+  });
+  assert.notEqual(compatClaim.result.isError, true, 'cached hosts can claim an already-approved receipt after logical session drift');
+  assert.equal(JSON.parse(compatClaim.result.content[0].text).state, 'approved');
+  const compatRetry = await rpc('tools/call', {
+    name: 'exec_command',
+    arguments: { workspaceId, ...compatClaimArgs },
+    _meta: driftedConversationMeta,
+  });
+  assert.notEqual(compatRetry.result.isError, true, 'claimed approval must authorize exactly the original operation');
+  assert.match(readFileSync(join(project, 'compat-claimed.txt'), 'utf8'), /compat-claimed/);
+  const scopedCard = JSON.parse((await rpc('tools/call', {
+    name: 'codex_task_start',
+    arguments: { workspaceId, ...cardArgs },
+    _meta: conversationMeta,
+  })).result.content[0].text);
+  assert.equal(scopedCard.approvalId, cardRequest.approvalId, 'enabling Chat UI must not create a second approval for the same pending request');
+  assert.equal(scopedCard.chatApproval.enabled, true);
+  assert.match(scopedCard.instruction, /Call review_approval with no approvalId/);
+  assert.doesNotMatch(scopedCard.instruction, /Call review_approvals/);
   const unscoped = await rpc('tools/call', { name: 'codex_task_start', arguments: { workspaceId, ...cardArgs, requestKey: 'unscoped-card' } });
   const unscopedId = JSON.parse(unscoped.result.content[0].text).approvalId;
   assert.equal(JSON.parse(unscoped.result.content[0].text).chatApproval.mode, 'owner_page');
@@ -290,16 +567,31 @@ test('real OAuth/MCP requires independent Owner approval before command side eff
   const unscopedReview = await rpc('tools/call', { name: 'review_approval', arguments: { approvalId: unscopedId } });
   assert.equal(unscopedReview.result.isError, true, 'Chat UI approval must not bind different conversations to a shared null scope');
   assert.equal(JSON.parse(unscopedReview.result.content[0].text).code, 'CHAT_CONTEXT_REQUIRED');
+  const notificationsBeforeReview = notifications.length;
   const reviewed = await rpc('tools/call', reviewArgs);
   assert.notEqual(reviewed.result.isError, true);
+  assert.equal(
+    notifications.slice(notificationsBeforeReview).filter(message => message.method === 'notifications/tools/list_changed').length,
+    1,
+    'a successful specific-card review nudges a host that may still cache the older tool contract',
+  );
   const view = reviewed.result._meta['devspace/approval'];
   assert.ok(view.decisionToken);
+  assert.equal(view.approvalUrl, `${origin}/owner/approvals/${view.id}`);
+  const reviewedSummary = JSON.parse(reviewed.result.content[0].text);
+  assert.equal(reviewedSummary.approvalUrl, view.approvalUrl,
+    'single approval review must preserve an Owner-page fallback when the app card cannot load');
   const modelVisible = JSON.stringify({ content: reviewed.result.content, structuredContent: reviewed.result.structuredContent });
   assert.equal(modelVisible.includes(view.decisionToken), false);
   assert.equal(modelVisible.includes('decisionToken'), false);
   const listed = await rpc('tools/list', {});
   const decisionTool = listed.result.tools.find((item: any) => item.name === 'decide_approval');
   const reviewTool = listed.result.tools.find((item: any) => item.name === 'review_approval');
+  const approvalCenterTool = listed.result.tools.find((item: any) => item.name === 'review_approvals');
+  const reissueTool = listed.result.tools.find((item: any) => item.name === 'reissue_approval');
+  const claimTool = listed.result.tools.find((item: any) => item.name === 'claim_approval');
+  const revokeConversationTool = listed.result.tools.find((item: any) => item.name === 'revoke_conversation_approvals');
+  const recycleTool = listed.result.tools.find((item: any) => item.name === 'recycle_approvals');
   assert.deepEqual(decisionTool._meta.ui.visibility, ['app']);
   assert.equal(decisionTool._meta['openai/visibility'], 'private');
   assert.equal(decisionTool._meta['openai/widgetAccessible'], true);
@@ -308,9 +600,63 @@ test('real OAuth/MCP requires independent Owner approval before command side eff
   assert.equal(decisionTool._meta.ui.resourceUri, undefined,
     'a hidden action must not own an output template: ChatGPT disables templates associated with hidden tools');
   assert.equal(decisionTool._meta['openai/outputTemplate'], undefined);
-  assert.equal(reviewTool._meta.ui.resourceUri, 'ui://devspace/workspace-app.html');
+  assert.equal(reviewTool._meta.ui.resourceUri, 'ui://devspace/workspace-app-v7.html');
   assert.equal(reviewTool._meta['openai/outputTemplate'], reviewTool._meta.ui.resourceUri);
   assert.deepEqual(reviewTool._meta.ui.visibility, ['model', 'app']);
+  const resources = await rpc('resources/list', {});
+  const resourceUris = new Set(resources.result.resources.map((item: any) => item.uri));
+  for (const uri of [
+    'ui://devspace/workspace-app.html',
+    'ui://devspace/workspace-app-v2.html',
+    'ui://devspace/workspace-app-v3.html',
+    'ui://devspace/workspace-app-v4.html',
+    'ui://devspace/workspace-app-v5.html',
+    'ui://devspace/workspace-app-v6.html',
+    'ui://devspace/workspace-app-v7.html',
+  ]) assert.equal(resourceUris.has(uri), true, `workspace app resource must remain readable for cached host URI: ${uri}`);
+  assert.equal(reviewTool.inputSchema.required?.includes('approvalId') ?? false, false,
+    'review_approval without an id must open the current conversation Approval Center');
+  assert.deepEqual(approvalCenterTool._meta.ui.visibility, ['app']);
+  assert.equal(approvalCenterTool._meta['openai/visibility'], 'private');
+  assert.equal(approvalCenterTool._meta.ui.resourceUri, undefined,
+    'the compatibility center action must not compete for the model-facing output template');
+  assert.equal(approvalCenterTool._meta['openai/outputTemplate'], undefined);
+  const centerViaPrimaryTool = await rpc('tools/call', { name: 'review_approval', arguments: {}, _meta: conversationMeta });
+  assert.notEqual(centerViaPrimaryTool.result.isError, true);
+  assert.ok(centerViaPrimaryTool.result._meta['devspace/approval-center']);
+  const centerSummary = JSON.parse(centerViaPrimaryTool.result.content[0].text);
+  assert.ok(centerSummary.fallbackApprovals.some((item: any) => item.approvalId === view.id && item.approvalUrl === view.approvalUrl),
+    'Approval Center must expose Owner-page fallbacks when the app card cannot load');
+  const centerViaCachedSchema = await rpc('tools/call', {
+    name: 'review_approval',
+    arguments: { approvalId: REVIEW_APPROVAL_CENTER_COMPAT_ID },
+    _meta: conversationMeta,
+  });
+  assert.notEqual(centerViaCachedSchema.result.isError, true);
+  assert.ok(centerViaCachedSchema.result._meta['devspace/approval-center'],
+    'the reserved compatibility id must let hosts with a cached required approvalId schema open the Approval Center');
+  assert.deepEqual(
+    JSON.parse(centerViaCachedSchema.result.content[0].text).fallbackApprovals,
+    centerSummary.fallbackApprovals,
+    'cached-schema compatibility must expose the same bounded Owner-page fallbacks as the normal center entry',
+  );
+  const centerResult = await rpc('tools/call', { name: 'review_approvals', arguments: {}, _meta: conversationMeta });
+  assert.notEqual(centerResult.result.isError, true);
+  const centerView = centerResult.result._meta['devspace/approval-center'];
+  assert.ok(centerView.approvals.some((item: any) => item.id === view.id));
+  assert.equal(JSON.stringify({ content: centerResult.result.content, structuredContent: centerResult.result.structuredContent }).includes('decisionToken'), false);
+  assert.equal(reissueTool.annotations.destructiveHint, false);
+  assert.equal(reissueTool.annotations.openWorldHint, false);
+  assert.deepEqual(reissueTool._meta.ui.visibility, ['model']);
+  assert.deepEqual(claimTool._meta.ui.visibility, ['model']);
+  assert.equal(claimTool._meta['openai/outputTemplate'], undefined);
+  assert.equal(revokeConversationTool.annotations.destructiveHint, false);
+  assert.equal(revokeConversationTool.annotations.idempotentHint, true);
+  assert.deepEqual(revokeConversationTool._meta.ui.visibility, ['model']);
+  assert.deepEqual(recycleTool._meta.ui.visibility, ['app']);
+  assert.equal(recycleTool._meta['openai/visibility'], 'private');
+  assert.equal(recycleTool.annotations.destructiveHint, false);
+  assert.equal(recycleTool.annotations.idempotentHint, true);
   const uiDecision = { name: 'decide_approval', arguments: { approvalId: view.id, decisionToken: view.decisionToken, decision: 'approve' }, _meta: conversationMeta };
   const unreviewed = await rpc('tools/call', { name: 'decide_approval', arguments: { approvalId: view.id, decisionToken: 'forged', decision: 'approve' }, _meta: conversationMeta });
   assert.equal(unreviewed.result.isError, true);
@@ -341,4 +687,157 @@ test('real OAuth/MCP requires independent Owner approval before command side eff
   await approveTask(revoked.approvalUrl); await new Promise(resolve => setTimeout(resolve, 30));
   assert.match(await (await fetch(revoked.approvalUrl)).text(), /Submission could not be confirmed/);
   assert.equal(submissions.length, 3, 'revoked OAuth credentials must not authorize deferred delivery');
+});
+
+test('real OAuth/MCP A2 lease executes only in Candidate when boundary is verified', { timeout: 30000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'devspace-a2-candidate-http-'));
+  const project = join(root, 'project'); mkdirSync(project);
+  writeFileSync(join(project, 'hello.txt'), 'hello\n');
+  const reserve = reserveServer(); await new Promise<void>(r => reserve.listen(0, '127.0.0.1', r));
+  const port = (reserve.address() as {port:number}).port; await new Promise<void>(r => reserve.close(() => r()));
+  const origin = `http://127.0.0.1:${port}`, resource = `${origin}/mcp`;
+  const config = loadConfig({ ...writeTestDevspaceConfig(join(root, 'config'), {
+    server: { port, publicBaseUrl: origin }, workspaces: { allowedRoots: [project] },
+    storage: { stateDir: join(root, 'state') }, skills: { enabled: false },
+    tools: { authorization: 'owner_approval', approvalTtlSeconds: 7200 },
+    logging: { level: 'silent' },
+  }), DEVSPACE_OAUTH_OWNER_TOKEN: owner });
+  const boundary: WorkspaceExecutionBoundary = {
+    profile: 'fixture-boundary-v2',
+    prepare(input) {
+      return { executable: input.executable, args: input.args, boundaryProfile: this.profile };
+    },
+  };
+  const app = createServer(config, {
+    executionBoundary: boundary,
+    workspaceExecutionBoundaryVerifier: () => ({
+      verified: true,
+      profile: boundary.profile,
+      reason: 'verified',
+      checks: {
+        profileMatch: true,
+        workspaceWrite: true,
+        outsideWriteBlocked: true,
+        protectedEnvWriteBlocked: true,
+        hostControlSocketsMasked: true,
+        sensitiveEnvironmentBlocked: true,
+        networkNoneIsolated: true,
+      },
+    }),
+  });
+  const listener = app.app.listen(port, '127.0.0.1');
+  await new Promise<void>(r => listener.once('listening', r));
+  t.after(async () => {
+    await app.close();
+    listener.closeAllConnections();
+    await new Promise<void>(r => listener.close(() => r()));
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const registration = await fetch(`${origin}/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      client_name: 'A2 candidate fixture',
+      redirect_uris: ['http://127.0.0.1/callback'],
+      token_endpoint_auth_method: 'none',
+      grant_types: ['authorization_code', 'refresh_token'],
+      response_types: ['code'],
+    }),
+  });
+  assert.equal(registration.status, 201);
+  const client = await registration.json() as { client_id: string };
+  const verifier = randomBytes(32).toString('base64url');
+  const redirectUri = 'http://127.0.0.1/callback';
+  const authorize = await fetch(`${origin}/authorize`, {
+    method: 'POST',
+    redirect: 'manual',
+    body: new URLSearchParams({
+      client_id: client.client_id,
+      redirect_uri: redirectUri,
+      response_type: 'code',
+      scope: 'devspace',
+      resource,
+      code_challenge: createHash('sha256').update(verifier).digest('base64url'),
+      code_challenge_method: 'S256',
+      owner_token: owner,
+    }),
+  });
+  assert.equal(authorize.status, 302);
+  const code = new URL(authorize.headers.get('location')!).searchParams.get('code')!;
+  const exchanged = await fetch(`${origin}/token`, {
+    method: 'POST',
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: client.client_id,
+      code,
+      code_verifier: verifier,
+      redirect_uri: redirectUri,
+      resource,
+    }),
+  });
+  assert.equal(exchanged.status, 200);
+  const access = (await exchanged.json() as { access_token: string }).access_token;
+
+  let session = '', id = 0;
+  const rpc = async (method: string, params: unknown) => {
+    const requestId = id + 1;
+    const response = await fetch(resource, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${access}`,
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        ...(session ? { 'mcp-session-id': session } : {}),
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }),
+    });
+    session = response.headers.get('mcp-session-id') ?? session;
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    if (!text.startsWith('event:')) return JSON.parse(text);
+    const messages = text.split('\n').filter(line => line.startsWith('data:'))
+      .map(line => JSON.parse(line.slice(5)));
+    const reply = messages.find(message => message?.id === requestId);
+    assert.ok(reply, 'missing JSON-RPC response for request ' + requestId + ': ' + text);
+    return reply;
+  };
+
+  await rpc('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'fixture', version: '1' } });
+  const opened = await rpc('tools/call', { name: 'open_workspace', arguments: { path: project } });
+  const workspaceId = opened.result.structuredContent.workspaceId;
+  const conversationMeta = { 'openai/session': 'fixture-a2-candidate-chat' };
+  const leaseStore = new WorkspaceLeaseStore(config.stateDir);
+  try {
+    const lease = leaseStore.activate(leaseStore.request({
+      clientId: client.client_id,
+      conversationScopeId: conversationMeta['openai/session'],
+      workspaceRoot: project,
+      durationSeconds: 14_400,
+      policyVersion: A2_WORKSPACE_LEASE_POLICY_VERSION,
+      boundaryProfile: boundary.profile,
+    }).id, { boundaryVerified: true });
+    assert.equal(lease.state, 'active');
+  } finally {
+    leaseStore.close();
+  }
+
+  const executed = await rpc('tools/call', {
+    name: 'exec_command',
+    arguments: {
+      workspaceId,
+      cmd: `node -e "require('node:fs').writeFileSync('a2-candidate-only.txt','candidate')"`,
+      yieldTimeMs: 10_000,
+    },
+    _meta: conversationMeta,
+  });
+  assert.notEqual(executed.result.isError, true);
+  assert.equal(existsSync(join(project, 'a2-candidate-only.txt')), false, 'A2 execution must not mutate Stable Workspace');
+  const evidence = executed.result.structuredContent.candidateExecution;
+  assert.equal(evidence.state, 'completed');
+  assert.equal(evidence.mutation.stableChanged, false);
+  assert.deepEqual(evidence.mutation.created, ['a2-candidate-only.txt']);
+  assert.equal(evidence.mutation.createdCount, 1);
+  assert.equal(evidence.mutation.pathListTruncated, false);
+  assert.doesNotMatch(JSON.stringify(executed), /OWNER_APPROVAL_REQUIRED/);
 });

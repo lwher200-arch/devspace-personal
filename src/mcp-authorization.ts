@@ -12,8 +12,11 @@ import { projectReadBatchInputSchema } from './project-read-batch.js';
 import { selectExecutionModel } from './local-agent-execution.js';
 import { logEvent } from './logger.js';
 import { openAiConversationScopeId } from './request-meta.js';
-import { APPROVAL_TTL_SECONDS, type ApprovalState, type ApprovalView } from './approval-protocol.js';
+import { APPROVAL_TTL_SECONDS, type ApprovalCenterView, type ApprovalState, type ApprovalView } from './approval-protocol.js';
 import { readOwnerSession, establishOwnerSession } from './owner-session.js';
+import { canRelaunchApproval } from './control-plane/returnflow.js';
+import { contextFabricToolInputSchema } from './control-plane/context-fabric-tools.js';
+import { controlHubToolInputSchema } from './control-plane/control-hub-tools.js';
 
 type Arguments = Record<string, unknown>;
 export class InvalidToolArgumentsError extends Error {
@@ -31,8 +34,16 @@ interface SubmissionReceipt { agentId: string; workspaceId: string }
 interface Approval extends ApprovalOperation {
   id: string; key: string; bytes: number; expires: number;
   state: ApprovalState;
+  conversationLeaseUntil?: number;
+  singleUseConsumed?: boolean;
   uiToken?: string;
   nonce?: string; submit?: () => Promise<SubmissionReceipt>; submission?: SubmissionReceipt;
+}
+interface ConversationApprovalLease {
+  principal: string;
+  scopeKey: string;
+  scopeLabel: string;
+  expires: number;
 }
 const token = () => randomBytes(32).toString('base64url');
 const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
@@ -41,6 +52,97 @@ function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
   if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${canonical((value as Arguments)[k])}`).join(',')}}`;
   return JSON.stringify(value) ?? 'null';
+}
+
+function conversationLineageKey(id: string): string {
+  return hash(canonical(['conversation-lease-lineage', id]));
+}
+
+function asRecord(value: unknown): Arguments | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Arguments : undefined;
+}
+
+function approvalRoot(operation: ApprovalOperation): string | undefined {
+  const root = asRecord(operation.context)?.root;
+  return typeof root === 'string' && root ? root : undefined;
+}
+
+function firstApprovalTarget(operation: ApprovalOperation): string | undefined {
+  const targets = asRecord(operation.context)?.targets;
+  if (!Array.isArray(targets)) return undefined;
+  const path = asRecord(targets[0])?.path;
+  return typeof path === 'string' && path ? path : undefined;
+}
+
+function codexConversationScope(operation: ApprovalOperation): { key: string; label: string } | undefined {
+  if (!['codex_task_start', 'codex_task_continue'].includes(operation.tool)) return undefined;
+  const root = approvalRoot(operation);
+  if (!root) return undefined;
+  const context = asRecord(operation.context);
+  const selectedModel = typeof context?.selectedModel === 'string' ? context.selectedModel :
+    typeof operation.args.model === 'string' ? operation.args.model : 'configured model';
+  const writeMode = operation.args.writeMode === 'allowed' ? 'allowed' : 'read_only';
+  const agentId = operation.tool === 'codex_task_continue' && typeof operation.args.agentId === 'string'
+    ? operation.args.agentId : null;
+  return {
+    key: canonical(['safe-codex-turn', root, operation.tool, writeMode, selectedModel, agentId]),
+    label: operation.tool === 'codex_task_continue'
+      ? `Codex follow-ups for this task (${writeMode}, ${selectedModel})`
+      : `Codex new turns in this project (${writeMode}, ${selectedModel})`,
+  };
+}
+
+function conversationPolicyScopes(operation: ApprovalOperation): Array<{ key: string; label: string }> {
+  const scopes: Array<{ key: string; label: string }> = [];
+  const root = approvalRoot(operation);
+  const codexScope = codexConversationScope(operation);
+  if (codexScope) scopes.push(codexScope);
+  if (['exec_command', 'bash'].includes(operation.tool) && root) {
+    scopes.push({ key: canonical(['safe-shell-exact', root, operation.args]), label: 'this exact shell command request' });
+  }
+  if (operation.tool === 'host_command' && root) {
+    scopes.push({ key: canonical(['safe-host-shell-exact', root, operation.args]), label: 'this exact host maintenance command request' });
+  }
+  if (operation.tool === 'run_process' && root) {
+    scopes.push({ key: canonical(['safe-native-exact', root, operation.args]), label: 'this exact native process request' });
+  }
+  if (root && ['show_changes', 'open_workspace', 'exec_command', 'bash', 'run_process'].includes(operation.tool)) {
+    scopes.push({ key: canonical(['safe-project-review', root]), label: 'safe reviews/worktrees in this project' });
+    scopes.push({ key: canonical(['safe-worktree', root]), label: 'worktrees from this project' });
+  }
+  const source = operation.tool === 'open_workspace' && operation.args.mode === 'worktree'
+    ? firstApprovalTarget(operation) : undefined;
+  if (source) scopes.push({ key: canonical(['safe-worktree', source]), label: 'worktrees from this project' });
+  return [...new Map(scopes.map(scope => [scope.key, scope])).values()];
+}
+
+function operationConversationLeaseKeys(operation: ApprovalOperation): string[] {
+  const codexScope = codexConversationScope(operation);
+  if (codexScope) return [codexScope.key];
+  const root = approvalRoot(operation);
+  if (operation.tool === 'show_changes' && root) return [canonical(['safe-project-review', root])];
+  if (operation.tool === 'open_workspace' && operation.args.mode === 'worktree') {
+    const source = firstApprovalTarget(operation);
+    return source ? [canonical(['safe-worktree', source])] : [];
+  }
+  if (['exec_command', 'bash'].includes(operation.tool) && root) return [canonical(['safe-shell-exact', root, operation.args])];
+  if (operation.tool === 'host_command' && root) return [canonical(['safe-host-shell-exact', root, operation.args])];
+  if (operation.tool === 'run_process' && root) return [canonical(['safe-native-exact', root, operation.args])];
+  return [];
+}
+
+export function conversationApprovalScope(operation: ApprovalOperation): { key: string; label: string } | undefined {
+  const scopes = conversationPolicyScopes(operation);
+  return scopes[0];
+}
+
+function approvalPrincipalParts(principal: string): { clientId: string; conversation: string | null } | undefined {
+  try {
+    const parsed = JSON.parse(principal);
+    if (!Array.isArray(parsed) || parsed.length !== 2 || typeof parsed[0] !== 'string' ||
+        !(parsed[1] === null || typeof parsed[1] === 'string')) return undefined;
+    return { clientId: parsed[0], conversation: parsed[1] };
+  } catch { return undefined; }
 }
 
 export function approvalPrincipal(clientId: string, metadata: unknown): string {
@@ -55,6 +157,8 @@ export function approvalContextMatches(view: Pick<ApprovalView, 'reason' | 'cont
 export class OwnerApprovals {
   private readonly entries = new Map<string, Approval>();
   private readonly failures = new Map<string, number>();
+  private readonly relaunchKeys = new Map<string, number>();
+  private readonly conversationLeases = new Map<string, ConversationApprovalLease>();
   private readonly inFlight = new Set<Promise<void>>();
   private closed = false;
   constructor(private readonly now = Date.now, private readonly ttl = APPROVAL_TTL_SECONDS.default * 1000) {
@@ -62,9 +166,16 @@ export class OwnerApprovals {
       throw new RangeError('Approval lifetime must be positive and no longer than two hours.');
     }
   }
-  private prune() { for (const [id, value] of this.entries) if (value.expires <= this.now() && value.state !== 'submitting') { this.entries.delete(id); this.failures.delete(id); } }
+  private prune() {
+    for (const [id, value] of this.entries) if (value.expires <= this.now() && value.state !== 'submitting') {
+      this.entries.delete(id); this.failures.delete(id); this.relaunchKeys.delete(value.key);
+    }
+    for (const [key, expires] of this.relaunchKeys) if (expires <= this.now()) this.relaunchKeys.delete(key);
+    for (const [key, lease] of this.conversationLeases) if (lease.expires <= this.now()) this.conversationLeases.delete(key);
+  }
   inspect(id: string): Approval | undefined { this.prune(); return this.entries.get(id); }
-  require(operation: ApprovalOperation, submit?: () => Promise<SubmissionReceipt>): { allowed: true } | { allowed: false; approval: Approval } {
+  require(operation: ApprovalOperation, submit?: () => Promise<SubmissionReceipt>):
+    { allowed: true; source?: 'single_use' | 'conversation_lease'; leaseExpiresAt?: string } | { allowed: false; approval: Approval } {
     if (this.closed) throw new Error('Owner approval service is closed.');
     if (submit && !['codex_task_start', 'codex_task_continue'].includes(operation.tool)) throw new Error('Only Codex submissions support execution on approval.');
     this.prune();
@@ -73,15 +184,44 @@ export class OwnerApprovals {
     if (bytes > 1024 * 1024) throw new Error('Approval request is too large; split the operation.');
     const key = hash(encoded);
     const prior = [...this.entries.values()].find(entry => entry.key === key);
-    if (prior) {
-      if (prior.state === 'approved') { this.entries.delete(prior.id); this.failures.delete(prior.id); return { allowed: true }; }
-      return { allowed: false, approval: prior };
+    if (prior?.state === 'approved') {
+      if (!prior.conversationLeaseUntil) {
+        this.entries.delete(prior.id); this.failures.delete(prior.id);
+        return { allowed: true, source: 'single_use' };
+      }
+      if (!prior.singleUseConsumed) {
+        prior.singleUseConsumed = true;
+        prior.key = conversationLineageKey(prior.id);
+        this.failures.delete(prior.id);
+        return { allowed: true, source: 'single_use' };
+      }
+      const retainedLease = this.findConversationLease(operation);
+      if (retainedLease) return { allowed: true, source: 'conversation_lease', leaseExpiresAt: new Date(retainedLease.expires).toISOString() };
+      this.entries.delete(prior.id); this.failures.delete(prior.id); this.relaunchKeys.delete(prior.key);
+    } else if (prior) {
+      const relaunchUntil = this.relaunchKeys.get(prior.key);
+      if (canRelaunchApproval(prior.state) && relaunchUntil !== undefined && relaunchUntil > this.now()) {
+        this.entries.delete(prior.id); this.failures.delete(prior.id); this.relaunchKeys.delete(prior.key);
+      } else return { allowed: false, approval: prior };
     }
+    const lease = this.findConversationLease(operation);
+    if (lease) return { allowed: true, source: 'conversation_lease', leaseExpiresAt: new Date(lease.expires).toISOString() };
+    const principalActiveApprovals = [...this.entries.values()].filter(entry =>
+      entry.principal === operation.principal && ['pending', 'submitting'].includes(entry.state)).length;
     if (this.entries.size >= 500 || [...this.entries.values()].reduce((total, entry) => total + entry.bytes, bytes) > 16 * 1024 * 1024 ||
-        [...this.entries.values()].filter(entry => entry.principal === operation.principal).length >= 20) throw new Error('Too many pending approvals; finish or wait for existing requests to expire.');
+        principalActiveApprovals >= 20) throw new Error('Too many pending approvals; finish or wait for existing requests to expire.');
     const approval: Approval = { ...structuredClone(operation), id: token(), key, bytes, state: 'pending', expires: this.now() + this.ttl, submit };
     this.entries.set(approval.id, approval);
     return { allowed: false, approval };
+  }
+  prepareRelaunch(id: string, principal: string): ApprovalView {
+    const entry = this.forPrincipal(id, principal);
+    if (!canRelaunchApproval(entry.state)) throw new Error('Only a denied approval can be requested again.');
+    // ReturnFlow RELAUNCH does not rewrite or approve the old decision. It only
+    // arms one exact re-request so require() can create a fresh pending record
+    // with the current execution callback and a new deadline.
+    this.relaunchKeys.set(entry.key, entry.expires);
+    return this.uiView(entry);
   }
   challenge(id: string): string {
     const entry = this.inspect(id);
@@ -94,6 +234,118 @@ export class OwnerApprovals {
     // never enter model-visible content, structuredContent, URLs or logs.
     if (entry.state === 'pending') entry.uiToken ??= token();
     return this.uiView(entry);
+  }
+  reviewConversationUi(principal: string): ApprovalCenterView {
+    if (this.closed) throw new Error('Owner approval service is closed.');
+    this.prune();
+    const approvals = [...this.entries.values()].filter(entry => entry.principal === principal);
+    for (const entry of approvals) if (entry.state === 'pending') entry.uiToken ??= token();
+    const activeRank = (state: ApprovalState) => state === 'pending' ? 0 : state === 'submitting' ? 1 : 2;
+    approvals.sort((a, b) => activeRank(a.state) - activeRank(b.state) ||
+      (activeRank(a.state) < 2 ? a.expires - b.expires : b.expires - a.expires));
+    const leases = [...this.conversationLeases.values()]
+      .filter(lease => lease.principal === principal)
+      .sort((a, b) => a.expires - b.expires)
+      .map(lease => ({ scope: lease.scopeLabel, expiresAt: new Date(lease.expires).toISOString() }));
+    return structuredClone({ version: 1 as const, approvals: approvals.map(entry => this.uiView(entry)), leases });
+  }
+  decideUiForConversation(id: string, principal: string, capability: string, validate?: (view: ApprovalView) => void): ApprovalView {
+    const entry = this.forPrincipal(id, principal);
+    if (!entry.uiToken || !equal(entry.uiToken, capability)) throw new Error('Approval unavailable or not authorized.');
+    if (entry.state === 'pending') {
+      const scopes = conversationPolicyScopes(entry);
+      if (!scopes.length) throw new Error('This operation is not eligible for conversation approval.');
+      validate?.(this.uiView(entry));
+      for (const scope of scopes) {
+        const lease: ConversationApprovalLease = { principal, scopeKey: scope.key, scopeLabel: scope.label, expires: entry.expires };
+        this.conversationLeases.set(this.conversationLeaseKey(principal, scope.key), lease);
+      }
+      entry.conversationLeaseUntil = entry.expires;
+      this.transition(entry, true);
+    }
+    return this.uiView(entry);
+  }
+  claimApproved(id: string, principal: string): ApprovalView {
+    const entry = this.inspect(id);
+    const submittedLease = entry?.state === 'submitted' && Boolean(entry.conversationLeaseUntil) && this.hasConversationPolicyLease(entry);
+    if (!entry || this.closed || !(entry.state === 'approved' || submittedLease) || entry.state === 'approved' && (entry.submit || entry.submission)) {
+      throw new Error('Approval unavailable or not claimable.');
+    }
+    if (entry.singleUseConsumed && !this.hasConversationPolicyLease(entry)) {
+      throw new Error('Approval unavailable or not claimable.');
+    }
+    const previous = approvalPrincipalParts(entry.principal), next = approvalPrincipalParts(principal);
+    if (!previous || !next || previous.clientId !== next.clientId || !next.conversation) {
+      throw new Error('Approval unavailable or not authorized.');
+    }
+    if (entry.principal === principal) return this.uiView(entry);
+    const oldPrincipal = entry.principal;
+    const nextOperation: ApprovalOperation = { principal, tool: entry.tool, args: entry.args, context: entry.context, reason: entry.reason };
+    const nextEncoded = canonical(nextOperation), nextOperationKey = hash(nextEncoded);
+    entry.principal = principal;
+    entry.key = entry.state === 'submitted' || entry.singleUseConsumed ? conversationLineageKey(entry.id) : nextOperationKey;
+    entry.bytes = Buffer.byteLength(nextEncoded);
+    if (entry.conversationLeaseUntil) {
+      for (const [leaseKey, lease] of [...this.conversationLeases]) {
+        if (lease.principal !== oldPrincipal || lease.expires > entry.conversationLeaseUntil) continue;
+        this.conversationLeases.delete(leaseKey);
+        const migrated = { ...lease, principal };
+        this.conversationLeases.set(this.conversationLeaseKey(principal, lease.scopeKey), migrated);
+      }
+    }
+    for (const [duplicateId, duplicate] of [...this.entries]) {
+      if (duplicateId === entry.id || duplicate.principal !== principal || duplicate.state !== 'pending') continue;
+      const exactDuplicate = duplicate.key === nextOperationKey;
+      const coveredByMigratedLease = Boolean(this.findConversationLease(duplicate));
+      if (!exactDuplicate && !coveredByMigratedLease) continue;
+      this.entries.delete(duplicateId); this.failures.delete(duplicateId); this.relaunchKeys.delete(duplicate.key);
+    }
+    return this.uiView(entry);
+  }
+  revokeConversationLeases(principal: string): number {
+    this.prune();
+    let revoked = 0;
+    for (const [key, lease] of this.conversationLeases) {
+      if (lease.principal !== principal) continue;
+      this.conversationLeases.delete(key);
+      revoked++;
+    }
+    for (const [id, entry] of [...this.entries]) {
+      if (entry.principal !== principal || !entry.conversationLeaseUntil) continue;
+      entry.conversationLeaseUntil = undefined;
+      if (entry.singleUseConsumed && entry.state === 'approved') {
+        this.entries.delete(id); this.failures.delete(id); this.relaunchKeys.delete(entry.key);
+      }
+    }
+    return revoked;
+  }
+  recycleConversationApprovals(principal: string): number {
+    this.prune();
+    let recycled = 0;
+    for (const [id, entry] of [...this.entries]) {
+      if (entry.principal !== principal || !this.isRecyclable(entry)) continue;
+      this.entries.delete(id); this.failures.delete(id); this.relaunchKeys.delete(entry.key); recycled++;
+    }
+    return recycled;
+  }
+  private conversationLeaseKey(principal: string, scopeKey: string): string {
+    return hash(canonical([principal, scopeKey]));
+  }
+  private findConversationLease(operation: ApprovalOperation): ConversationApprovalLease | undefined {
+    for (const scopeKey of operationConversationLeaseKeys(operation)) {
+      const lease = this.conversationLeases.get(this.conversationLeaseKey(operation.principal, scopeKey));
+      if (lease) return lease;
+    }
+    return undefined;
+  }
+  private hasConversationPolicyLease(operation: ApprovalOperation): boolean {
+    return conversationPolicyScopes(operation).some(scope =>
+      this.conversationLeases.has(this.conversationLeaseKey(operation.principal, scope.key)));
+  }
+  private isRecyclable(entry: Approval): boolean {
+    if (!['denied', 'submitted', 'failed'].includes(entry.state)) return false;
+    if (entry.conversationLeaseUntil && entry.conversationLeaseUntil > this.now() && this.hasConversationPolicyLease(entry)) return false;
+    return true;
   }
   decideUi(id: string, principal: string, capability: string, approve: boolean, validate?: (view: ApprovalView) => void): ApprovalView {
     const entry = this.forPrincipal(id, principal);
@@ -110,10 +362,19 @@ export class OwnerApprovals {
     return entry;
   }
   private uiView(entry: Approval): ApprovalView {
+    const leaseScopes = conversationPolicyScopes(entry);
+    const leaseScope = leaseScopes[0];
     return structuredClone({ version: 1 as const, id: entry.id, state: entry.state,
       tool: entry.tool, reason: entry.reason, args: entry.args, context: entry.context,
       expiresAt: new Date(entry.expires).toISOString(), automatic: Boolean(entry.submit || entry.submission || ['submitting', 'failed'].includes(entry.state)),
+      recyclable: this.isRecyclable(entry),
       ...(entry.state === 'pending' ? { decisionToken: entry.uiToken } : {}),
+      ...(leaseScope ? { conversationLease: {
+        eligible: true as const,
+        scope: leaseScope.label,
+        scopes: leaseScopes.map(scope => scope.label),
+        ...(entry.conversationLeaseUntil ? { expiresAt: new Date(entry.conversationLeaseUntil).toISOString() } : {}),
+      } } : {}),
       ...(entry.submission ? { submission: entry.submission } : {}) });
   }
   decide(id: string, nonce: string, suppliedOwner: string, owner: string, approve: boolean, verifiedSession = false): boolean {
@@ -140,11 +401,15 @@ export class OwnerApprovals {
         // Provider errors can contain private paths or prompts. Inspect the
         // workspace task store for details rather than publishing them here.
         entry.state = 'failed';
+        for (const scope of conversationPolicyScopes(entry)) {
+          this.conversationLeases.delete(this.conversationLeaseKey(entry.principal, scope.key));
+        }
+        entry.conversationLeaseUntil = undefined;
       }).finally(() => { entry.expires = this.now() + this.ttl; this.inFlight.delete(pending); });
       this.inFlight.add(pending);
     } else if (!approve) entry.submit = undefined;
   }
-  clear() { this.entries.clear(); this.failures.clear(); }
+  clear() { this.entries.clear(); this.failures.clear(); this.relaunchKeys.clear(); this.conversationLeases.clear(); }
   async close() { this.closed = true; this.clear(); await Promise.allSettled([...this.inFlight]); }
 }
 
@@ -160,20 +425,41 @@ function sensitive(path: string, config: ServerConfig, mutation: boolean) {
     /^(agents|claude)\.md$|^(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|requirements.*\.txt|pyproject\.toml|dockerfile|compose.*\.ya?ml)$/.test(name));
 }
 
-export function classifyMcpOperation(config: ServerConfig, workspaces: Pick<WorkspaceRegistry, 'getWorkspace' | 'resolveReadPath'>, tool: string, args: Arguments) {
+export function classifyMcpOperation(
+  config: ServerConfig,
+  workspaces: Pick<WorkspaceRegistry, 'getWorkspace' | 'resolveReadPath'>,
+  tool: string, args: Arguments, executionBoundaryProfile?: string,
+) {
   const workspace = typeof args.workspaceId === 'string' ? workspaces.getWorkspace(args.workspaceId) : undefined;
   const root = workspace ? canonicalAllowedPath(workspace.root) : undefined;
   const paths: string[] = [];
   let reason: string | undefined;
   const highRiskOnly = config.approvalProfile === 'high_risk_only';
   let mutation = false;
-  if (tool === 'exec_command' || tool === 'bash') reason = 'Arbitrary shell executes with the service OS account authority.';
-  else if (tool === 'run_process') reason = 'Native process execution uses the service OS account authority; literal arguments do not provide a sandbox.';
+  if (tool === 'exec_command' || tool === 'bash') reason = executionBoundaryProfile
+    ? 'Project shell execution is confined to the selected workspace by execution boundary ' + executionBoundaryProfile + ', but arbitrary project code can still modify that workspace and access inherited network/environment state.'
+    : 'Project shell execution has no configured workspace execution boundary and uses the service OS account authority.';
+  else if (tool === 'host_command') reason = 'Host maintenance shell executes with the service OS account authority and is not sandboxed.';
+  else if (tool === 'run_process') reason = executionBoundaryProfile
+    ? 'Native process execution is confined to the selected workspace by execution boundary ' + executionBoundaryProfile + ', but arbitrary project code can still modify that workspace and access inherited network/environment state.'
+    : 'Native process execution has no configured workspace execution boundary and uses the service OS account authority.';
   else if (tool === 'process_cancel') reason = 'Cancel one running process with the service OS account authority.';
   else if (tool === 'project_read_batch') {
     const { items } = parseToolInput(projectReadBatchInputSchema,
       { items: args.items, maxResultBytes: args.maxResultBytes });
     for (const item of items) paths.push(item.path);
+  }
+  else if (tool === 'context_fabric') {
+    // Context Fabric is bounded, workspace-scoped, memory-only state. It cannot
+    // grant execution authority or access new files, so validated operations
+    // remain routine even when they update the in-process folding store.
+    parseToolInput(contextFabricToolInputSchema, args);
+  }
+  else if (tool === 'control_hub') {
+    // Control Hub exposes only fixed relay actions against the preconfigured
+    // endpoint. These actions cannot carry arbitrary commands, paths, secrets,
+    // or local execution authority.
+    parseToolInput(controlHubToolInputSchema, args);
   }
   else if (tool === 'write_stdin') { if (args.chars !== undefined && args.chars !== '') reason = 'Interactive process input can execute additional commands.'; }
   else if (tool === 'codex_task_start' || tool === 'codex_task_continue') {

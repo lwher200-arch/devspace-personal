@@ -182,7 +182,19 @@ counts into token counts or treat them as a provider bill. If independent
 network telemetry is available for the task, show its source and scope
 separately rather than relabeling this payload measurement.
 
-## End each work report with accounting
+## End each work report with a task summary and accounting
+
+Accounting is the final footer, not the work report itself. Before it, summarize
+the completed task in plain language: what changed, what problem or root cause
+was fixed, what verification actually ran, whether the result is only in source
+or is also built/deployed/runtime-verified, and any material remaining issue or
+next step. For partial or failed work, say what completed and where execution
+stopped instead of implying success.
+
+The task summary should stay concise and evidence-based. Use the user's language,
+merge overlapping categories, and omit empty or obvious fields. A small task may
+need only two to four short lines. It must not be replaced by a diff count,
+changelog entry, tool transcript or usage report.
 
 Keep accounting economical: collect one snapshot near the end of the turn,
 reuse already available receipts, and put detailed call records in the local
@@ -198,10 +210,15 @@ These are workflow controls, not evidence of measured savings: compare equal
 acceptance criteria and actual receipts before making a cost-reduction claim.
 
 Every task turn must end with a traffic and token accounting footer after the
-work outcome and validation evidence, even when receipts are unavailable. Give
+task summary, work outcome and validation evidence, even when receipts are unavailable. Give
 the sampling time, separate coverage states and one set of counters for each
 available source. Use actual values or `unavailable`; never estimate a tool's
 token cost from its runtime, response length or the number of tool calls.
+
+If most accounting sources are unavailable, prefer one compact sentence listing
+the unavailable sources instead of expanding every unavailable counter. Use the
+full field-by-field shape only when real measurements or materially different
+coverage states are available.
 
 ```text
 Traffic and token accounting (sampled at <UTC timestamp>)

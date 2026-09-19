@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { parsePatchFiles, type FileDiffMetadata, type FileDiffOptions } from "@pierre/diffs";
 import { FileDiff } from "@pierre/diffs/react";
-import type { HostContext, ToolResultCard } from "./card-types.js";
+import { reviewPreviewMessage, type HostContext, type ToolResultCard } from "./card-types.js";
 import {
   fileChangeKindLabel,
   getRenderedFileChangePathDisplay,
@@ -57,7 +57,9 @@ function ReviewPayload({
   const [openFiles, setOpenFiles] = useState(() => new Set<string>());
 
   if (errorMessage) return <StatusLine message={errorMessage} tone="error" />;
-  if (!patch) return <StatusLine message="Diff payload is not available." />;
+  if (!patch) {
+    return <StatusLine message={reviewPreviewMessage(card) ?? "Diff payload is not available."} />;
+  }
   if (files.length === 0) return <StatusLine message="No diff hunks to review." />;
 
   const options = diffOptions(themeType);

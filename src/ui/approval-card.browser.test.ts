@@ -22,19 +22,23 @@ test('approval card requires a click, handles failure and denial, and fits mobil
   const buildDirectory = process.env.DEVSPACE_UI_BUILD_DIR ? resolve(process.env.DEVSPACE_UI_BUILD_DIR) : undefined;
   const fixture = { version: 1, id: 'approval-ui-fixture', state: 'pending', tool: 'codex_task_start', reason: 'Review one read-only Codex turn.',
     args: { workspaceId: 'ws-fixture', prompt: 'Read probe.txt. <img src=x onerror=window.pwned=true>', writeMode: 'read_only' },
-    context: { root: '/example/project', selectedModel: 'gpt-5.6-sol' }, expiresAt: '2099-01-01T00:00:00Z', automatic: true, decisionToken: 'u'.repeat(43) };
+    context: { root: '/example/project', selectedModel: 'gpt-5.6-sol' }, expiresAt: '2099-01-01T00:00:00Z', approvalUrl: 'https://devspace.example/owner/approvals/approval-ui-fixture', automatic: true, decisionToken: 'u'.repeat(43) };
+  const leaseFixture = { ...fixture, id: 'approval-ui-lease-fixture', tool: 'exec_command', reason: 'Review one local command.',
+    args: { workspaceId: 'ws-fixture', cmd: 'echo ok' }, context: { root: '/example/project', targets: [] }, automatic: false,
+    conversationLease: { eligible: true, scope: 'safe operations in this conversation' } };
   const scripts = new Map([
     ['/approval-card.js', new URL('./approval-card.ts', import.meta.url)],
     ['/approval-protocol.js', new URL('../approval-protocol.ts', import.meta.url)],
   ].map(([path, url]) => [String(path), ts.transpileModule(readFileSync(url as URL, 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText]));
   const server = createServer((req, res) => {
-    if (buildDirectory && req.url === '/host-bridge') {
+    if (buildDirectory && (req.url === '/host-bridge' || req.url === '/host-bridge-lease')) {
       const entry = JSON.parse(readFileSync(join(buildDirectory, '.vite/manifest.json'), 'utf8'))['workspace-app.html'];
+      const initialView = req.url === '/host-bridge-lease' ? leaseFixture : fixture;
       res.setHeader('content-type', 'text/html; charset=utf-8');
       res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">${(entry.css ?? []).map((path: string) => `<link rel="stylesheet" href="/built/${path}">`).join('')}<style>body{background:#f6f6f6;padding:12px}</style><main id="app"></main><script>
-const initial=${JSON.stringify(fixture)};window.fixture={calls:[],messages:[]};
+const initial=${JSON.stringify(initialView)};window.fixture={calls:[],messages:[]};
 window.openai={theme:'light',toolOutput:{result:'Awaiting user'},toolResponseMetadata:{'devspace/approval':initial},
- callTool:async(name,args)=>{fixture.calls.push({name,args});return {content:[],_meta:{'devspace/approval':{...initial,state:'submitted',decisionToken:undefined,submission:{agentId:'agt-built-fixture',workspaceId:'ws-fixture'}}}};},
+ callTool:async(name,args)=>{fixture.calls.push({name,args});const conversation=args?.decision==='approve_conversation';return {content:[],_meta:{'devspace/approval':{...initial,state:conversation?'approved':'submitted',decisionToken:undefined,...(conversation?{conversationLease:{...initial.conversationLease,expiresAt:initial.expiresAt}}:{submission:{agentId:'agt-built-fixture',workspaceId:'ws-fixture'}})}}};},
  sendFollowUpMessage:async message=>{fixture.messages.push(message);}};</script><script type="module" src="/built/${entry.file}"></script>`); return;
     }
     if (buildDirectory && req.url?.startsWith('/built/')) {
@@ -48,9 +52,9 @@ window.openai={theme:'light',toolOutput:{result:'Awaiting user'},toolResponseMet
     res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><link rel="stylesheet" href="/style.css"><style>body{background:#181818;padding:12px}</style><main id="app"></main><script type="module">
 import {mountApprovalCard} from '/approval-card.js';
 const base=${JSON.stringify(fixture)};
-window.fixture={calls:[],messages:[],fail:false}; let unmount;
-window.reset=(overrides={})=>{unmount?.();fixture.calls=[];fixture.messages=[];fixture.fail=false;fixture.failNotify=false;fixture.delayed=false;fixture.pending=false;fixture.current={...base,...overrides};unmount=mountApprovalCard(document.querySelector('#app'),fixture.current,{
-  review:async(name,args)=>{fixture.calls.push({name,args});if(fixture.fail)throw Error('fixture transport loss');if(name==='decide_approval'&&fixture.delayed){fixture.pending=true;return fixture.current={...base,decisionToken:undefined,state:'submitting'};}if(name==='review_approval'&&fixture.pending){fixture.pending=false;return fixture.current={...base,decisionToken:undefined,state:'submitted',submission:{agentId:'agt-ui-fixture',workspaceId:'ws-fixture'}};}return name==='decide_approval'?fixture.current={...base,decisionToken:undefined,state:args.decision==='deny'?'denied':'submitted',submission:args.decision==='approve'?{agentId:'agt-ui-fixture',workspaceId:'ws-fixture'}:undefined}:fixture.current;},
+window.fixture={calls:[],messages:[],fail:false,failDecision:false}; let unmount;
+window.reset=(overrides={})=>{unmount?.();fixture.calls=[];fixture.messages=[];fixture.fail=false;fixture.failDecision=false;fixture.failNotify=false;fixture.delayed=false;fixture.pending=false;fixture.current={...base,...overrides};unmount=mountApprovalCard(document.querySelector('#app'),fixture.current,{
+  review:async(name,args)=>{fixture.calls.push({name,args});if(fixture.fail)throw Error('fixture transport loss');if(name==='decide_approval'&&fixture.failDecision){fixture.failDecision=false;fixture.pending=true;fixture.current={...base,decisionToken:undefined,state:'submitted',submission:{agentId:'agt-ui-fixture',workspaceId:'ws-fixture'}};throw Error('decision response lost');}if(name==='decide_approval'&&fixture.delayed){fixture.pending=true;return fixture.current={...base,decisionToken:undefined,state:'submitting'};}if(name==='review_approval'&&fixture.pending){fixture.pending=false;return fixture.current={...base,decisionToken:undefined,state:'submitted',submission:{agentId:'agt-ui-fixture',workspaceId:'ws-fixture'}};}if(name==='decide_approval'&&args.decision==='approve_conversation'){return fixture.current={...fixture.current,decisionToken:undefined,state:'approved',conversationLease:{...fixture.current.conversationLease,expiresAt:fixture.current.expiresAt}};}return name==='decide_approval'?fixture.current={...fixture.current,decisionToken:undefined,state:args.decision==='deny'?'denied':'submitted',submission:args.decision==='approve'?{agentId:'agt-ui-fixture',workspaceId:'ws-fixture'}:undefined}:fixture.current;},
   notify:async message=>{fixture.messages.push(message);if(fixture.failNotify)throw Error('fixture notification failure');}
 });};reset();</script>`);
   });
@@ -83,6 +87,11 @@ window.reset=(overrides={})=>{unmount?.();fixture.calls=[];fixture.messages=[];f
   assert.ok(loaded); assert.equal(await evaluate('fixture.calls.length'), 0, 'render must never decide');
   assert.equal(await evaluate(`document.body.innerText.includes(${JSON.stringify(fixture.decisionToken)})`), false);
   assert.equal(await evaluate('Boolean(window.pwned)'), false);
+  assert.equal(await evaluate('Boolean(document.querySelector(".approval-collapse"))'), true, 'pending cards expose an explicit collapse control');
+  await evaluate('document.querySelector(".approval-collapse").click()');
+  assert.equal(await evaluate('document.querySelector(".approval-body")?.hidden'), true, 'collapse hides the whole card body without deciding');
+  assert.equal(await evaluate('fixture.calls.length'), 0, 'collapsing a card is presentation only');
+  await evaluate('document.querySelector(".approval-collapse").click()');
   for (const width of [900, 360]) {
     await browser.send('Emulation.setDeviceMetricsOverride', { width, height: 900, deviceScaleFactor: 1, mobile: false }, sessionId);
     assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'), true);
@@ -92,34 +101,63 @@ window.reset=(overrides={})=>{unmount?.();fixture.calls=[];fixture.messages=[];f
       writeFileSync(join(output, `pending-${width}.png`), Buffer.from(capture.data, 'base64'));
     }
   }
+  await evaluate('reset({tool:"exec_command",automatic:false,conversationLease:{eligible:true,scope:"safe operations in this conversation"}})');
+  assert.equal(await evaluate('Boolean(document.querySelector(".approval-conversation"))'), true, 'eligible non-Codex approvals expose the conversation action');
+  assert.equal(await evaluate('document.body.innerText.includes("本对话始终批准（受限范围）")'), true);
+  await evaluate('document.querySelector(".approval-conversation").click()'); await delay(50);
+  assert.equal(await evaluate('fixture.calls[0].args.decision'), 'approve_conversation');
+  assert.equal(await evaluate('document.querySelector(".approval-context")?.open'), false, 'conversation approval collapses parameter details after the decision');
+  assert.equal(await evaluate('document.querySelector(".approval-body")?.hidden'), true, 'conversation approval collapses the whole terminal card');
+  assert.equal(await evaluate('document.querySelector(".approval-body")?.textContent.includes("本对话受限授权有效至")'), true);
+  assert.equal(await evaluate('fixture.messages[0].includes("conversationLeaseUntil")'), true);
+  assert.equal(await evaluate('fixture.messages[0].includes("Retry the exact approved operation first.")'), true);
+  assert.equal(await evaluate('fixture.messages[0].indexOf("Retry") < fixture.messages[0].indexOf("claim_approval")'), true);
+  assert.equal(await evaluate('fixture.messages[0].includes("review_approval")'), true, 'cached hosts get an explicit compatibility claim path');
+  assert.equal(await evaluate('fixture.messages[0].includes("__claim__")'), true, 'compatibility claim prefix is present in the Chat follow-up');
+  await evaluate('reset()');
   await evaluate('document.querySelector(".approval-primary").click()'); await delay(50);
   assert.equal(await evaluate('fixture.calls.length'), 1);
   assert.equal(await evaluate('fixture.calls[0].name'), 'decide_approval');
   assert.equal(await evaluate('fixture.messages.length'), 1);
   assert.equal(await evaluate(`fixture.messages[0].includes(${JSON.stringify(fixture.decisionToken)})`), false);
-  assert.equal(await evaluate('document.body.innerText.includes("agt-ui-fixture")'), true);
+  assert.equal(await evaluate('document.querySelector(".approval-body")?.textContent.includes("agt-ui-fixture")'), true);
+  assert.equal(await evaluate('document.querySelector(".approval-context")?.open'), false, 'completed approvals collapse their parameter details');
+  assert.equal(await evaluate('document.querySelector(".approval-body")?.hidden'), true, 'completed approvals collapse the whole terminal card');
   await evaluate('reset();fixture.delayed=true;document.querySelector(".approval-primary").click()'); await delay(50);
   assert.equal(await evaluate('fixture.messages.length'), 0, 'do not notify Chat before a submission receipt exists');
   for (let i = 0; i < 60 && !await evaluate('fixture.messages.length'); i++) await delay(50);
   assert.equal(await evaluate('fixture.messages.length'), 1);
   assert.equal(await evaluate('fixture.messages[0].includes("agt-ui-fixture")'), true);
   assert.equal(await evaluate('fixture.calls.filter(call=>call.name==="decide_approval").length'), 1);
-  await evaluate('reset(); document.querySelectorAll("button")[1].click()'); await delay(50);
+  await evaluate('reset(); [...document.querySelectorAll(".approval-actions button")].find(button=>button.textContent==="拒绝").click()'); await delay(50);
   assert.equal(await evaluate('fixture.calls[0].args.decision'), 'deny');
   assert.equal(await evaluate('document.body.innerText.includes("已拒绝")'), true);
+  assert.equal(await evaluate('document.querySelector(".approval-context")?.open'), false, 'denied approvals collapse their parameter details');
+  assert.equal(await evaluate('document.querySelector(".approval-body")?.hidden'), true, 'denied approvals collapse the whole terminal card');
   await evaluate('reset({expiresAt:"2000-01-01T00:00:00Z"});document.querySelector(".approval-primary").click()');
   assert.equal(await evaluate('fixture.calls.length'), 0);
+  await evaluate('reset();fixture.failDecision=true;document.querySelector(".approval-primary").click()'); await delay(100);
+  assert.equal(await evaluate('fixture.calls.filter(call=>call.name==="decide_approval").length'), 1);
+  assert.equal(await evaluate('fixture.calls.filter(call=>call.name==="review_approval").length'), 1);
+  assert.equal(await evaluate('fixture.messages.length'), 1, 'a lost decision response should recover from the read-only status check');
+  assert.equal(await evaluate('document.body.innerText.includes("Codex 任务已提交")'), true);
   await evaluate('reset();fixture.fail=true;document.querySelector(".approval-primary").click()'); await delay(100);
-  assert.equal(await evaluate('fixture.calls.length'), 1, 'ambiguous delivery must not auto-retry');
+  assert.equal(await evaluate('fixture.calls.length'), 2, 'ambiguous delivery must reconcile with a read-only status check');
+  assert.equal(await evaluate('fixture.calls[1].name'), 'review_approval');
   assert.equal(await evaluate('document.querySelector(".approval-primary").disabled'), true);
+  assert.equal(await evaluate('document.querySelector(".approval-owner-link")?.getAttribute("href")'), fixture.approvalUrl);
   await evaluate('reset();fixture.failNotify=true;document.querySelector(".approval-primary").click()'); await delay(50);
   assert.equal(await evaluate('fixture.calls.length'), 1);
   assert.equal(await evaluate('Boolean(document.querySelector(".approval-continue"))'), true);
+  assert.equal(await evaluate('document.querySelector(".approval-body")?.hidden'), false, 'notification failure expands recovery controls');
   await evaluate('fixture.failNotify=false;document.querySelector(".approval-continue").click()'); await delay(50);
   assert.equal(await evaluate('fixture.calls.filter(call=>call.name==="decide_approval").length'), 1, 'notification recovery must not approve or execute again');
   assert.equal(await evaluate('fixture.messages.length'), 2);
   await evaluate('reset({state:"submitted",decisionToken:undefined,submission:{agentId:"agt-restored",workspaceId:"ws-fixture"}})'); await delay(50);
   assert.equal(await evaluate('fixture.messages.length'), 0, 'history restore must not auto-send a message');
+  assert.equal(await evaluate('document.querySelector(".approval-context")?.open'), false, 'restored completed approvals stay collapsed');
+  assert.equal(await evaluate('document.querySelector(".approval-body")?.hidden'), true, 'restored completed cards stay compact');
+  await evaluate('document.querySelector(".approval-collapse").click()');
   await evaluate('document.querySelector(".approval-continue").click()'); await delay(50);
   assert.equal(await evaluate('fixture.messages[0].includes("agt-restored")'), true);
   assert.equal(await evaluate('fixture.calls[0].name'), 'review_approval');
@@ -143,5 +181,13 @@ window.reset=(overrides={})=>{unmount?.();fixture.calls=[];fixture.messages=[];f
     assert.equal(await evaluate('fixture.calls.length'), 1); assert.equal(await evaluate('fixture.messages.length'), 1);
     assert.equal(await evaluate('fixture.messages[0].prompt.includes("agt-built-fixture")'), true);
     assert.equal(await evaluate(`fixture.messages[0].prompt.includes(${JSON.stringify(fixture.decisionToken)})`), false);
+    await browser!.send('Page.navigate', { url: `http://127.0.0.1:${(server.address() as { port: number }).port}/host-bridge-lease` }, sessionId);
+    let leaseReady = false;
+    for (let i = 0; i < 240; i++) { if (await evaluate('Boolean(document.querySelector(".approval-conversation"))')) { leaseReady = true; break; } await delay(50); }
+    assert.ok(leaseReady, 'actual bundled entrypoint must expose the scoped conversation approval action');
+    await evaluate('document.querySelector(".approval-conversation").click()'); await delay(100);
+    assert.equal(await evaluate('fixture.calls[0].args.decision'), 'approve_conversation');
+    assert.equal(await evaluate('document.querySelector(".approval-context")?.open'), false);
+    assert.equal(await evaluate('fixture.messages[0].prompt.includes("conversationLeaseUntil")'), true);
   });
 });

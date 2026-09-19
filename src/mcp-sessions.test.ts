@@ -84,3 +84,11 @@ finishDelayedClose?.();
 await delayedClose;
 assert.equal(delayedCloseResolved, true);
 assert.equal(registry.size, 0);
+
+const defaultCapacityRegistry = new McpSessionRegistry<FakeTransport>();
+for (let i = 0; i < 33; i++) defaultCapacityRegistry.register(`session-${i}`, createTransport());
+const defaultCapacityReservation = await defaultCapacityRegistry.reserve();
+assert.ok(defaultCapacityReservation, 'default MCP capacity must exceed the previous 32-session ceiling');
+assert.deepEqual(defaultCapacityReservation.closed, [], 'normal ChatGPT multi-session churn must not evict at 33 sessions');
+defaultCapacityReservation.release();
+await defaultCapacityRegistry.closeAll();

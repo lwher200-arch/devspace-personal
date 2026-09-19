@@ -10,6 +10,13 @@ export type ReviewFileType =
   | "new"
   | "deleted";
 
+export interface ReviewPreview {
+  complete?: boolean;
+  includedFiles?: number;
+  totalFiles?: number;
+  omittedFiles?: number;
+}
+
 export interface ToolResultCard {
   tool: ToolName;
   workspaceId?: string;
@@ -38,6 +45,7 @@ export interface ToolResultCard {
     additions?: number;
     removals?: number;
   }>;
+  preview?: ReviewPreview;
   payload?: { patch?: string };
   agentsFiles?: Array<{
     path?: string;
@@ -73,6 +81,27 @@ export function summaryNumber(
 ): number | undefined {
   const value = summary?.[key];
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+export function reviewPreviewFileCount(card: ToolResultCard): number {
+  const fallback = card.files?.length ?? 0;
+  const included = card.preview?.includedFiles;
+  if (typeof included !== "number" || !Number.isInteger(included) || included < 0) return fallback;
+  return Math.min(included, fallback);
+}
+
+export function reviewPreviewMessage(card: ToolResultCard): string | undefined {
+  if (card.preview?.complete !== false) return undefined;
+  const included = reviewPreviewFileCount(card);
+  const totalValue = card.preview.totalFiles;
+  const total = typeof totalValue === "number" && Number.isInteger(totalValue) && totalValue >= included
+    ? totalValue
+    : Math.max(included, card.files?.length ?? 0);
+  const omittedValue = card.preview.omittedFiles;
+  const omitted = typeof omittedValue === "number" && Number.isInteger(omittedValue) && omittedValue >= 0
+    ? omittedValue
+    : Math.max(0, total - included);
+  return `Diff preview includes ${included} of ${total} changed ${total === 1 ? "file" : "files"}; ${omitted} ${omitted === 1 ? "file" : "files"} omitted by preview limits. File statistics are complete.`;
 }
 
 export function isExpandableCard(card: ToolResultCard): boolean {

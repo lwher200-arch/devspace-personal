@@ -2,6 +2,11 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
+import type {
+  PreparedWorkspaceExecution,
+  WorkspaceExecutionBoundary,
+  WorkspaceExecutionNetworkProfile,
+} from "./workspace-execution-boundary.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_INTERACTIVE_YIELD_MS = 250;
@@ -24,6 +29,12 @@ export interface StartCommandInput {
   rows?: number;
   yieldTimeMs?: number;
   maxOutputTokens?: number;
+  executionBoundary?: WorkspaceExecutionBoundary;
+  networkProfile?: WorkspaceExecutionNetworkProfile;
+}
+
+export interface RunCommandInput extends Omit<StartCommandInput, "yieldTimeMs"> {
+  timeoutMs?: number;
 }
 
 export interface WriteStdinInput {
@@ -46,6 +57,8 @@ export interface StartProcessInput {
   timeoutMs?: number;
   yieldTimeMs?: number;
   maxOutputTokens?: number;
+  executionBoundary?: WorkspaceExecutionBoundary;
+  networkProfile?: WorkspaceExecutionNetworkProfile;
 }
 
 export interface NativeProcessSnapshot extends ProcessSnapshot {
@@ -64,6 +77,9 @@ export interface ProcessSnapshot {
   running: boolean;
   exitCode?: number;
   signal?: string;
+  timedOut?: boolean;
+  boundaryProfile?: string;
+  networkProfile?: WorkspaceExecutionNetworkProfile;
   wallTimeMs: number;
 }
 
@@ -88,6 +104,9 @@ interface ProcessSession {
   resolveExit: () => void;
   cleanupTimer?: NodeJS.Timeout;
   runtimeTimer?: NodeJS.Timeout;
+  timedOut?: boolean;
+  boundaryProfile?: string;
+  networkProfile?: WorkspaceExecutionNetworkProfile;
   native?: {
     executionId: string;
     cwd: string;
@@ -153,8 +172,8 @@ function terminalSize(value: number | undefined, fallback: number): number {
 function processEnvironment(input?: {
   workspaceId?: string;
   workspaceRoot?: string;
-}): Record<string, string> {
-  return {
+}, executionBoundary?: WorkspaceExecutionBoundary): Record<string, string> {
+  const environment = {
     ...Object.fromEntries(
       Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
     ),
@@ -169,6 +188,7 @@ function processEnvironment(input?: {
     ...(input?.workspaceId ? { DEVSPACE_WORKSPACE_ID: input.workspaceId } : {}),
     ...(input?.workspaceRoot ? { DEVSPACE_WORKSPACE_ROOT: input.workspaceRoot } : {}),
   };
+  return executionBoundary?.filterEnvironment?.(environment) ?? environment;
 }
 
 function codePointLength(value: string): number {
@@ -290,19 +310,32 @@ export class ProcessSessionManager {
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
-    const session = this.createSession(input);
-    this.sessions.set(session.id, session);
-
-    try {
-      if (input.tty && process.platform !== "win32") await this.startPty(session, input);
-      else this.startPipe(session, input);
-    } catch (error) {
-      this.sessions.delete(session.id);
-      throw error;
-    }
-
+    const session = await this.beginCommand(input);
     const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_COMMAND_YIELD_MS);
     await this.waitForExit(session, yieldTimeMs);
+
+    const snapshot = this.consume(session, input.maxOutputTokens);
+    if (!session.running) this.removeSession(session.id);
+    return snapshot;
+  }
+
+  async runToCompletion(input: RunCommandInput): Promise<ProcessSnapshot> {
+    const timeoutMs = nativeInteger(input.timeoutMs, 30_000, 1, 300_000);
+    const session = await this.beginCommand(input);
+    session.timedOut = false;
+    session.runtimeTimer = setTimeout(() => {
+      if (!session.running) return;
+      session.timedOut = true;
+      session.process?.kill("SIGKILL");
+    }, timeoutMs);
+    session.runtimeTimer.unref();
+
+    await this.waitForExit(session, timeoutMs + 5_000);
+    if (session.running) {
+      session.timedOut = true;
+      session.process?.kill("SIGKILL");
+      await this.waitForExit(session, 1_000);
+    }
 
     const snapshot = this.consume(session, input.maxOutputTokens);
     if (!session.running) this.removeSession(session.id);
@@ -312,10 +345,29 @@ export class ProcessSessionManager {
   async startProcess(input: StartProcessInput): Promise<NativeProcessSnapshot> {
     // Validate all budgets before the child can have any side effects.
     const { args, timeoutMs, yieldTimeMs } = validateNativeInput(input);
+    if (input.networkProfile === "none" && !input.executionBoundary) {
+      throw new Error("Network isolation requires a configured workspace execution boundary.");
+    }
+    const prepared: PreparedWorkspaceExecution = input.executionBoundary
+      ? input.executionBoundary.prepare({
+          workspaceRoot: input.workspaceRoot ?? input.cwd,
+          cwd: input.cwd,
+          executable: input.executable,
+          args,
+          networkProfile: input.networkProfile,
+        })
+      : { executable: input.executable, args, boundaryProfile: "" };
     const session = this.createSession({ workspaceId: input.workspaceId });
-    session.native = { executionId: randomUUID(), cwd: input.cwd, timedOut: false, cancelled: false };
+    if (prepared.boundaryProfile) session.boundaryProfile = prepared.boundaryProfile;
+    session.networkProfile = prepared.networkProfile ?? input.networkProfile;
+    session.native = {
+      executionId: randomUUID(),
+      cwd: input.cwd,
+      timedOut: false,
+      cancelled: false,
+    };
     this.sessions.set(session.id, session);
-    this.startNativePipe(session, input, args, timeoutMs);
+    this.startNativePipe(session, { ...input, executable: prepared.executable }, prepared.args, timeoutMs);
     await this.waitForExit(session, yieldTimeMs);
     const snapshot = this.consume(session, input.maxOutputTokens) as NativeProcessSnapshot;
     if (!session.running) this.removeSession(session.id);
@@ -433,19 +485,59 @@ export class ProcessSessionManager {
     };
   }
 
-  private startPipe(session: ProcessSession, input: StartCommandInput): void {
+  private async beginCommand(input: StartCommandInput): Promise<ProcessSession> {
     const shell = resolveShellCommand(input.command);
+    // Preserve the pre-A2 non-PTY shell:true contract: POSIX shells use -c.
+    // PTY execution keeps resolveShellCommand() semantics (for example bash -lc).
+    const shellArgs = !input.tty && process.platform !== "win32"
+      ? ["-c", input.command]
+      : shell.args;
+    if (input.networkProfile === "none" && !input.executionBoundary) {
+      throw new Error("Network isolation requires a configured workspace execution boundary.");
+    }
+    const prepared: PreparedWorkspaceExecution = input.executionBoundary
+      ? input.executionBoundary.prepare({
+          workspaceRoot: input.workspaceRoot ?? input.cwd,
+          cwd: input.cwd,
+          executable: shell.executable,
+          args: shellArgs,
+          networkProfile: input.networkProfile,
+        })
+      : {
+          executable: shell.executable,
+          args: shellArgs,
+          boundaryProfile: "",
+        };
+    const session = this.createSession(input);
+    if (prepared.boundaryProfile) session.boundaryProfile = prepared.boundaryProfile;
+    session.networkProfile = prepared.networkProfile ?? input.networkProfile;
+    this.sessions.set(session.id, session);
+    try {
+      if (input.tty && process.platform !== "win32") await this.startPty(session, input, prepared);
+      else this.startPipe(session, input, prepared);
+      return session;
+    } catch (error) {
+      this.sessions.delete(session.id);
+      throw error;
+    }
+  }
+
+  private startPipe(
+    session: ProcessSession,
+    input: StartCommandInput,
+    prepared: PreparedWorkspaceExecution,
+  ): void {
     const detached = process.platform !== "win32";
-    const child = spawn(input.command, {
+    const child = spawn(prepared.executable, prepared.args, {
       cwd: input.cwd,
       env: processEnvironment({
         workspaceId: input.workspaceId,
         workspaceRoot: input.workspaceRoot,
-      }),
+      }, input.executionBoundary),
       stdio: "pipe",
       windowsHide: true,
       detached,
-      shell: shell.executable,
+      shell: false,
     });
 
     session.process = {
@@ -461,12 +553,16 @@ export class ProcessSessionManager {
 
   private startNativePipe(session: ProcessSession, input: StartProcessInput, args: string[], timeoutMs: number): void {
     const detached = process.platform !== "win32";
+    const stdinPayload = input.stdin ?? "";
+    const hasStdinPayload = Buffer.byteLength(stdinPayload, "utf8") > 0;
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(input.executable, args, {
         cwd: input.cwd,
-        env: processEnvironment(input),
-        stdio: "pipe",
+        env: processEnvironment(input, input.executionBoundary),
+        // A no-input process should receive EOF from the null device. A pipe
+        // races fast-exiting children and reports a spurious EPIPE on close.
+        stdio: [hasStdinPayload ? "pipe" : "ignore", "pipe", "pipe"],
         shell: false,
         windowsHide: true,
         detached,
@@ -489,9 +585,11 @@ export class ProcessSessionManager {
       // Error codes identify launch failures without copying argv or stdin into logs.
       session.native!.spawnError = error.code ?? "SPAWN_FAILED";
     });
-    child.stdin!.on("error", (error: NodeJS.ErrnoException) => {
-      session.native!.stdinError = error.code ?? "STDIN_FAILED";
-    });
+    if (child.stdin) {
+      child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+        session.native!.stdinError = error.code ?? "STDIN_FAILED";
+      });
+    }
     child.on("close", (code, signal) => this.finish(session, code ?? undefined, signal ?? undefined));
     session.runtimeTimer = setTimeout(() => {
       if (!session.running) return;
@@ -500,10 +598,14 @@ export class ProcessSessionManager {
       session.process?.kill("SIGKILL");
     }, Math.max(0, timeoutMs - (Date.now() - session.startedAt)));
     session.runtimeTimer.unref();
-    child.stdin!.end(input.stdin ?? "", "utf8");
+    if (child.stdin) child.stdin.end(stdinPayload, "utf8");
   }
 
-  private async startPty(session: ProcessSession, input: StartCommandInput): Promise<void> {
+  private async startPty(
+    session: ProcessSession,
+    input: StartCommandInput,
+    prepared: PreparedWorkspaceExecution,
+  ): Promise<void> {
     let nodePty: typeof import("node-pty");
     try {
       nodePty = await import("node-pty");
@@ -511,15 +613,14 @@ export class ProcessSessionManager {
       throw new Error("PTY support requires the optional node-pty dependency.");
     }
 
-    const shell = resolveShellCommand(input.command);
     let pty: import("node-pty").IPty;
     try {
-      pty = nodePty.spawn(shell.executable, shell.args, {
+      pty = nodePty.spawn(prepared.executable, prepared.args, {
         cwd: input.cwd,
         env: processEnvironment({
           workspaceId: input.workspaceId,
           workspaceRoot: input.workspaceRoot,
-        }),
+        }, input.executionBoundary),
         name: "xterm-256color",
         cols: session.columns,
         rows: session.rows,
@@ -569,6 +670,9 @@ export class ProcessSessionManager {
       running: session.running,
       exitCode: session.exitCode,
       signal: session.signal,
+      ...(session.timedOut !== undefined ? { timedOut: session.timedOut } : {}),
+      ...(session.boundaryProfile ? { boundaryProfile: session.boundaryProfile } : {}),
+      ...(session.networkProfile ? { networkProfile: session.networkProfile } : {}),
       wallTimeMs: Date.now() - session.startedAt,
       ...(session.native ?? {}),
     };

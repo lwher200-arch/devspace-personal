@@ -19,6 +19,8 @@ export interface McpSessionRegistryOptions {
   maxSessions?: number;
 }
 
+const DEFAULT_MCP_SESSION_CAPACITY = 128;
+
 export interface McpSessionReservation<TTransport> {
   closed: McpSessionCloseResult[];
   register(sessionId: string, transport: TTransport): void;
@@ -33,7 +35,11 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
 
   constructor(options: McpSessionRegistryOptions = {}) {
     this.now = options.now ?? Date.now;
-    this.maxSessions = options.maxSessions ?? 32;
+    // ChatGPT may maintain several short-lived MCP sessions in parallel for
+    // tool discovery, tool calls and UI-resource reads. A 32-session ceiling
+    // proved low enough to evict still-referenced idle sessions under normal
+    // host churn, which can surface as a template fetch failure.
+    this.maxSessions = options.maxSessions ?? DEFAULT_MCP_SESSION_CAPACITY;
     if (!Number.isSafeInteger(this.maxSessions) || this.maxSessions < 1) {
       throw new RangeError("MCP session capacity must be a positive integer.");
     }

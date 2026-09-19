@@ -55,6 +55,33 @@ export const workspaceConversationBindings = sqliteTable(
   ],
 );
 
+export const workspaceLeases = sqliteTable(
+  "workspace_leases",
+  {
+    id: text("id").primaryKey(),
+    clientId: text("client_id").notNull(),
+    conversationScopeId: text("conversation_scope_id").notNull(),
+    workspaceRoot: text("workspace_root").notNull(),
+    durationSeconds: integer("duration_seconds").notNull(),
+    policyVersion: text("policy_version").notNull(),
+    boundaryProfile: text("boundary_profile").notNull(),
+    state: text("state").notNull(),
+    requestedAt: text("requested_at").notNull(),
+    issuedAt: text("issued_at"),
+    expiresAt: text("expires_at"),
+    updatedAt: text("updated_at").notNull(),
+    integrity: text("integrity").notNull(),
+  },
+  (table) => [
+    index("workspace_leases_principal_idx").on(
+      table.clientId,
+      table.conversationScopeId,
+      table.updatedAt,
+    ),
+    index("workspace_leases_state_expiry_idx").on(table.state, table.expiresAt),
+  ],
+);
+
 export const oauthClients = sqliteTable(
   "oauth_clients",
   {
@@ -123,5 +150,7 @@ export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;
 export type NewLoadedAgentFileRow = typeof loadedAgentFiles.$inferInsert;
 export type WorkspaceConversationBindingRow = typeof workspaceConversationBindings.$inferSelect;
 export type NewWorkspaceConversationBindingRow = typeof workspaceConversationBindings.$inferInsert;
+export type WorkspaceLeaseRow = typeof workspaceLeases.$inferSelect;
+export type NewWorkspaceLeaseRow = typeof workspaceLeases.$inferInsert;
 export type LocalAgentSessionRow = typeof localAgentSessions.$inferSelect;
 export type NewLocalAgentSessionRow = typeof localAgentSessions.$inferInsert;

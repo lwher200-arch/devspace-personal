@@ -77,6 +77,28 @@ test("show_changes reports and advances the last-shown checkpoint", async (t) =>
   assert.equal(afterReviewed.patch, "");
 });
 
+test("large review payloads keep a complete file summary and bound the patch preview", async (t) => {
+  const root = await committedRepository(t);
+  const manager = createReviewCheckpointManager();
+  await manager.initializeWorkspace({ workspaceId: "ws_large_preview", root });
+
+  await writeFile(join(root, "00-huge.txt"), "x\n".repeat(350_000));
+  await writeFile(join(root, "01-small.txt"), "small\n");
+
+  const review = await manager.reviewChanges({
+    workspaceId: "ws_large_preview",
+    root,
+    markReviewed: false,
+  });
+  assert.equal(review.summary.files, 2);
+  assert.deepEqual(review.files.map((file) => file.path), ["00-huge.txt", "01-small.txt"]);
+  assert.equal(review.patchTruncated, true);
+  assert.equal(review.patchFileCount, 1);
+  assert.match(review.patch, /01-small\.txt/);
+  assert.doesNotMatch(review.patch, /x{1000}/);
+  assert.match(review.result, /bounded to 1 of 2 changed files/);
+});
+
 test("historical review refs survive later reviews and manager restarts", async (t) => {
   const root = await committedRepository(t);
   const manager = createReviewCheckpointManager();
@@ -238,17 +260,32 @@ test("a concurrent review rejects a different root after initialization", async 
   }
 });
 
-test("an unborn repository becomes reviewable after its first commit", async (t) => {
+test("an unborn repository is reviewable without creating the user's first commit", async (t) => {
   const root = await unbornRepository(t);
   const manager = createReviewCheckpointManager();
 
-  await manager.initializeWorkspace({ workspaceId: "ws_unborn", root });
+  assert.deepEqual(
+    await manager.initializeWorkspace({ workspaceId: "ws_unborn", root }),
+    { available: true },
+  );
   await assert.rejects(
-    () => manager.reviewChanges({ workspaceId: "ws_unborn", root }),
-    /repository has no HEAD commit/,
+    () => execFileAsync("git", ["rev-parse", "--verify", "HEAD"], { cwd: root }),
   );
 
   await writeFile(join(root, "README.md"), "first commit\n");
+  const beforeFirstCommit = await manager.reviewChanges({
+    workspaceId: "ws_unborn",
+    root,
+    markReviewed: false,
+  });
+  assert.deepEqual(beforeFirstCommit.files.map((file) => file.path), ["README.md"]);
+  assert.equal(beforeFirstCommit.summary.additions, 1);
+  assert.match(beforeFirstCommit.patch, /first commit/);
+  await assert.rejects(
+    () => execFileAsync("git", ["rev-parse", "--verify", "HEAD"], { cwd: root }),
+  );
+
+  await manager.reviewChanges({ workspaceId: "ws_unborn", root, markReviewed: true });
   await git(root, ["add", "README.md"]);
   await git(root, ["commit", "-m", "Initial commit"]);
 

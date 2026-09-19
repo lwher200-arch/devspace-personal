@@ -1,5 +1,245 @@
 # Development Log
 
+## 2026-09-19 - Prepare the personal repository update
+
+- Align README and linked architecture documents with the implemented Linux boundary, unavailable public A2 lease activation, in-memory Context Fabric and limited Control Hub relay. Include the original ColdHao donation image at the end of README.
+- Build before source tests in `pnpm verify`, because MCP resource tests read the generated UI assets on a fresh checkout.
+- Recover from concurrent first-start configuration migration only when another caller has published a valid configuration; keep rejecting a backup collision without a valid replacement. Add a deterministic filesystem-interleaving regression alongside the existing two-process test.
+
+## 2026-09-19 - Stop approval loops after logical Chat session drift
+
+- Symptom: After a user approved an exact non-Codex operation, the first retry could arrive under a rotated `openai/session` and return a fresh `OWNER_APPROVAL_REQUIRED`. The follow-up instruction described claim recovery only in abstract session-drift terms, so a host/model could surface the duplicate approval instead of reclaiming the already-approved receipt.
+- Changes: Strengthen the approval-card follow-up contract: retry the exact approved operation first; if that retry returns a new approval requirement, do not ask the user to approve again. Claim the original approval receipt using `claim_approval` (or the cached-host `review_approval("__claim__<original approvalId>")` compatibility path), retry the original exact operation once, and stop if claim fails. No Owner approval, OAuth, execution-boundary or lease scope was broadened.
+- Verification: The follow-up regression was first made RED on the missing `OWNER_APPROVAL_REQUIRED` branch, then passed 2/2 after the instruction fix. A live compatibility claim of an already-approved `run_process` receipt then allowed the exact retry to execute without generating another approval; the combined regression/build batch passed 62/62 and produced a Candidate whose manifest fingerprint matched current source.
+
+## 2026-09-19 - Default A2 Candidate execution to a verified no-network profile
+
+- Risk: After credential containment v3, A2 Candidate execution still inherited the host network. That left a long-lived workspace lease able to reach arbitrary network destinations even though the design contract specified no general network capability by default.
+- Changes: Bump the Linux source boundary profile to `linux-bwrap-workspace-rw-host-ipc-masked-env-filtered-net-profile-v4` and add explicit `inherit | none` network profiles. A2 Candidate plans now use `networkProfile="none"`; `exec_command`, `bash` and `run_process` propagate that profile through `ProcessSessionManager` to Bubblewrap, where `none` adds `--unshare-net`. Legacy one-shot Owner-approved project execution keeps inherited networking. Process snapshots and Candidate execution evidence expose the effective network profile.
+- Lease compatibility: Raise `A2_WORKSPACE_LEASE_POLICY_VERSION` to `a2-workspace-lease-v2-network-none`. Recovery therefore invalidates older policy-version leases instead of silently reinterpreting them under the new network semantics.
+- Verification: Boundary self-test now requests the no-network profile and compares the child and parent `/proc/self/ns/net` identities; a missing/different-profile failure is fail-closed. Targeted regression passed 46/46 with one expected nested-Bubblewrap environment skip, and `pnpm typecheck` exited 0. Full `pnpm test` passed 396 tests with 381 passed, 0 failed and 15 platform/environment skips in about 149.5 seconds.
+- Deployment status: Source is verified at v4, but the active DevSpace connector used for this verification still reported `linux-bwrap-workspace-rw-host-ipc-masked-net-env-inherit-v2`. No production rebuild/restart/promotion is claimed here; runtime v4 activation must be verified after controlled deployment.
+- Remaining: A verified allowlisted egress profile is not implemented. RCF Verify/Hold/Quarantine/Freeze, guarded Candidate promotion/rollback and restart-durable Candidate state remain separate unresolved A2 work.
+
+## 2026-09-19 - Add labeled Decision Benchmark Harness (L1)
+
+- Changes: Extend Decision Intelligence benchmarking from single-call latency/token capture to labeled provider evaluation. Add exact accuracy, normalized Brier score, expected calibration error, explicitly labeled False-Safe/False-Alarm rates, Score mean absolute error, mean/p95 latency, token totals and optional caller-supplied cost estimates. Add multi-provider execution that returns independent reports without selecting a winner.
+- Evidence discipline: Ground truth is fixture-owned, safety metrics are computed only when fixtures explicitly define unsafe Noul values, Choice labels or Score thresholds, missing answers/type drift fail closed, and pricing is caller-supplied rather than embedded in the control plane.
+- Authority boundary: Benchmark reports remain evidence only. They cannot approve, execute, promote a provider, or override deterministic RCF/A2/Owner controls.
+- Verification: New benchmark harness regression passed 3/3 and `pnpm typecheck` exited 0 after the implementation. Existing Decision Intelligence and wider repository regression remain separate verification scopes.
+
+## 2026-09-19 - Contain inherited host credentials inside the A2 project boundary
+
+- Risk: Bounded project shell/native execution previously inherited the complete DevSpace service environment. Filesystem credential masks protected common on-disk locations, but service-level API keys, tokens, passwords, agent sockets and container/Kubernetes control endpoints could still cross the project-process boundary through environment variables.
+- Changes: Add boundary-owned environment filtering and bump the Linux source profile to `linux-bwrap-workspace-rw-host-ipc-masked-net-inherit-env-filtered-v3`. The v3 boundary removes common token/key/password/private-key patterns plus explicit SSH/GPG/D-Bus/Docker/Kubernetes/cloud credential/control variables, while preserving ordinary development variables such as PATH/HOME/LANG. Expand credential-directory masks to Azure, Kubernetes, Docker, GitHub/GLab, rclone and 1Password config locations. `host_command` remains the separate Owner-gated host-maintenance plane and does not inherit this project-boundary filter.
+- Verification: Targeted boundary/verifier/process/readiness/startup/MCP authorization regression passed 38/38 with one expected nested-Bubblewrap environment skip, and `pnpm typecheck` exited 0. Full `pnpm test` then passed 391 tests with 376 passed, 0 failed and 15 platform/environment skips in about 148 seconds. Boundary verification now explicitly checks that sensitive environment filtering is present.
+- Deployment status: Source is verified at v3, but the active DevSpace connector used for this verification still reported `linux-bwrap-workspace-rw-host-ipc-masked-net-env-inherit-v2`. No production rebuild/restart/promotion is claimed by this entry; runtime v3 activation must be verified after controlled deployment.
+- Remaining: Network is still inherited and needs an explicit egress policy. RCF Verify/Hold/Quarantine/Freeze plus guarded Candidate promotion/rollback and restart-durable Candidate state remain separate unresolved A2 work.
+
+## 2026-09-19 - Restore full regression after A2 boundary and project-access convergence
+
+- Symptom: The first full regression after the A2/Workspace Lease rollout reported 10 failures. The failures mixed real project-access cache drift with stale migration/startup expectations and test fixtures that attempted to nest Bubblewrap inside the already-isolated DevSpace execution boundary.
+- Changes: Align OAuth/startup tests with schema migration v8 and the additional `WorkspaceLeaseStore` database handle; give the npm package-privacy fixture a workspace-local npm cache; classify the runner's nested user-namespace failure as an unavailable Pi sandbox environment; add bounded validated inventory/text-body caches to project access; and keep MCP reconnect/cancellation fixtures focused on lifecycle semantics by disabling their redundant inner execution boundary.
+- Cache safety: Inventory caching is bounded to 8 complete catalogs of at most 20,000 files and revalidates Git candidate signatures plus observed directory metadata. Text caching is bounded to 32 entries / 32 MiB and revalidates canonical path plus inode/size/mtime/ctime metadata before reuse. Existing stale-cursor, SHA, symlink and root-containment checks remain authoritative.
+- Verification: L1 targeted regression passed 15/15 with one expected Pi-sandbox environment skip; package privacy passed 1/1; project-access regression passed 7/7 and TypeScript typecheck exited 0; MCP reconnect/cancellation regression passed 4/4. The final `pnpm test` run passed with 390 tests, 375 passed, 0 failed and 15 platform/environment skips in about 148 seconds.
+- Release verification: `pnpm build` exited 0, `pnpm test:deploy` passed 19/19, and `pnpm test:docs` passed 5/5 with 36 documents / 112 local links / 0 documentation errors. The converged source/build/test chain is green. Vite still reports several chunks above 500 kB; this remains performance debt, not a correctness failure.
+- Performance baseline: `pnpm benchmark:project-access` measured 291 eligible files across 7 inventory rounds and 15 text-read rounds. Validated inventory cache reuse reduced median latency from 15.645 ms to 11.845 ms (1.321x), while validated text cache reuse on `src/server.ts` (66,624 bytes) reduced median latency from 0.992 ms to 0.474 ms (2.093x). Diagnostics observed exactly one inventory build / one inventory cache hit and one text-body read / one text cache hit per cold-warm pair; benchmark assertions preserved snapshot and SHA-256 consistency. `pnpm typecheck` exited 0 after the benchmark.
+
+## 2026-09-19 - Keep candidate pnpm state inside the A2 workspace boundary
+
+- Symptom: `deploy.mjs --candidate-only --yes` failed before compilation with pnpm `ERR_SQLITE_ERROR: unable to open database file` because pnpm attempted to open its host-level store/index outside the workspace-write execution boundary.
+- Changes: Candidate preparation now uses a dedicated `.runtime/pnpm-store` via `--store-dir` for both direct pnpm and npm-fallback invocations. The store directory is created under the existing ignored runtime area and symlink stores are rejected before dependency preparation.
+- Verification: Deployment regression now asserts that candidate builds pass the workspace-local store path to pnpm. A real candidate-only benchmark is required after this patch to confirm the host-global SQLite failure is removed and to measure build time.
+
+## 2026-09-19 - Add bounded local Control Hub relay client v0.1
+
+- Changes: Add a fixed-action local Control Hub client and shared `control_hub` MCP tool for public health, node hello, this node's coordination permissions and unread notifications. Runtime configuration is environment-only (`DEVSPACE_CONTROL_HUB_URL`, node ID/client ID/token and timeout); no Cloudflare secret is added to durable DevSpace config or model-visible output.
+- Safety: The client has no arbitrary URL/path/body action, does not upload Chat/Codex IO yet, and advertises only the actually implemented node capability (`status`). Cloud coordination remains non-authoritative for local execution. HTTP errors are bounded and never include the configured bearer token.
+- Scope: Automatic Context IO offload is intentionally deferred until a local redaction/denylist gate exists; callers are not trusted merely because a cloud payload has `redacted:true`.
+- Verification: Targeted Control Hub client, server tool-surface, Owner authorization and TypeScript checks are required after this patch before runtime promotion is claimed.
+
+## 2026-09-19 - Add advisory TypeSafe Decision Intelligence adapter (L1)
+
+- Changes: Add a provider-neutral Decision Intelligence contract, TypeSafe System One HTTP adapter, credential redaction helper, A/B observation builders for agent traces and mutation risk, and a small benchmark wrapper for latency/provider token telemetry. The adapter uses the documented /v1/systemone endpoint with jev-latest by default, accepts the documented structured EntryType criteria/legends, validates Noul/Choice/Score responses, and uses SDK-aligned retry classes for connection/timeout failures plus 408/429/5xx.
+- Safety: The integration is advisory only. It has no approval, shell, filesystem, lease, promotion or break-glass capability; RCF/A2/Owner policy remains authoritative. The API key is constructor-only and is not added to durable DevSpace config, Context Fabric, Cloudflare state, logs or errors. The credential destination is fixed to api.typesafe.ai and outbound state/questions receive automatic key-based plus bounded inline-secret redaction with redacted-path telemetry.
+- Verification: Baseline Context Fabric regression passed 5/5 before the change. TypeSafe adapter tests and full typecheck are required after this patch before the integration is considered verified. A live API call is intentionally not part of the source test because no secret-bearing tool argument should be recorded.
+
+## 2026-09-19 - Add Context Fabric runtime consumer v0.1 (candidate verified)
+
+- Runtime: Add one shared `context_fabric` MCP tool with `put_anchor`, `append_delta` and `capsule` actions. Its service-level `ContextFabricStore` is workspace-scoped and survives MCP session replacement while the process lives; restart clears it. Anchor replacement is explicit, Delta sequence is monotonic, and per-record/workspace limits bound memory use.
+- Authority: Context Fabric validates the existing Anchor/Delta/Budget contracts but cannot grant execution authority, access project files or expand workspace roots. The Owner authorization classifier treats valid Context Fabric operations as bounded routine state operations; malformed inputs fail validation instead of entering approval.
+- Verification: Context Fabric/server/Owner regression passed 37/37 with zero failures; TypeScript typecheck exited 0. A fresh isolated candidate build succeeded under `linux-bwrap-workspace-rw-host-ipc-masked-net-env-inherit-v2` and contains both `context-fabric.js` and `context-fabric-tools.js`. Direct execution of the compiled candidate Store completed `putAnchor -> appendDelta -> capsule`, superseding `old` with `new` and returning only evidence `b`.
+- Deployment: Production promotion is not claimed. The active Chat tool schema still lacks the host-maintenance surface needed to identify/restart the host supervisor safely, so the verified candidate remains isolated until a controlled promotion path is available.
+
+## 2026-09-19 - Route eligible A2 execution through Candidate Workspace
+
+- Changes: Add `CandidateExecutionCoordinator` and connect it to Workspace Lease runtime authorization plus Codex `exec_command`, Claude `bash`, native `run_process`, and their long-session continuation paths. ACTIVE persisted authority becomes `executionEligible=true` only when the boundary is explicitly verified and the Candidate provider probe succeeds; the coordinator then consumes one short-lived private grant, remaps `cwd/workspaceRoot` to Candidate state and returns bounded mutation evidence.
+- Safety: Stable Workspace is never the writable execution target on the A2-ready path. Candidate grants are single-use and memory-only, long-running sessions retain the same Candidate until completion/cancel, and mutation path lists are capped while preserving counts/changed-bytes/Stable-drift evidence. Production still defaults `workspaceLeaseBoundaryVerified=false`, so no lease execution is enabled without an explicit trusted verification signal. No automatic promotion was added.
+- Verification: Coordinator/lease/server integration regression passed 32/32 with zero failures; real OAuth/MCP authorization regression passed 11/11, including both fail-closed `boundary_unverified` behavior and the verified A2 Candidate path that bypasses per-operation Owner approval while leaving Stable unchanged. Full TypeScript typecheck exited 0 after the final OAuth/MCP test addition.
+- Remaining: Replace the injected boundary-verification flag with a trusted startup/runtime self-test; make Candidate recovery durable across restart if promotion is to survive process loss; add RCF Verify/Hold/Quarantine/Freeze and guarded promotion/rollback; define the final network policy before describing A2 as complete.
+
+## 2026-09-19 - Add Candidate Workspace Provider v0.1
+
+- Changes: Add a Linux filesystem Candidate Workspace provider that creates candidate storage outside Stable Workspace, snapshots regular files with reflink-if-supported / copy fallback semantics, rewrites internal symlinks to Candidate-local targets, tracks a verified baseline manifest, reports created/modified/deleted paths plus changed bytes and Stable drift, and only discards provider-owned candidates.
+- Safety: Hardlinks are not used. Broken or workspace-escaping symlinks and special filesystem entries fail closed. Snapshot creation verifies Stable before/after copy and verifies the Candidate manifest before registration. The provider is not connected to project execution yet, so Workspace Lease remains `executionEligible=false`.
+- Verification: Candidate Provider regression passed 6/6 with zero failures; full TypeScript typecheck exited 0 under `linux-bwrap-workspace-rw-host-ipc-masked-net-env-inherit-v2`.
+- Remaining: Candidate Execution Coordinator must route shell/native execution into Candidate state, preserve session lifecycle for long-running processes, emit mutation evidence, and keep Stable unchanged until later RCF verification/promotion.
+
+## 2026-09-19 - Wire persisted Workspace Lease into runtime authorization (fail-closed)
+
+- Changes: Add `WorkspaceLeaseRuntime` and context lookup in `WorkspaceLeaseStore`; the server now owns the lease store lifecycle and observes matching persisted A2 authority for `exec_command`, `bash` and `run_process` using OAuth client, logical conversation, canonical workspace, policy version and boundary profile.
+- Safety: This cut does not grant lease execution. An ACTIVE persisted lease is reported as authority-only with `executionEligible=false` while Candidate Workspace is unavailable, so project execution still follows the existing exact Owner-approval path. Lease integrity failure blocks execution; unverified boundary recovery suspends the lease; profile/policy mismatch invalidates it.
+- Verification: Workspace Lease store/runtime plus real OAuth/MCP authorization regression passed 20/20 with zero failures. Server/process/boundary lifecycle regression passed 28/32 with zero failures and four nested-Bubblewrap environment skips. Full TypeScript typecheck exited 0 under `linux-bwrap-workspace-rw-host-ipc-masked-net-env-inherit-v2`.
+- Remaining: Candidate Workspace, mutation observation, RCF Verify/Promote/Hold/Quarantine/Freeze and a verified network policy are still required before an ACTIVE workspace lease may authorize mutation-capable execution without a per-operation Owner approval.
+
+## 2026-09-19 - Validate Context Fabric candidate and long-history folding trial (L1)
+
+- Candidate: `node scripts/deploy.mjs --candidate-only --yes` completed successfully and produced an isolated verified build under `.runtime`; the running `dist`, configuration, credentials and tunnel were not replaced or restarted.
+- Trial: The compiled candidate `control-plane/context-fabric.js` ran two direct experiments. A small mixed-state sample folded 120 estimated tokens to 60 (2.00x). A longer supersession-heavy sample with 181 historical statements folded 2302 estimated tokens to 142 (16.21x), leaving 21 current statements after supersession and materializing 11 under the configured budget.
+- Boundary: The live execution profile observed during the later trial was `linux-bwrap-workspace-rw-host-ipc-masked-net-env-inherit-v2`. A project-shell supervisor probe could see only its Bubblewrap namespace, confirming that host process/systemd inspection must use the separate Owner-gated `host_command` plane rather than bypassing IPC isolation.
+- Status/Risk: Production promotion is intentionally not claimed. The current Chat tool schema does not expose `host_command`, so the actual host supervisor cannot be safely identified or restarted from this conversation. Context Fabric also has no runtime consumer yet; promoting the library alone would not reduce Chat context automatically.
+
+## 2026-09-18 - Close host-control socket escape in A2 Boundary v2
+
+- Evidence: A live Phase 1 probe from sandboxed `run_process` successfully executed `systemd-run --user --wait --collect --quiet /bin/true`. A read-only host filesystem therefore did not constitute a closed workspace boundary because Unix-domain sockets can exercise host authority without mutating their filesystem inode.
+- Fix: Bump the Linux profile to `linux-bwrap-workspace-rw-host-ipc-masked-net-env-inherit-v2`; hide `/run/user/$UID` inside project execution and mask common Docker/containerd/Podman, system D-Bus and systemd private control sockets. Resolver state remains visible so this fix does not silently redefine the existing inherited-network contract.
+- Safety: This is capability isolation, not command-text filtering. `host_command` remains the explicit Owner-gated recovery plane. Phase 2 promotion is blocked until the live `systemd-run --user` probe fails under v2.
+
+## 2026-09-18 - Extend A2 workspace boundary to project shells (Phase 2)
+
+- Changes: Route Codex `exec_command` pipe/PTY sessions and Claude `bash` synchronous commands through the same configured `WorkspaceExecutionBoundary` used by native `run_process`. Preserve `write_stdin`, PTY resize/SIGINT behavior, the pre-A2 non-PTY POSIX `-c` contract, and Claude's bounded timeout contract through `ProcessSessionManager`; remove the redundant Pi shell executor.
+- Authorization: Propagate the effective runtime boundary profile into initial classification, Approval Center context revalidation and pre-dispatch TOCTOU revalidation. Approval text now reflects the actual server instance instead of inferring isolation from `process.platform`.
+- Verification: Targeted Phase 2/native/authorization/server regression passed 52/57 with zero failures and five environment-specific skips; four skips are nested Bubblewrap namespace tests because the regression command itself ran inside the deployed Phase 1 boundary, and one is Windows-only. Full TypeScript typecheck exited 0 through boundary profile `linux-bwrap-workspace-rw-net-env-inherit-v1`.
+- Safety/Scope: `host_command` remains the explicit unsandboxed recovery plane. The Linux project boundary still inherits network and process environment. Candidate workspace, mutation verification, Workspace Lease integration and Phase 2 runtime promotion are separate gates.
+
+## 2026-09-18 - Deploy A2 native workspace execution boundary (Phase 1)
+
+- Changes: Add Linux Bubblewrap profile `linux-bwrap-workspace-rw-net-env-inherit-v1` for native `run_process`: host root read-only, selected workspace writable, normal production `/tmp` private, common credential locations masked, workspace `.env` / `.env.local` read-only, and PID/UTS/IPC isolated.
+- Verification: A2/native/authorization/server regression passed with zero failures; TypeScript typecheck and candidate build passed. Managed promotion returned ready, and the live runtime probe wrote inside the workspace while a sibling write failed with `EROFS`; the response reported the expected boundary profile.
+- Remaining boundary: Network and inherited environment are intentionally not isolated by this profile. `host_command` remains the separate Owner-gated recovery plane.
+
+## 2026-09-18 - Add Pattern Folding Context Fabric v0.1 (L1)
+
+- Changes: Add `src/control-plane/context-fabric.ts` with explicit ContextAnchor, ContextDelta, EvidenceRef, ContextCapsule and ContextBudget contracts. Folding uses Anchor + Delta + Exception + References, supports explicit supersession of stale state, and selects optional context by bounded priority/role ordering while preserving required statements.
+- Safety: Factual folded statements require evidence references; missing referenced evidence, cross-anchor deltas and required-context budget overflow fail closed. Token estimates are caller-supplied and are not presented as tokenizer measurements. The module has no execution, approval, Cloudflare or prompt-authority capability.
+- Verification: Context Fabric + existing Control Plane + Relay Contract tests passed 13/13 with zero failures. `pnpm typecheck` exited 0. Both commands ran through the observed Linux Bubblewrap boundary profile `linux-bwrap-workspace-rw-net-env-inherit-v1`.
+- Scope: This cut establishes the local folding contract only. It does not yet persist capsules, perform retrieval, assemble ChatGPT prompts, or integrate a Cloudflare Control Hub.
+
+## 2026-09-18 - Freeze the A2 workspace execution-boundary design (design only)
+
+- Current State: `exec_command` / `bash` and native `run_process` still execute with the DevSpace service account authority; current conversation leases are exact-scope, memory-only grants tied to the approval lifetime. The repository has no direct Bubblewrap backend, but the Pi adapter already uses `@anthropic-ai/sandbox-runtime` with workspace-write, symlink-containment and protected-file tests.
+- Decision: Define A2 as a separate workspace lease + RCF guard + verified OS execution boundary + candidate workspace + mutation verification + controlled promotion pipeline. Split `ApprovalRequestTTL` from 4h/8h/12h/24h `WorkspaceLeaseTTL`; persist only a signed recovery envelope and durable incident state; require recovery self-tests; keep break-glass single-use and outside the lease.
+- Safety: The document explicitly forbids silent fallback to an unconfined shell, command-text review as a sandbox substitute, filesystem watcher completeness as promotion evidence, candidate-command replay against stable state, and relabelling current conversation leases as A2.
+- Scope: Documentation only. No production authorization, shell/process behavior, database schema, UI authority or sandbox claim changed in this cut. Implementation remains split into Workspace Lease, minimal UI/outbox, Execution Boundary + Candidate Workspace, and RCF Incident/Mutation/Promote/Rollback.
+
+## 2026-09-18 - Reduce MCP App template fetch failures under ChatGPT session churn (L1)
+
+- Symptom: ChatGPT could display `Failed to fetch template` even though the v7 app resource passed authenticated `resources/read`, its JS/CSS assets returned HTTP 200 with cross-origin headers, and the main MCP endpoint remained healthy.
+- Evidence: Production logs repeatedly showed MCP sessions being closed with `reason:"capacity"` while `openai-mcp/1.0.0` was rapidly creating new sessions. The registry default was 32 sessions, and capacity eviction removes the oldest idle session even if the remote host may still reference it for a later UI-resource read.
+- Changes: Raise the default MCP session capacity from 32 to 128 and log successful workspace-app resource reads with the safe resource URI/current-alias flag and HTML byte count. This does not change OAuth, approval authority, workspace access, or tool capabilities.
+- Verification: Add a regression proving the default registry no longer evicts at 33 sessions. Existing authenticated MCP resource-read coverage continues to validate the v7 URI, MCP App MIME type, HTML asset URL and CSP metadata.
+
+## 2026-09-18 - Preserve Owner fallback when Chat approval UI fails to load (L1)
+
+- Symptom: A valid Chat approval request could be created and `review_approval` could return successfully while the host displayed a generic card loading error. The private app metadata still contained the Owner URL, but the model-visible review result did not, so the conversation had no recoverable approval path.
+- Root Cause: The approval UI treated the MCP App card as the only presentation path after review, even though the server already had a hardened Owner page intended as the fallback.
+- Changes: Include the exact Owner `approvalUrl` in single-review summaries and expose pending `fallbackApprovals` from the centralized Approval Center. The decision token remains private and no approval authority changes.
+- Verification: Added contract assertions that single-card and center responses expose only the Owner fallback URL while continuing to exclude private decision credentials. Runtime/build deployment remains a separate acceptance gate.
+
+## 2026-09-18 - Serve bounded legacy MCP App resource aliases (L1)
+
+- Symptom: A Chat session could retain an older `review_approval` schema/output-template binding while the running DevSpace service had already advanced its workspace App URI to v7. The approval RPC succeeded, but the host could fail while resolving the cached UI resource and display a generic loading error.
+- Root Cause: Resource URI versioning correctly prevented stale UI reuse, but the server removed the previous read-only resource identities immediately. A host that cached the old tool descriptor therefore had no resource to resolve during the reconnect gap.
+- Changes: Keep the unversioned workspace App URI and v2-v6 as read-only compatibility aliases that render the current v7 HTML/CSP/assets. New tool definitions still publish only v7, and no decision capability, token, approval scope or legacy authorization behavior is restored.
+- Verification: Add MCP resource-list coverage for the bounded compatibility window while retaining the v7-only `review_approval` output-template assertion. Runtime deployment and a real Chat card reload remain separate acceptance gates.
+
+## 2026-09-18 - Repair Chat approval card discovery and continuation (L2)
+
+- Symptom: `review_approval` reached DevSpace and returned a pending approval, but some Chat sessions rendered no inline card; those sessions could also retain an older partial tool surface. After a decision, an explicitly rejected host message could leave Chat waiting for a manual continuation.
+- Root Cause: The approval UI contract had accumulated more than one model-visible review entry sharing one output template, while MCP hosts can cache tool/app-resource contracts across reconnects. The follow-up bridge also treated explicit non-delivery the same as ambiguous delivery.
+- Changes: Bump the MCP App resource contract to `workspace-app-v7` and app identity to 0.6.0. Use `review_approval` as the single model-facing review entry: omit `approvalId` for the Approval Center and provide it for one request. Keep `review_approvals` app-private for widget compatibility. If the standard message API explicitly rejects delivery, fall back once to the ChatGPT compatibility follow-up; ambiguous delivery still never retries.
+- Safety: Approval authority is unchanged. Decision capabilities remain app-private, approval tokens remain outside model-visible content, and follow-up fallback occurs only after explicit non-delivery.
+
+## 2026-09-18 - Add Owner-gated host maintenance command (L2)
+
+- Symptom: When the main DevSpace service or its public ingress needed recovery, Chat had only project-oriented shell/native tools and no explicit host-maintenance contract. A proposed Windows CMD bridge was also invalid for the actual deployment because runtime probing confirmed the DevSpace host is native Ubuntu, not WSL.
+- Root Cause: Host maintenance and project execution shared mechanics but lacked a distinct model-facing capability and authorization scope. Treating the Ubuntu host as WSL would have created a false platform contract.
+- Changes: Add `host_command` as a shared MCP tool for explicit DevSpace-host maintenance/recovery. It resolves the host shell, executes through the existing native process manager, and reuses timeout, output truncation, `process_status`, `process_cancel`, workspace initial-cwd validation and tool-call auditing. Add an Owner-approval classification plus a principal/root/full-arguments exact conversation lease dedicated to host maintenance.
+- Safety: `host_command` is explicitly not sandboxed and does not grant machine-wide standing authority. Conversation reuse requires an explicit user approval and an identical full request; changed command text, arguments, workspace, client or logical conversation fall back to normal approval. No unauthenticated rescue shell or Windows interop claim was added.
+- Verification: TDD RED failed 2/15 because `host_command` was absent; after implementation the same targeted suite passed 15/15, typecheck/build passed, and the deployed service restarted onto the new build. The OAuth/HTTP MCP integration now also asserts that authenticated `tools/list` exposes `host_command`; the same full-stack test already verifies that invoking it before Owner approval returns `OWNER_APPROVAL_REQUIRED` with no filesystem side effect.
+
+## 2026-09-18 - Repair Chat approval continuation and control-tool visibility (L2)
+
+- Symptom: Chat approval could reach `approved` while the model tool surface still omitted `claim_approval`, and approval follow-up text always instructed Chat to claim before retrying. This created a deadlock when the host had not actually changed logical session identity.
+- Root Cause: Approval-core semantics and host-facing continuation guidance diverged. `OwnerApprovals` already allowed the same OAuth client and same `openai/session` to consume an approved exact retry directly, but `claim_approval`, `reissue_approval` and `revoke_conversation_approvals` lacked explicit model visibility, while UI/server instructions treated claim as unconditional.
+- Changes: Mark `claim_approval`, `reissue_approval` and `revoke_conversation_approvals` as model-visible control tools without widget/output-template bindings. Update approval-card and server instructions so the same logical Chat retries the exact approved operation first; `claim_approval` is now the recovery path only when host logical-session rotation prevents direct receipt consumption. Add regressions for control-tool visibility and follow-up ordering.
+- Safety: No approval authority is broadened. Claim remains same-OAuth-client only, does not approve or execute an operation, and exact operation/workspace boundaries remain unchanged. UI-only decision/recycle tools remain app-only.
+- Verification: `src/mcp-authorization.test.ts`, `src/ui/approval-bridge.test.ts` and `src/ui/tool-result.test.ts` passed 23/23; `pnpm typecheck` and `pnpm build` exited 0. The browser approval-card regression was skipped because no Chromium executable was present in PATH. The built `dist/approval-tools.js` contains three model-visible control-tool registrations; the running MCP process still requires restart/reconnect before Chat can discover the new tool surface.
+
+## 2026-09-17 - Align host-visible approval contracts and exact Shell leases (L2)
+
+- Symptom: The source already contained Approval Center support, but approval-required responses still pointed Chat at the single-card tool, the shared MCP App still identified itself as a diff-only card, and the conversation-approval button did not consistently grant the exact Shell request it described across Codex/Claude tool surfaces. The checked-in `dist` build was also stale relative to source.
+- Root Cause: Host-visible metadata, authorization semantics, UI identity and deployment freshness evolved independently. Source tests covered the newer components but did not establish that the running build exposed the same contract.
+- Changes: Make `review_approvals` the primary Chat approval entry with `review_approval` retained for one-request recovery; add fixed-TTL, principal-bound, exact-root/exact-arguments Shell leases for both `exec_command` and `bash`; rename the shared MCP resource to `DevSpace Workspace App`; bump the app protocol identity to `devspace-workspace-app` 0.5.0; align authorization documentation with the implemented lease boundary.
+- Safety: Exact Shell leases require an explicit user conversation-approval click and an identical complete request. Changed commands, arguments, roots, clients or conversations miss the lease. PTY input, Codex delegation, credentials/service state, destructive file operations and unknown capabilities retain their existing approval boundaries. Leases remain memory-only, fixed-expiry and revocable.
+- Verification: Authorization/approval bridge/tool-result regressions passed after the first contract repair. Final build/deployment freshness and real-host tool discovery remain separate acceptance gates and must not be inferred from source-test success.
+
+## 2026-09-17 - Add centralized Approval Center and visible approval lifecycle (L2)
+
+- Symptom: Approval capabilities existed as individual cards, but there was no user-visible queue. Conversation approval, terminal-card collapse and Chat follow-up therefore looked missing or fragmented in the real workflow.
+- Changes: Add `review_approvals` with a private-metadata Approval Center that groups pending/in-flight requests, active bounded conversation leases and processed requests. Pending items keep independent decision capabilities; processed items move into a collapsed archive; active leases can be revoked from the center. Individual cards link back to the center and still auto-notify Chat after a decision, with the existing manual recovery action when message delivery is uncertain. Bump the MCP app URI to v3 so hosts cannot reuse the older approval widget contract.
+- Safety: The center is a presentation and coordination layer only. It does not add bulk approval, expose decision tokens to model-visible content, broaden Shell/Codex authority, or persist conversation leases across restart.
+
+## 2026-09-17 - Preserve conversation lease lineage and restore Shell single-use safety (L2)
+
+- Symptom: A conversation lease could be handed off across one host `openai/session` rotation, but the approved receipt was deleted when its exact one-shot retry was consumed. A later session rotation therefore lost the lease lineage and produced another approval. The same-day runtime policy had also drifted from the authorization docs by allowing an exact Shell command to become a reusable lease.
+- Root Cause: Single-use execution consumption and conversation-lease identity used the same approval record lifecycle. Removing the record was correct for a plain one-shot grant but also removed the only safe handoff anchor for an active conversation lease.
+- Changes: Retain a consumed conversation approval as an in-memory lineage record until its fixed lease deadline, revocation or service restart. `claim_approval` can migrate that active lineage repeatedly across host session rotation for the same trusted OAuth client. Restore reusable scopes to safe project review/worktree operations plus an explicitly approved exact `run_process`; Shell remains one-shot even when the user selected the safe-conversation action. Add real `/readyz` startup coverage before deployment.
+- Safety: Lineage retention never recreates the consumed one-shot execution grant. Shell/PTY/Codex/destructive or sensitive operations do not gain reusable authority, changed native arguments miss the lease, cross-client claim remains rejected, and revocation deletes consumed lineage along with its leases.
+- Verification: Extend authorization regressions through a second session rotation after the original grant is consumed, assert Shell requires a new approval on its second execution, and keep the server startup test gated on `/readyz = 200`.
+
+## 2026-09-17 - Make conversation approval explicit and terminal cards compact (L2)
+
+- Symptom: The backend exposed conversation approval, but the user still saw the previous approval choices and completed cards remained visually expanded.
+- Immediate Cause: The MCP app resource kept the same `ui://devspace/workspace-app.html` identity across UI contract changes, allowing a host to reuse an older widget. The card also closed only its parameter `<details>` block instead of collapsing the complete terminal body.
+- Root/Architecture Cause: Approval authority, app-resource versioning and terminal presentation were treated as separate implementation details without one end-to-end host-visible contract. The existing lease model also did not provide a useful repeated scope for shell requests.
+- Changes: Version the workspace app resource as v2, make conversation leases tool-specific, add an exact-root/exact-arguments shell lease for `exec_command`/`bash`, and collapse approved/denied/submitted cards to a compact terminal view with expandable details. Notification failures reopen the recovery controls automatically.
+- Safety: Conversation approval remains user-selected, conversation/principal-bound and fixed-expiry. Shell reuse requires the identical root and complete argument object; changed commands, credentials, Codex submissions, destructive patches and unknown capabilities still require their normal authorization path.
+- Verification: Add authorization and browser regressions for scope isolation, exact shell matching, the v2 resource URI, whole-card collapse and recovery expansion. Deployment/runtime acceptance remains separate from source-test success.
+
+## 2026-09-16 - Stabilize conversation approval handoff and always-visible safe lease action (L2)
+
+- Current State: The safe-operation conversation lease existed in source but its button was conditional, and an approved operation could fail to consume when the host changed `openai/session` between the approval-card click and the next Chat turn. That produced a fresh pending approval even though the user had already approved the exact operation.
+- Changes: Make the non-Codex approval card consistently expose `本对话内始终同意安全操作`. The action approves the current request once and creates only server-defined safe scopes: project review/worktree permissions plus an exact native-process signature only when that process was explicitly approved. Add `claim_approval` so Chat can bind an already-approved, unconsumed receipt to the current logical session when the same trusted OAuth client receives a new `openai/session`.
+- Safety: Claiming never approves a pending/denied/submitted request, never crosses OAuth clients, never executes the operation, and removes only an exact duplicate pending request created by session drift. Shell, Codex, credentials, security configuration, destructive patches and unknown capabilities do not inherit the safe lease.
+
+## 2026-09-16 - Add scoped conversation approval leases (L2)
+
+- Current State: Owner approval was strictly single-use. Repeated aggregate reviews, equivalent worktree creation and identical native test commands required a new click even when the authenticated OAuth client, logical Chat conversation and reviewed scope had not changed.
+- Changes: Add an in-memory conversation approval lease created only by the private user decision UI. Leases bind the authenticated client/conversation principal to one server-defined scope and reuse the existing fixed approval deadline without sliding renewal. Eligible scopes are same-workspace `show_changes`, same-source/same-base worktree creation, and an exactly identical `run_process` request. Add `revoke_conversation_approvals` to remove all leases for the current conversation immediately.
+- Safety: Shell/PTY input, Codex turns, credentials/service state, security/execution configuration, destructive or large patch operations and unknown capabilities remain single-use. Ordinary guarded small patches already bypass unnecessary consent and therefore do not need a lease. Leases are memory-only, disappear on restart, never cross OAuth clients or `openai/session`, and never expand workspace or sandbox boundaries.
+
+## 2026-09-16 - Introduce Personal Control Plane research contracts and approval relaunch (L2)
+
+- Current State: Routine/complex routing was embedded in the Codex execution module, denied Owner approvals remained pinned until expiry, and recovery concepts were spread across bridge/approval states. Several Eterna research concepts had no explicit engineering boundary, which made it easy either to ignore useful mechanisms or to over-apply names without runtime evidence.
+- Changes: Add a deterministic Canonical Intent IR, a permission-neutral Chimera routing module, and ReturnFlow/RCF recovery helpers. Route existing protected Codex auto-selection through those modules without changing the approved model allowlist. Add `reissue_approval`, which can only be used from the same trusted client/conversation after a denial and only arms an exact re-request; it neither approves nor executes the old operation. Codex receipt replay now uses the ReturnFlow recovery rule for uncertain delivery. Document how Shadow/Mirror, Neuron Safety, Eterna layering, Bamboo, Water Intelligence, probability/risk, Dream IR, ColdLang, Zero/Lingxi, Shadow Worlds, Resonance, Pattern Folding and Meta-World map to current or future DevSpace mechanisms.
+- Root Cause: Policy, routing and recovery semantics had grown inside provider/security modules instead of a narrow control-plane seam, while denial had no explicit user-driven relaunch transition. Research concepts also lacked a rule distinguishing implemented mechanisms from experimental architecture.
+- Safety: `route != authority`, `candidate != live`, `unknown != retryable`. Relaunch preserves the denied record until the exact original operation is requested again and still requires a new human decision. No automatic provider fallback, permission expansion, synthetic risk score, new daemon, event bus or shadow database is introduced.
+
+## 2026-09-16 - Condense task completion reports (L0)
+
+- Changes: Make completion reports follow the user's language, merge overlapping change/fix information, omit empty sections, and allow small tasks to finish in two to four short lines. Collapse accounting to a concise unavailable-source sentence when no real counters exist.
+- Reason: The earlier completion contract was accurate but too verbose for routine work and repeated information already visible in the conversation.
+- Impact: Workflow/documentation only. Evidence, deployment-state distinctions and accounting requirements remain; presentation is shorter and less repetitive.
+
+## 2026-09-16 - Require evidence-backed task completion summaries (L0)
+
+- Current State: DevSpace already required a traffic/token accounting footer, but the project instructions did not separately require a concise user-facing summary of what work was performed, what was fixed, how it was validated, whether it reached the deployed runtime and what remained unresolved.
+- Changes: Add a task-completion reporting contract to `AGENTS.md`, document the standard ChatGPT workflow and compact report shape, and clarify that accounting is the final footer after the task summary rather than a replacement for it.
+- Root Cause: Completion reporting and usage accounting were coupled too loosely, so a turn could satisfy the accounting requirement while leaving the actual engineering outcome, fix, validation boundary or deployment state implicit.
+- Impact: Workflow/documentation only. Future DevSpace task reports must distinguish outcome, actual changes, fixes, validation evidence, source/build/deploy/runtime state and material remaining issues before the accounting footer.
+- Compatibility: No MCP tool schema, runtime behavior, authorization boundary, configuration or code path changes.
+
 ## 2026-09-09 - Unblock approval templates without exposing private decisions (L3)
 
 - Current State: The personal branch started at 6370d97 with unrelated accounting edits preserved. A real host probe created an approval and review_approval returned pending, but ChatGPT settings explicitly reported that hidden decide_approval was associated with a template and made that template unavailable.

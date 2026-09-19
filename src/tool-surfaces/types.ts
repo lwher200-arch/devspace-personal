@@ -2,8 +2,13 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ProcessSessionManager } from "../process-sessions.js";
 import type { ServerConfig } from "../config.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
+import type { WorkspaceExecutionBoundary } from "../workspace-execution-boundary.js";
+import type { CandidateExecutionCoordinator } from "../candidate-workspace/candidate-execution-coordinator.js";
 
-export const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
+// Bump this URI whenever the widget interaction contract changes. MCP hosts may
+// cache app resources by URI across server restarts, so reusing the old URI can
+// leave a new backend paired with stale approval UI.
+export const WORKSPACE_APP_URI = "ui://devspace/workspace-app-v7.html";
 
 export const toolNames = {
   openWorkspace: "open_workspace",
@@ -48,6 +53,10 @@ export interface ToolLogFields {
   workingDirectory?: string;
   command?: string;
   commandLength?: number;
+  sessionId?: number;
+  running?: boolean;
+  exitCode?: number;
+  signal?: string;
   success: boolean;
   durationMs: number;
   error?: string;
@@ -78,6 +87,8 @@ export interface ToolRegistrationContext {
   config: ServerConfig;
   workspaces: WorkspaceRegistry;
   processSessions: ProcessSessionManager;
+  executionBoundary?: WorkspaceExecutionBoundary;
+  candidateExecutionCoordinator?: CandidateExecutionCoordinator;
 }
 
 export interface ToolInstructionContext {

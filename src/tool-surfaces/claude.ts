@@ -1,9 +1,14 @@
 import * as z from "zod/v4";
 import {
   editFileTool,
-  runShellTool,
   writeFileTool,
 } from "../pi-tools.js";
+import type { ProcessSnapshot } from "../process-sessions.js";
+import {
+  candidateGrantFromMetadata,
+  type CandidateExecutionEvidence,
+  type CandidateExecutionPlan,
+} from "../candidate-workspace/candidate-execution-coordinator.js";
 import {
   EDIT_TOOL_ANNOTATIONS,
   SHELL_TOOL_ANNOTATIONS,
@@ -22,7 +27,7 @@ import {
   textBlock,
 } from "./shared.js";
 
-const CLAUDE_INSTRUCTIONS = `Use ${toolNames.read} for direct file reads, ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for inspection, tests, builds, and other commands. Shell commands run with the local user's authority and are not sandboxed; workspace validation only selects their initial working directory. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.`;
+const CLAUDE_INSTRUCTIONS = `Use ${toolNames.read} for direct file reads, ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for inspection, tests, builds, and other project commands. Project shell commands use the configured workspace execution boundary when one is available; host maintenance remains a separate host_command capability. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.`;
 
 export function claudeInstructions({
   agents,
@@ -35,8 +40,6 @@ export function registerClaudeTools(context: ToolRegistrationContext): void {
   registerClaudeMutationTools(context);
   registerShellTool(context);
 }
-
-const CLAUDE_SHELL_DESCRIPTION = `Run a shell command with the local user's authority. Commands are not sandboxed; workspace validation only selects the initial working directory. Use this for file inspection, tests, builds, package scripts, and other commands.`;
 
 function registerClaudeMutationTools(context: ToolRegistrationContext): void {
   const { server, config, workspaces } = context;
@@ -172,13 +175,15 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
 }
 
 function registerShellTool(context: ToolRegistrationContext): void {
-  const { server, config, workspaces } = context;
+  const { server, config, workspaces, processSessions, executionBoundary, candidateExecutionCoordinator } = context;
 
   server.registerTool(
     toolNames.shell,
     {
       title: "Bash",
-      description: CLAUDE_SHELL_DESCRIPTION,
+      description: executionBoundary
+        ? `Run a project shell command through workspace boundary ${executionBoundary.profile}. The host filesystem is read-only and only the selected workspace is writable; PID/UTS/IPC are isolated. Legacy approved execution inherits network; A2 Candidate execution uses the no-network profile. Common credential/control environment variables are filtered when supported by the boundary.`
+        : "Run a project shell command. No workspace execution boundary is configured for this server instance, so the shell uses the service OS account authority.",
       inputSchema: {
         workspaceId: z.string().describe(workspaceIdDescription),
         command: z
@@ -197,22 +202,54 @@ function registerShellTool(context: ToolRegistrationContext): void {
           .optional()
           .describe("Timeout in seconds. Defaults to 30, max 300."),
       },
-      outputSchema: resultOutputSchema(),
+      outputSchema: resultOutputSchema({
+        exitCode: z.number().int().optional(), signal: z.string().optional(),
+        timedOut: z.boolean().optional(), boundaryProfile: z.string().optional(),
+        networkProfile: z.enum(["inherit", "none"]).optional(),
+        wallTimeMs: z.number().nonnegative().optional(), outputTruncated: z.boolean().optional(),
+        candidateExecution: z.object({
+          candidateId: z.string(), profile: z.string(), networkProfile: z.literal("none"),
+          state: z.enum(["running", "completed"]),
+          mutation: z.object({
+            created: z.array(z.string()), modified: z.array(z.string()), deleted: z.array(z.string()),
+            createdCount: z.number().int().nonnegative(), modifiedCount: z.number().int().nonnegative(),
+            deletedCount: z.number().int().nonnegative(), changedBytes: z.number().nonnegative(),
+            stableChanged: z.boolean(), pathListTruncated: z.boolean(),
+          }).optional(),
+        }).optional(),
+      }),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, workingDirectory, ...input }) => {
+    async ({ workspaceId, workingDirectory, ...input }, extra) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
-      const cwd = workspaces.resolveWorkingDirectory(
+      const stableCwd = workspaces.resolveWorkingDirectory(
         workspace,
         workingDirectory,
       );
-      const response = await runShellTool(input, {
-        cwd,
-        root: workspace.root,
-      });
-
-      if (response.isError) {
+      const timeoutSeconds = input.timeout === undefined ? 30 : Math.min(input.timeout, 300);
+      let snapshot: ProcessSnapshot;
+      let candidateExecution: CandidateExecutionEvidence | undefined;
+      let plan: CandidateExecutionPlan | undefined;
+      try {
+        plan = await candidateExecutionCoordinator?.beginGrantedExecution({
+          grantToken: candidateGrantFromMetadata(extra._meta),
+          workspaceId,
+          stableRoot: workspace.root,
+          stableCwd,
+          tool: "bash",
+        });
+        snapshot = await processSessions.runToCompletion({
+          workspaceId, command: input.command, cwd: plan?.cwd ?? stableCwd,
+          workspaceRoot: plan?.workspaceRoot ?? workspace.root,
+          timeoutMs: Math.max(1, Math.floor(timeoutSeconds * 1_000)),
+          networkProfile: plan?.networkProfile,
+          ...(executionBoundary ? { executionBoundary } : {}),
+        });
+        if (plan) candidateExecution = await candidateExecutionCoordinator!.observeSnapshot(plan, snapshot);
+      } catch (error) {
+        if (plan) await candidateExecutionCoordinator?.abandon(plan);
+        const content = [textBlock(error instanceof Error ? error.message : String(error))];
         logFailedToolResponse(
           config,
           {
@@ -222,10 +259,31 @@ function registerShellTool(context: ToolRegistrationContext): void {
             command: input.command,
             commandLength: input.command.length,
           },
-          response.content,
+          content,
           startedAt,
         );
-        return response;
+        return { content, structuredContent: { result: contentText(content) }, isError: true };
+      }
+
+      const failed = Boolean(snapshot.timedOut) || snapshot.running ||
+        snapshot.signal !== undefined || snapshot.exitCode !== 0;
+      const status = snapshot.timedOut
+        ? `Command timed out after ${timeoutSeconds} seconds.`
+        : snapshot.running ? "Command did not terminate after forced timeout cleanup."
+        : snapshot.signal ? `Process exited after signal ${snapshot.signal}.`
+        : snapshot.exitCode === 0 ? "" : `Process exited with code ${snapshot.exitCode ?? "unknown"}.`;
+      const result = [snapshot.output.replace(/\n$/, ""), status].filter(Boolean).join("\n");
+      const content = [textBlock(result)];
+      if (failed) {
+        logFailedToolResponse(config, { tool: toolNames.shell, workspaceId,
+          workingDirectory: workingDirectory ?? ".", command: input.command,
+          commandLength: input.command.length }, content, startedAt);
+        return { content, structuredContent: { result, exitCode: snapshot.exitCode,
+          signal: snapshot.signal, timedOut: snapshot.timedOut,
+          boundaryProfile: snapshot.boundaryProfile, networkProfile: snapshot.networkProfile,
+          wallTimeMs: snapshot.wallTimeMs,
+          outputTruncated: snapshot.outputTruncated,
+          ...(candidateExecution ? { candidateExecution } : {}) }, isError: true };
       }
 
       logToolCall(config, {
@@ -239,9 +297,13 @@ function registerShellTool(context: ToolRegistrationContext): void {
       });
 
       return {
-        ...response,
+        content,
         structuredContent: {
-          result: contentText(response.content),
+          result, exitCode: snapshot.exitCode, signal: snapshot.signal,
+          timedOut: snapshot.timedOut, boundaryProfile: snapshot.boundaryProfile,
+          networkProfile: snapshot.networkProfile, wallTimeMs: snapshot.wallTimeMs,
+          outputTruncated: snapshot.outputTruncated,
+          ...(candidateExecution ? { candidateExecution } : {}),
         },
       };
     },

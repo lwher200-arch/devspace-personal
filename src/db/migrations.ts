@@ -42,6 +42,11 @@ const migrations: Migration[] = [
     name: "local-agent-execution-contract",
     up: (sqlite) => addColumnIfMissing(sqlite, "local_agent_sessions", "execution_json", "text"),
   },
+  {
+    version: 8,
+    name: "workspace-leases",
+    up: migrateWorkspaceLeases,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -250,6 +255,32 @@ function migrateLocalAgentEffortRename(sqlite: Database.Database): void {
     return;
   }
   sqlite.exec("alter table local_agent_sessions rename column thinking to effort");
+}
+
+function migrateWorkspaceLeases(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists workspace_leases (
+      id text primary key,
+      client_id text not null,
+      conversation_scope_id text not null,
+      workspace_root text not null,
+      duration_seconds integer not null,
+      policy_version text not null,
+      boundary_profile text not null,
+      state text not null,
+      requested_at text not null,
+      issued_at text,
+      expires_at text,
+      updated_at text not null,
+      integrity text not null
+    );
+
+    create index if not exists workspace_leases_principal_idx
+      on workspace_leases(client_id, conversation_scope_id, updated_at desc);
+
+    create index if not exists workspace_leases_state_expiry_idx
+      on workspace_leases(state, expires_at);
+  `);
 }
 
 function addColumnIfMissing(

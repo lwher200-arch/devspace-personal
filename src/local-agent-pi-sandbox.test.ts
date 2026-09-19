@@ -16,7 +16,8 @@ import {
 test("Pi sandbox enforces workspace writes, symlink containment and read-only mode", async (t) => {
   const dependencies = await SandboxManager.checkDependenciesAsync();
   const supported = SandboxManager.isSupportedPlatform();
-  if (process.env.DEVSPACE_REQUIRE_PI_SANDBOX === "1") {
+  const sandboxRequired = process.env.DEVSPACE_REQUIRE_PI_SANDBOX === "1";
+  if (sandboxRequired) {
     assert.equal(supported, true, "Pi sandbox integration is required on this CI lane");
     assert.deepEqual(dependencies.errors, [], "Pi sandbox dependencies must be available on this CI lane");
   }
@@ -97,8 +98,19 @@ test("Pi sandbox enforces workspace writes, symlink containment and read-only mo
       /Read-only file system|Command exited with code/,
       "sandboxed Pi bash cannot overwrite protected workspace environment files",
     );
+  } catch (error) {
+    if (!sandboxRequired && isSandboxEnvironmentUnavailable(error)) {
+      t.skip("Pi sandbox is unavailable because this environment restricts nested user namespaces.");
+      return;
+    }
+    throw error;
   } finally {
     await releasePiSandboxSession(session);
     await rm(root, { recursive: true, force: true });
   }
 });
+
+function isSandboxEnvironmentUnavailable(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /apply-seccomp.*(?:setgroups|CAP_SYS_ADMIN)|capability-restricted|No permissions to create a new namespace|non-privileged user namespaces/i.test(message);
+}

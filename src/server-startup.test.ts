@@ -17,8 +17,24 @@ import { openDatabase } from "./db/client.js";
 import * as serverModule from "./server.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
+import type { WorkspaceExecutionBoundaryVerification } from "./workspace-execution-boundary-verifier.js";
 
 const execFileAsync = promisify(execFile);
+
+const verifiedBoundary: WorkspaceExecutionBoundaryVerification = {
+  verified: true,
+  profile: "fixture-boundary-v2",
+  reason: "verified",
+  checks: {
+    profileMatch: true,
+    workspaceWrite: true,
+    outsideWriteBlocked: true,
+    protectedEnvWriteBlocked: true,
+    hostControlSocketsMasked: true,
+    sensitiveEnvironmentBlocked: true,
+    networkNoneIsolated: true,
+  },
+};
 
 async function fixture(t: TestContext, port = 7676) {
   const root = await mkdtemp(join(tmpdir(), "devspace-startup-test-"));
@@ -75,7 +91,7 @@ for (const stage of ["oauth", "workspace", "bridge"] as const) {
       });
     }
     assert.throws(() => serverModule.createServer(f.config), error => error === failure);
-    assert.equal(f.handles.length, { oauth: 1, workspace: 2, bridge: 3 }[stage]);
+    assert.equal(f.handles.length, { oauth: 1, workspace: 2, bridge: 4 }[stage]);
     assert.ok(f.handles.every(handle => !handle.open), "a thrown constructor must not leak its own or earlier handles");
     assert.equal(f.timers.size, 0);
   });
@@ -84,9 +100,9 @@ for (const stage of ["oauth", "workspace", "bridge"] as const) {
 test("a failed bridge factory rolls back earlier resources without starting inference", async t => {
   const f = await fixture(t), failure = Error("fixture factory failure");
   assert.throws(() => serverModule.createServer(f.config, { codexBridgeFactory() { throw failure; } }), error => error === failure);
-  assert.equal(f.handles.length, 2);
+  assert.equal(f.handles.length, 3);
   assert.ok(f.handles.every(handle => !handle.open));
-  assert.deepEqual(f.events, ["db:1", "db:0"]);
+  assert.deepEqual(f.events, ["db:2", "db:1", "db:0"]);
 });
 
 test("late route setup failure clears the timer and rolls back resources in reverse order", async t => {
@@ -97,10 +113,10 @@ test("late route setup failure clears the timer and rolls back resources in reve
     return Reflect.apply(get, this, args);
   });
   assert.throws(() => serverModule.createServer(f.config), error => error === failure);
-  assert.equal(f.handles.length, 3);
+  assert.equal(f.handles.length, 4);
   assert.ok(f.handles.every(handle => !handle.open));
   assert.equal(f.timers.size, 0);
-  assert.deepEqual(f.events, [...Array(5).fill("timer"), "db:2", "db:1", "db:0"]);
+  assert.deepEqual(f.events, [...Array(5).fill("timer"), "db:3", "db:2", "db:1", "db:0"]);
 });
 
 test("rollback failure preserves the startup cause and still attempts remaining resources", async t => {
@@ -117,7 +133,7 @@ test("rollback failure preserves the startup cause and still attempts remaining 
     return true;
   });
   assert.ok(f.handles.every(handle => !handle.open));
-  assert.deepEqual(f.events, ["db:1", "db:0"]);
+  assert.deepEqual(f.events, ["db:2", "db:1", "db:0"]);
 });
 
 for (const entry of ["cli", "server"]) {
@@ -148,7 +164,9 @@ for (const entry of ["cli", "server"]) {
 test("start resolves only after real listening and normal close releases every owned timer", async t => {
   const f = await fixture(t);
   f.config.port = 0;
-  const running = await serverModule.startServer(f.config);
+  const running = await serverModule.startServer(f.config, {
+    workspaceExecutionBoundaryVerifier: () => verifiedBoundary,
+  });
   try {
     assert.equal(running.httpServer.listening, true);
     const reference = new HttpServer();
@@ -160,6 +178,9 @@ test("start resolves only after real listening and normal close releases every o
     const health = await fetch(`http://127.0.0.1:${address.port}/healthz`);
     assert.equal(health.status, 200);
     assert.deepEqual(await health.json(), { ok: true, name: "devspace" });
+    const readiness = await fetch(`http://127.0.0.1:${address.port}/readyz`);
+    assert.equal(readiness.status, 200);
+    assert.equal((await readiness.json() as { ok?: boolean }).ok, true);
     assert.equal((await fetch(`http://127.0.0.1:${address.port}/mcp`)).status, 401);
   } finally { await shutdownHttpServer(running.httpServer, running.close); }
   assert.equal(f.timers.size, 0);

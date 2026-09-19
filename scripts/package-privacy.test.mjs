@@ -16,8 +16,19 @@ test('npm package excludes private deployment files even when present locally', 
   writeFileSync(join(root, 'scripts/fix-node-pty-permissions.mjs'), '// public');
   writeFileSync(join(root, 'auth.json'), '{}');
   const result = spawnSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['pack', '--dry-run', '--ignore-scripts', '--json'],
-    { cwd: root, encoding: 'utf8', windowsHide: true, shell: process.platform === 'win32', timeout: 60000 });
-  assert.equal(result.status, 0, result.stderr);
+    {
+      cwd: root,
+      encoding: 'utf8',
+      windowsHide: true,
+      shell: process.platform === 'win32',
+      timeout: 60000,
+      env: { ...process.env, NPM_CONFIG_CACHE: join(root, '.npm-cache') },
+    });
+  if (result.error?.code === 'ENOENT') {
+    t.skip('npm is not installed in this environment.');
+    return;
+  }
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
   const files = JSON.parse(result.stdout)[0].files.map(file => file.path);
   assert.ok(files.includes('scripts/fix-node-pty-permissions.mjs'));
   assert.equal(files.some(path => path.startsWith('scripts/windows/') || path === 'auth.json'), false);

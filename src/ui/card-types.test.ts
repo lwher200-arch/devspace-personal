@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isExpandableCard } from "./card-types.js";
+import { isExpandableCard, reviewPreviewFileCount, reviewPreviewMessage } from "./card-types.js";
 
 test("aggregate review opens when a patch is available", () => {
   const card = {
@@ -21,4 +21,17 @@ test("workspace details open only when there is useful context", () => {
     tool: "open_workspace",
     review: { available: false, reason: "Not a Git repository." },
   }), true);
+});
+
+test("bounded review metadata reports preview coverage without overstating visible files", () => {
+  const card = {
+    tool: "show_changes" as const,
+    files: [{ path: "large.bin" }, { path: "small.txt" }],
+    preview: { complete: false, includedFiles: 1, totalFiles: 2, omittedFiles: 1 },
+  };
+  assert.equal(reviewPreviewFileCount(card), 1);
+  assert.equal(
+    reviewPreviewMessage(card),
+    "Diff preview includes 1 of 2 changed files; 1 file omitted by preview limits. File statistics are complete.",
+  );
 });

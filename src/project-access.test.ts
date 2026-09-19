@@ -6,6 +6,23 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { projectFiles, projectRead, projectSearch } from "./project-access.js";
+import * as projectAccessModule from "./project-access.js";
+
+type ProjectAccessDiagnostics = {
+  reset(): void;
+  snapshot(): {
+    inventoryBuilds: number;
+    inventoryCacheHits: number;
+    textBodyReads: number;
+    textCacheHits: number;
+  };
+};
+
+function projectAccessDiagnostics(): ProjectAccessDiagnostics {
+  const diagnostics = (projectAccessModule as Record<string, unknown>).projectAccessDiagnosticsForTest;
+  assert.ok(diagnostics && typeof diagnostics === "object", "project access cache diagnostics should be available");
+  return diagnostics as ProjectAccessDiagnostics;
+}
 
 test('credential directories cannot leak through ordinary Git or filesystem search', async t => {
   const root=await mkdtemp(join(tmpdir(),'devspace-credential-search-'));
@@ -81,6 +98,37 @@ test("project reads reconstruct long Unicode lines and reject stale pages", asyn
   await assert.rejects(projectRead(root, { path: "large.txt", expectedSha256: sha256 }), /changed|hash/i);
   await writeFile(join(root, "binary.bin"), Buffer.from([0, 1, 2]));
   await assert.rejects(projectRead(root, { path: "binary.bin" }), /binary/i);
+});
+
+test("project access reuses validated inventory and text bodies across pagination", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-project-cache-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, "a.txt"), "a\n");
+  await writeFile(join(root, "b.txt"), "b\n");
+  const diagnostics = projectAccessDiagnostics();
+
+  diagnostics.reset();
+  const firstFiles = await projectFiles(root, { limit: 1, includeIgnored: true });
+  assert.ok(firstFiles.nextCursor);
+  await projectFiles(root, { limit: 1, includeIgnored: true, cursor: firstFiles.nextCursor });
+  let snapshot = diagnostics.snapshot();
+  assert.equal(snapshot.inventoryBuilds, 1);
+  assert.equal(snapshot.inventoryCacheHits, 1);
+
+  const content = "x".repeat(40_000);
+  await writeFile(join(root, "large.txt"), content);
+  diagnostics.reset();
+  const firstPage = await projectRead(root, { path: "large.txt", limit: 1000 });
+  assert.ok(firstPage.nextOffset);
+  await projectRead(root, {
+    path: "large.txt",
+    offset: firstPage.nextOffset,
+    limit: 1000,
+    expectedSha256: firstPage.sha256,
+  });
+  snapshot = diagnostics.snapshot();
+  assert.equal(snapshot.textBodyReads, 1);
+  assert.equal(snapshot.textCacheHits, 1);
 });
 
 test("literal search has resumable bounded pages with correct line numbers", async (t) => {

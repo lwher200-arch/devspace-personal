@@ -1,0 +1,16 @@
+{
+  "name": "@coldhao/devspace-control-hub",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "cf:check": "wrangler deploy --dry-run --config wrangler.jsonc --outdir ../../.runtime/control-hub-dry-run",
+    "cf:whoami": "wrangler whoami",
+    "cf:deploy": "wrangler deploy --config wrangler.jsonc"
+  },
+  "dependencies": {
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "wrangler": "4.135.0"
+  }
+}

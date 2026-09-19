@@ -25,6 +25,8 @@ export interface ReviewChangesResult {
   summary: ReviewSummary;
   files: ReviewFile[];
   patch: string;
+  patchTruncated: boolean;
+  patchFileCount: number;
 }
 
 export type ReviewAvailability =
@@ -57,6 +59,9 @@ export interface ReviewCheckpointManager {
 }
 
 const REVIEW_REF_PREFIX = "refs/devspace/review";
+const MAX_REVIEW_PATCH_BYTES = 1024 * 1024;
+const MAX_REVIEW_PATCH_FILE_BYTES = 512 * 1024;
+const MAX_REVIEW_PATCH_FILES = 128;
 
 export function createReviewCheckpointManager(): ReviewCheckpointManager {
   const states = new Map<string, WorkspaceReviewState>();
@@ -135,7 +140,7 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
         result: `${
           review.summary.files === 0
             ? `No changes since ${effectiveSince === "workspace_open" ? "workspace open" : "last shown changes"}.`
-            : formatChangedFiles(review.summary)
+            : formatChangedFiles(review.summary, review.patchTruncated, review.patchFileCount)
         }${fallbackNote}`,
         ...review,
       };
@@ -183,7 +188,7 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
 
 export async function readReviewRef(root: string, reviewRef: string): Promise<ReviewChangesResult> {
   const eligibility = await getGitEligibility(root);
-  if (!eligibility.ok || !eligibility.gitRoot) {
+  if ((!eligibility.ok && eligibility.reason !== "no_head") || !eligibility.gitRoot) {
     throw new Error(eligibility.message ?? "show-changes requires a Git workspace.");
   }
 
@@ -219,7 +224,7 @@ async function initializeWorkspaceState(
 
   try {
     const eligibility = await getGitEligibility(root);
-    if (!eligibility.ok || !eligibility.gitRoot) {
+    if ((!eligibility.ok && eligibility.reason !== "no_head") || !eligibility.gitRoot) {
       state.diagnostic = eligibility.message ?? "show_changes requires a Git workspace in this version.";
       return;
     }
@@ -230,7 +235,7 @@ async function initializeWorkspaceState(
     ]);
 
     if (!openCommit && !baselineCommit) {
-      const head = (await git(eligibility.gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
+      const head = await commitForRef(eligibility.gitRoot, "HEAD");
       const initialCommit = await createWorkingTreeSnapshot(eligibility.gitRoot, head);
       await git(eligibility.gitRoot, ["update-ref", state.openRef, initialCommit]);
       await git(eligibility.gitRoot, ["update-ref", state.baselineRef, initialCommit]);
@@ -280,16 +285,19 @@ function reviewRefs(
   };
 }
 
-async function createWorkingTreeSnapshot(gitRoot: string, parent: string): Promise<string> {
+async function createWorkingTreeSnapshot(gitRoot: string, parent?: string): Promise<string> {
   const tempDir = await mkdtemp(join(tmpdir(), "devspace-review-index-"));
   const indexPath = join(tempDir, "index");
   const env = checkpointEnv(indexPath);
 
   try {
-    await git(gitRoot, ["read-tree", "HEAD"], { env });
+    await git(gitRoot, parent ? ["read-tree", parent] : ["read-tree", "--empty"], { env });
     await git(gitRoot, ["add", "-A", "--", "."], { env });
     const tree = (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
-    return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "DevSpace review snapshot"], { env })).stdout.trim();
+    const commitArgs = ["commit-tree", tree];
+    if (parent) commitArgs.push("-p", parent);
+    commitArgs.push("-m", "DevSpace review snapshot");
+    return (await git(gitRoot, commitArgs, { env })).stdout.trim();
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -300,7 +308,9 @@ async function readReviewCommit(gitRoot: string, reviewRef: string): Promise<Rev
   const review = await readReviewBetween(gitRoot, parent, reviewRef);
   return {
     reviewRef,
-    result: review.summary.files === 0 ? "No changes in this review." : formatChangedFiles(review.summary),
+    result: review.summary.files === 0
+      ? "No changes in this review."
+      : formatChangedFiles(review.summary, review.patchTruncated, review.patchFileCount),
     ...review,
   };
 }
@@ -309,18 +319,58 @@ async function readReviewBetween(
   gitRoot: string,
   before: string,
   after: string,
-): Promise<Pick<ReviewChangesResult, "summary" | "files" | "patch">> {
-  const patch = (await git(gitRoot, ["diff", "--binary", "--no-color", before, after], {
-    maxBuffer: 50 * 1024 * 1024,
-  })).stdout;
+): Promise<Pick<ReviewChangesResult, "summary" | "files" | "patch" | "patchTruncated" | "patchFileCount">> {
   const numstat = (await git(gitRoot, ["diff", "--numstat", "-z", before, after], {
-    maxBuffer: 50 * 1024 * 1024,
+    maxBuffer: 16 * 1024 * 1024,
   })).stdout;
   const files = parseNumstat(numstat);
+  const preview = await readBoundedPatch(gitRoot, before, after, files);
   return {
     summary: summarizeFiles(files),
     files,
+    ...preview,
+  };
+}
+
+async function readBoundedPatch(
+  gitRoot: string,
+  before: string,
+  after: string,
+  files: ReviewFile[],
+): Promise<Pick<ReviewChangesResult, "patch" | "patchTruncated" | "patchFileCount">> {
+  let patch = "";
+  let patchBytes = 0;
+  let patchFileCount = 0;
+  let attemptedFiles = 0;
+
+  for (const file of files) {
+    if (attemptedFiles >= MAX_REVIEW_PATCH_FILES) break;
+    attemptedFiles += 1;
+    const paths = [...new Set([file.previousPath, file.path].filter((path): path is string => Boolean(path)))];
+    let filePatch: string;
+    try {
+      filePatch = (await git(
+        gitRoot,
+        ["diff", "--binary", "--no-color", before, after, "--", ...paths],
+        { maxBuffer: MAX_REVIEW_PATCH_FILE_BYTES },
+      )).stdout;
+    } catch (error) {
+      if (isMaxBufferError(error)) continue;
+      throw error;
+    }
+
+    if (!filePatch) continue;
+    const filePatchBytes = Buffer.byteLength(filePatch, "utf8");
+    if (patchBytes + filePatchBytes > MAX_REVIEW_PATCH_BYTES) continue;
+    patch += filePatch;
+    patchBytes += filePatchBytes;
+    patchFileCount += 1;
+  }
+
+  return {
     patch,
+    patchFileCount,
+    patchTruncated: patchFileCount < files.length,
   };
 }
 
@@ -391,8 +441,22 @@ function isReviewRef(value: string): boolean {
   return /^[0-9a-f]{40,64}$/.test(value);
 }
 
-function formatChangedFiles(summary: ReviewSummary): string {
-  return `Changed ${summary.files} ${summary.files === 1 ? "file" : "files"} (+${summary.additions} -${summary.removals}).`;
+function formatChangedFiles(
+  summary: ReviewSummary,
+  patchTruncated = false,
+  patchFileCount = summary.files,
+): string {
+  const base = `Changed ${summary.files} ${summary.files === 1 ? "file" : "files"} (+${summary.additions} -${summary.removals}).`;
+  return patchTruncated
+    ? `${base} Diff preview is bounded to ${patchFileCount} of ${summary.files} changed files; the file summary is complete.`
+    : base;
+}
+
+function isMaxBufferError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = "code" in error ? (error as { code?: unknown }).code : undefined;
+  if (code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return true;
+  return error instanceof Error && /maxBuffer/i.test(error.message);
 }
 
 function checkpointEnv(indexPath: string): NodeJS.ProcessEnv {

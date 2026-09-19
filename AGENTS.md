@@ -107,6 +107,28 @@ For UI changes, include before/after images and a short interaction video when b
 
 Start at the boundary named by the problem and follow the data. Keep policy in DevSpace, provider translation in adapters, and important behavior in schemas, types, checks, or explicit tool results rather than hidden prompt conventions.
 
+## Task completion reports
+
+End each task turn with a short, evidence-backed work summary before traffic and
+token accounting. Use the user's language by default. Keep the format
+proportional to the task: a small task may need only two to four short lines.
+
+Prefer these compact fields only when they add information:
+
+- **完成/修复** — combine what changed with the concrete problem fixed when they
+  are the same story. Do not claim a fix when only diagnosis was completed.
+- **验证** — only checks, tests, builds or runtime probes that actually ran.
+- **状态** — include source/build/deploy/runtime state only when that distinction
+  matters for the result.
+- **剩余** — include only material unresolved issues or next steps; omit it when
+  nothing useful remains.
+
+For partial, blocked or failed work, state that status explicitly and where work
+stopped. Otherwise avoid a redundant `completed` label. Merge overlapping facts,
+do not repeat the same result under multiple headings, and omit empty or obvious
+boilerplate. Do not replace the summary with a changelog, raw tool transcript,
+diff count or accounting footer.
+
 ## Task scope, traffic and token accounting
 
 Use direct tools for scoped reads, searches, guarded edits and deterministic
@@ -128,6 +150,11 @@ Preserve required verification and permission boundaries.
   delegated agents and subagents separately. Include input, cached input,
   cache-write input when supplied, output, reasoning output and total; recorded
   request/response payload bytes; sampling time and coverage for each source.
+  Place this accounting footer after the required task completion summary so the
+  final user-visible section is accounting, not a substitute for reporting the work.
+  When most counters are unavailable, collapse unavailable fields into one concise
+  sentence instead of printing an expanded empty template; expand only when actual
+  measurements or coverage distinctions exist.
 - Use actual response receipts, deduplicate response IDs, and do not add their
   totals to provider cumulative totals. Cache and reasoning counts are details
   of parent counters. A receipt shared by several operations is counted once;

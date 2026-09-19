@@ -12,6 +12,7 @@ import type { WorkspaceRegistry } from "./workspaces.js";
 import { canonicalAllowedPath } from "./roots.js";
 import { resolveCodexCommand, type CodexCommandResolver } from "./local-agent-codex.js";
 import { assertExecutionSelection, executionEvidenceSchema, approvedModels, selectExecutionModel, type CodexExecutionPolicy } from "./local-agent-execution.js";
+import { deliveryRecoveryPlan } from "./control-plane/returnflow.js";
 
 type AgentClient = Pick<LocalAgentClient, "start" | "continue" | "get" | "list">;
 type WriteMode = "read_only" | "allowed";
@@ -135,7 +136,8 @@ export class CodexBridge {
 
   private async replay(receipt: Receipt, fingerprint: string, scope: LocalAgentWorkspaceScope) {
     if (receipt.fingerprint !== fingerprint) throw new Error("requestKey was already used for a different request.");
-    if (!receipt.agent_id) throw new Error("Previous delivery is pending or uncertain. Use codex_tasks; do not automatically create another task.");
+    const recovery = deliveryRecoveryPlan(receipt.state, Boolean(receipt.agent_id));
+    if (!receipt.agent_id || !recovery.canReadExistingTask) throw new Error(recovery.instruction);
     return { ...await this.status({ workspaceRoot: scope.workspaceRoot }, receipt.agent_id), replayed: true };
   }
 }

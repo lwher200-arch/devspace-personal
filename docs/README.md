@@ -15,6 +15,7 @@
 ## 理解系统
 
 - [架构与请求流](architecture.md)：分层、生命周期、状态归属和不变量。
+- [研究成果工程映射](research-architecture.md)：回游、奇美拉、影身/镜影、Neuron Safety 等如何进入实际架构，以及暂不进入运行时的边界。
 - [核心模块](core-modules.md)：源码入口及依赖责任。
 - [代理桥接](closed-loop.md)：请求去重、模型证据及有限往返。
 - [守护进程](local-agent-daemon.md) 与 [代理档案](agent-profile-schema.md)：执行与权限契约。

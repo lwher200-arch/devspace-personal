@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { HeadTailBuffer, ProcessSessionManager } from "./process-sessions.js";
+import { BubblewrapWorkspaceExecutionBoundary, type WorkspaceExecutionBoundary } from "./workspace-execution-boundary.js";
 
 const smallBuffer = new HeadTailBuffer(100);
 smallBuffer.append("hello\n");
@@ -48,6 +49,18 @@ assert.equal(foreground.exitCode, 0);
 assert.match(foreground.output, /foreground/);
 assert.equal(foreground.sessionId, undefined);
 
+const fastNative = await manager.startProcess({
+  workspaceId: "workspace-a",
+  executable: process.execPath,
+  args: ["-e", "process.exit(0)"],
+  cwd: process.cwd(),
+  timeoutMs: 2_000,
+  yieldTimeMs: 2_000,
+});
+assert.equal(fastNative.running, false);
+assert.equal(fastNative.exitCode, 0);
+assert.equal(fastNative.stdinError, undefined);
+
 const environment = await manager.start({
   workspaceId: "workspace-a",
   workspaceRoot: "/tmp/devspace-workspace-a",
@@ -57,6 +70,39 @@ const environment = await manager.start({
 });
 assert.equal(environment.running, false);
 assert.match(environment.output, /1,dumb,cat,cat,cat,1,workspace-a,\/tmp\/devspace-workspace-a/);
+
+const previousSecret = process.env.DEVSPACE_TEST_API_KEY;
+const previousSafe = process.env.DEVSPACE_TEST_VISIBLE;
+process.env.DEVSPACE_TEST_API_KEY = "fixture-secret";
+process.env.DEVSPACE_TEST_VISIBLE = "fixture-visible";
+try {
+  const policy = new BubblewrapWorkspaceExecutionBoundary("unused");
+  const filteringBoundary: WorkspaceExecutionBoundary = {
+    profile: "fixture-env-filter-v1",
+    prepare(input) {
+      return { executable: input.executable, args: input.args, boundaryProfile: this.profile };
+    },
+    filterEnvironment(input) {
+      return policy.filterEnvironment(input);
+    },
+  };
+  const boundedEnvironment = await manager.start({
+    workspaceId: "workspace-a",
+    workspaceRoot: process.cwd(),
+    cwd: process.cwd(),
+    executionBoundary: filteringBoundary,
+    command: `${node} -e "console.log([process.env.DEVSPACE_TEST_API_KEY, process.env.DEVSPACE_TEST_VISIBLE].join(','))"`,
+    yieldTimeMs: 2_000,
+  });
+  assert.equal(boundedEnvironment.running, false);
+  assert.match(boundedEnvironment.output, /,fixture-visible/);
+  assert.equal(boundedEnvironment.output.includes("fixture-secret"), false);
+} finally {
+  if (previousSecret === undefined) delete process.env.DEVSPACE_TEST_API_KEY;
+  else process.env.DEVSPACE_TEST_API_KEY = previousSecret;
+  if (previousSafe === undefined) delete process.env.DEVSPACE_TEST_VISIBLE;
+  else process.env.DEVSPACE_TEST_VISIBLE = previousSafe;
+}
 
 const background = await manager.start({
   workspaceId: "workspace-a",

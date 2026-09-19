@@ -6,10 +6,44 @@ DevSpace Personal 是个人维护的 MCP 本地开发服务。它将项目发现
 受保护修改、命令执行和代理任务协调组织为明确的工具接口，让支持 MCP 的
 客户端在授权范围内使用本地开发环境。
 
-它负责连接、执行和返回证据，不替用户决定权限，也不是无人值守的聊天机器人。
+项目基于 [Waishnav/devspace](https://github.com/Waishnav/devspace) 持续修改，保留上游 MIT 许可。
+当前源码的包名仍为 `@waishnav/devspace`、版本为 `1.0.8`；本仓库的个人修改应从本仓库源码构建，
+不能假定同名 npm 包已经包含这里的全部更新。
+
+它负责连接、执行和返回证据，工作流由 MCP 客户端协调。
 
 使用入口见 [文档导航](docs/README.md)，协议与预算见 [工具目录](docs/tool-reference.md)，
 维护、验证和架构待办见 [工程维护](docs/maintenance.md)。
+
+## 当前实现状态（2026-09-19）
+
+当前源码版本为 `1.0.8`，要求 Node.js `>=22.19 <27`，仓库固定使用
+`pnpm@11.25.0`。本仓库当前已经包含工作区文件工具、原生命令/进程会话、
+Owner 审批、可选代理桥接，以及下列正在收敛的能力：
+
+- **Linux 工作区执行边界：** 默认服务启动路径会创建 Bubblewrap 执行边界；项目级 Shell、PTY
+  和原生进程经同一边界执行，限制工作区之外的写入并屏蔽部分宿主凭据和控制接口。
+  需要本机提供可用的 `bwrap` 和用户命名空间支持。macOS / Windows 当前没有此后端。
+- **A2 租约与 Candidate 工作区：** 已有持久化租约、边界自检、Candidate 副本、执行协调和
+  有界变更证据，但尚未开放租约申请/激活的 MCP 或配置入口，普通客户端目前无法直接启用。
+  内部符合条件的 A2 执行在 Candidate 内使用禁网配置；普通逐次批准的执行仍继承网络。
+  Candidate 自动验证与晋升（promotion）、重启后恢复 Candidate、出站网络白名单尚未完成。
+  详见 [A2 执行边界](docs/a2-execution-boundary.md)。
+- **Context Fabric：** `context_fabric` 提供工作区内的 Anchor / Delta / ContextCapsule 状态，
+  用于按预算组织上下文。当前保存在服务进程内，重启后丢失，不授予文件或执行权限。
+- **Cloudflare Control Hub：** 仓库包含可选的 Worker / Durable Object / R2 协调服务，
+  本地 `control_hub` 工具只开放 `status`、`hello`、`permissions`、`notifications` 四种动作。
+  Worker 中的上下文、任务和通知接口，不等于本地已完成自动上传或后台任务消费。
+  云端 capability 不授予本机执行权限。部署与配置见 [Control Hub 说明](cloudflare/control-hub/README.md)。
+- **审批恢复：** approved receipt 可在同一受信任 OAuth client 下迁移逻辑会话。
+  Owner 审批、工作区权限和执行边界仍分别校验；恢复原批准不扩大其操作范围。
+- **Decision Intelligence：** 已有 TypeSafe、benchmark、redaction 与健康证据模块及测试，
+  当前作为辅助评估代码，不拥有 Owner approval、A2 或 Candidate promotion 权限。
+  参见 [Decision Intelligence](docs/decision-intelligence.md)。
+
+上述状态描述的是仓库源码。长期运行的服务是否使用了这些更新，需要另外核对构建标识、
+`tools/list` 和实际流程；一次构建或测试通过不能证明已部署。Raw Chat/Codex 输入输出自动写入 R2
+前的本地 Redaction Gateway 仍未接通，调用方自报已脱敏不能代替真实脱敏。
 
 ## 核心能力
 
@@ -42,7 +76,10 @@ DevSpace Personal 是个人维护的 MCP 本地开发服务。它将项目发现
 继续同一次执行，通过 `process_cancel` 请求终止。两种宿主工具模式均可使用。
 退出码、启动失败、超时和取消分别返回；进程会话不会跨服务重启恢复。
 
-命令以服务账户的权限执行。工作区路径校验不会将任意 Shell 命令变成沙箱。
+Linux 默认服务路径会创建 `WorkspaceExecutionBoundary`，项目级 Shell / native process
+经 Bubblewrap 执行；A2 Candidate 禁用网络，普通逐次批准的执行继承网络。边界的可用性和
+实际 profile 需要运行时验证。macOS / Windows 或明确未配置边界的实例仍按服务账户权限执行，
+文件路径校验本身不是进程沙箱。宿主维护使用独立的 `host_command` Owner 审批入口。
 
 ### 显式代理任务
 
@@ -85,14 +122,20 @@ flowchart TD
     Entry --> Workspace["工作区身份与物理根校验"]
     Workspace --> Policy["操作风险分类 / 单次 Owner 批准"]
     Policy --> Files["发现 / 搜索 / 读取 / 补丁"]
-    Policy --> Commands["命令与进程会话"]
+    Policy --> Boundary["可选 A2 Workspace Execution Boundary"]
+    Boundary --> Commands["项目命令与进程会话"]
+    Policy --> Host["Owner-gated host_command"]
     Policy --> Bridge["可选代理桥接"]
     Bridge --> Daemon["本地守护进程与任务管理"]
     Daemon --> Provider["已配置的执行提供方"]
+    Workspace --> Context["Context Fabric"]
+    Entry --> Cloud["独立 control_hub 工具 / 可选 Cloudflare 协调服务"]
+    Cloud -. "不授予本机执行权" .-> Policy
     Workspace --> State["本机持久化状态"]
     Daemon --> State
     Files --> Result["结果 / 错误 / 哈希 / 差异"]
     Commands --> Result
+    Host --> Result
     Provider --> Result
     Result --> Client
 ```
@@ -123,6 +166,13 @@ GPT-6 Astra / GPT-5.6 Sol 之间按任务路由，不借此扩大权限。配置
 [用户授权与双模型路由](docs/authorization.md)。
 
 先安装满足 `package.json` 要求的 Node.js（包含 npm）和 Git，再克隆或下载本仓库。
+Linux 项目命令执行还需要安装 Bubblewrap，并确保系统允许所需的用户命名空间。
+若使用 Pi 沙箱，其依赖与限制见 [部署与步骤引导](docs/setup.md)。
+
+```sh
+git clone https://github.com/lwher200-arch/devspace-personal.git
+cd devspace-personal
+```
 
 - **Windows：** 解压后双击根目录的 `deploy.cmd`。
 - **macOS / Linux：** 在仓库目录运行 `sh deploy.sh`。
@@ -149,9 +199,10 @@ node scripts/deploy.mjs --no-start
 
 ## 公开信息边界
 
-本仓库只使用虚构目录、示例域名和抽象工作区描述，不展示实际接入项目的名称、
-文件树、业务模块、账号、对话链接或部署拓扑。认证文件、数据库、日志、
-备份和专用部署脚本不纳入公开发布。
+本仓库可以公开项目自身有意公开的协议入口、Worker 名称、R2 bucket 名称与公共域名，
+例如 Control Hub 的公开地址；这些标识本身不是凭据，也不授予执行权限。仓库不应提交
+本机绝对路径、Cloudflare 账号 ID、API Token、Owner 密码、OAuth 私密材料、Node/Admin Token、
+实际接入项目的私有文件树、数据库、日志或备份。Secret 只通过部署环境或平台 Secret 管理。
 
 源码保留在本机，并不意味着工具返回内容不会离开本机：客户端取得的文本、
 命令输出和任务结果会进入对应宿主的处理流程，应按需要授权和最小化传输。
@@ -166,13 +217,30 @@ node scripts/deploy.mjs --no-start
 - 模型证据由提供方产生，不是对模型内部执行的独立证明。
 - 网络、宿主权限、提供方可用性与工具元数据都可能独立影响使用。
 - 未实现无人值守的双向聊天接管或自动递归代理循环。
+- Cloud Control Hub 是协调面，不是本机执行控制面；云端 assignment 不能替代 Owner/A2/Candidate 校验。
+- Context Fabric 当前为进程内状态；服务重启后不能把旧 capsule 当作仍然存在。
+- 在自动把 Chat/Codex 原始输入输出写入 R2 前，仍需要本地 Redaction Gateway；调用方自报
+  `redacted: true` 不能作为已经脱敏的证据。
+- 长期运行实例可能落后于当前源码或 Candidate；生产能力应通过 runtime/build identity、
+  tools/list 和真实回归确认。
 
 ## 仓库验证
 
-从源码仓库运行 `npm run typecheck`、`npm run test:docs`、`npm test` 和
-`npm run test:deploy`。浏览器回归需显式配置测试浏览器，构建中的界面需独立验收。
-文档链接、配置示例和基础工具目录已有自动检查；这些检查不能代替真实宿主流程。
-Git 提交、构建产物、实际部署和客户端缓存分别核对，不把其中一个的成功当作全部成功。
+安装 `package.json` 声明的 pnpm 版本后，在源码目录运行：
+
+```sh
+pnpm install --frozen-lockfile
+pnpm verify
+```
+
+`verify` 依次执行类型检查、文档契约、构建、源码测试和部署/打包契约。
+也可用 `pnpm typecheck`、`pnpm test:docs`、`pnpm test`、`pnpm test:deploy`、`pnpm build`
+定位单项问题。CI 配置覆盖三平台 Node 22.19，以及 Linux Node 24 / 26；实际通过情况以对应
+提交的运行结果为准。
+
+浏览器回归需要显式提供 `DEVSPACE_TEST_BROWSER`，构建后的界面需独立验收；
+沙箱测试也有平台和环境前提。跳过的测试不计作通过，文档链接检查不代替真实 MCP 宿主流程。
+构建会替换当前目录的 `dist`，已有服务使用该目录时应在独立目录验证。
 
 ## 文档导航
 
@@ -191,3 +259,12 @@ Git 提交、构建产物、实际部署和客户端缓存分别核对，不把�
 ## 许可证
 
 按 [MIT License](LICENSE) 提供。版权和许可声明保留在许可证文件中。
+
+## 赞赏
+
+如果 DevSpace Personal 对你有帮助，欢迎自愿打赏，支持 ColdHao 持续维护和改进项目。
+感谢你的使用、反馈与支持。
+
+<p align="center">
+  <img src="docs/coldhao-reward-code.jpg" alt="ColdHao 的赞赏码" width="384" />
+</p>

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { access, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
@@ -46,7 +47,25 @@ import {
   type McpSessionCloseResult,
 } from "./mcp-sessions.js";
 import { ProcessSessionManager } from "./process-sessions.js";
+import {
+  createWorkspaceExecutionBoundary,
+  type WorkspaceExecutionBoundary,
+} from "./workspace-execution-boundary.js";
+import {
+  WorkspaceExecutionBoundaryVerificationCache,
+  type WorkspaceExecutionBoundaryVerification,
+  type WorkspaceExecutionBoundaryVerifier,
+} from "./workspace-execution-boundary-verifier.js";
+import {
+  WorkspaceLeaseIntegrityError,
+  WorkspaceLeaseStore,
+} from "./workspace-lease/workspace-lease.js";
+import {
+  WorkspaceLeaseRuntime,
+  type WorkspaceLeaseRuntimeObservation,
+} from "./workspace-lease/workspace-lease-runtime.js";
 import { createExecutorReadiness, type ExecutorReadiness } from "./runtime-readiness.js";
+import { readProductVersion, readRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./runtime-build-identity.js";
 import { registerNativeProcessTools } from "./native-process-tools.js";
 import { AccessDeniedError } from "./roots.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
@@ -66,6 +85,16 @@ import {
   type LocalAgentProviderStatus,
 } from "./local-agent-catalog.js";
 import { getToolSurface } from "./tool-surfaces/index.js";
+import { ContextFabricStore, registerContextFabricTool } from "./control-plane/context-fabric-tools.js";
+import { registerControlHubTool } from "./control-plane/control-hub-tools.js";
+import {
+  A2_CANDIDATE_GRANT_META_KEY,
+  CandidateExecutionCoordinator,
+} from "./candidate-workspace/candidate-execution-coordinator.js";
+import {
+  FilesystemCandidateWorkspaceProvider,
+  type CandidateWorkspaceProvider,
+} from "./candidate-workspace/candidate-workspace.js";
 import {
   contentText,
   logFailedToolResponse,
@@ -88,6 +117,17 @@ type Transport = StreamableHTTPServerTransport;
 const MCP_SESSION_IDLE_TIMEOUT_MS = 5 * 60 * 1_000;
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 30 * 1_000;
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
+// Read-only resource aliases for MCP hosts that cached an older outputTemplate
+// URI before reconnecting. New tool definitions must continue to publish only
+// WORKSPACE_APP_URI. These aliases carry no approval authority or private data.
+const LEGACY_WORKSPACE_APP_URIS = [
+  "ui://devspace/workspace-app.html",
+  "ui://devspace/workspace-app-v2.html",
+  "ui://devspace/workspace-app-v3.html",
+  "ui://devspace/workspace-app-v4.html",
+  "ui://devspace/workspace-app-v5.html",
+  "ui://devspace/workspace-app-v6.html",
+] as const;
 
 interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
@@ -121,8 +161,8 @@ function serverInstructions(
   const common = `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work, reuse that workspaceId. Use refreshContext=true with the same checkout path only when project rules changed or the earlier bootstrap context is missing. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected.`;
 
   const authorization = config.toolAuthorization === 'owner_approval'
-    ? ' High-risk operations require user approval. On OWNER_APPROVAL_REQUIRED, if chatApproval.enabled is true call review_approval with approvalId to show the decision card, then wait for the user. Otherwise show approvalUrl and wait. Never ask for passwords, read private card metadata, call the UI decision tool on the user behalf, or evade approval. Codex submissions execute once on approval: recover the task and query status, not another start. Other operations need the exact retry after approval. Routine guarded patches remain available.' : '';
-  const nativeWorkflow = ' Use project_read_batch for a bounded group of known files, following per-file hashes and continuation. Prefer run_process when a program and literal arguments express the command; use process_status for its existing session and inspect exitCode, timedOut and spawnError. Do not start a second execution to poll delayed work. A zero exit code is command evidence, not proof that tests were discovered or a product workflow succeeded.';
+    ? ' High-risk operations require user approval. On OWNER_APPROVAL_REQUIRED, if chatApproval.enabled is true call review_approval with no approvalId to show the centralized Approval Center for the current Chat conversation; pass approvalId only when one specific request must be reopened, then wait for the user. Otherwise show approvalUrl and wait. Never ask for passwords, read private card metadata, call the UI decision tool on the user behalf, infer a conversation lease, or evade approval. After a non-Codex approval notification, retry only the exact original operation first. If the host changed the logical Chat session and the existing approval receipt cannot be consumed, call claim_approval with that approvalId. If a cached host tool surface does not expose claim_approval, call review_approval with approvalId "__claim__<approvalId>" to claim that same already-approved receipt without approving anything new, then retry the exact original operation. A conversation safe-operation lease exists only after the user selects that option in the approval UI. Shell/native leases remain exact-request scoped; Codex leases are bounded by project, Codex action, write mode, resolved model and, for continuations, agent ID. Revoke live leases with revoke_conversation_approvals. Recycle only server-marked processed history with recycle_approvals; recycling never grants or revokes authority. Codex approval submits the current turn exactly once; later matching calls may use an active bounded lease, but an approval receipt itself must never be replayed as execution. Routine guarded patches remain available.' : '';
+  const nativeWorkflow = ' Use project_read_batch for a bounded group of known files, following per-file hashes and continuation. Prefer run_process when a program and literal arguments express the command. Use host_command only for explicit DevSpace-host maintenance or recovery that requires shell semantics; it is not sandboxed and remains Owner-approval gated. Use process_status for existing native sessions and inspect exitCode, timedOut and spawnError. Do not start a second execution to poll delayed work. A zero exit code is command evidence, not proof that tests were discovered or a product workflow succeeded.';
   return `${common} ${toolSurface.instructions({ agents, skills })}${nativeWorkflow}${artifactInstruction}${showChangesInstruction}${authorization}`;
 }
 
@@ -292,6 +332,51 @@ async function assertWorkspaceAppAssets(): Promise<void> {
   }
 }
 
+function registerWorkspaceAppResources(server: McpServer, config: ServerConfig): void {
+  const uris = [WORKSPACE_APP_URI, ...LEGACY_WORKSPACE_APP_URIS];
+  for (const [index, uri] of uris.entries()) {
+    const current = index === 0;
+    registerAppResource(
+      server,
+      current ? "DevSpace Workspace App" : `DevSpace Workspace App compatibility ${index}`,
+      uri,
+      {
+        description: current
+          ? "Interactive DevSpace workspace UI for tool results, file reviews, and user approval workflows."
+          : "Compatibility alias for a previously cached DevSpace workspace UI resource. New tool definitions do not publish this URI.",
+        _meta: {
+          ui: {
+            csp: appCsp(config),
+          },
+        },
+      },
+      async () => {
+        await assertWorkspaceAppAssets();
+        const text = workspaceAppHtml(config);
+        logEvent(config.logging, "info", "mcp_app_resource_read", {
+          uri,
+          current,
+          bytes: Buffer.byteLength(text),
+        });
+        return {
+          contents: [
+            {
+              uri,
+              mimeType: RESOURCE_MIME_TYPE,
+              text,
+              _meta: {
+                ui: {
+                  csp: appCsp(config),
+                },
+              },
+            },
+          ],
+        };
+      },
+    );
+  }
+}
+
 export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -303,13 +388,16 @@ export function createMcpServer(
   approvals?: OwnerApprovals,
   beginRequest?: () => (() => void) | undefined,
   cancelledRequest?: (requestId: string | number) => void,
+  executionBoundary?: WorkspaceExecutionBoundary,
+  contextFabricStore = new ContextFabricStore(),
+  candidateExecutionCoordinator?: CandidateExecutionCoordinator,
 ): McpServer {
   const toolSurface = getToolSurface(config.toolMode);
   const server = new McpServer(
     {
       name: "devspace",
       title: "DevSpace",
-      version: "0.1.0",
+      version: readProductVersion(),
       description:
         "Coding tools for project workspaces. Open each project or worktree once, then reuse its workspaceId.",
     },
@@ -335,36 +423,7 @@ export function createMcpServer(
     });
   }
 
-  registerAppResource(
-    server,
-    "DevSpace Diff Card",
-    WORKSPACE_APP_URI,
-    {
-      description: "Interactive card for viewing DevSpace file diffs.",
-      _meta: {
-        ui: {
-          csp: appCsp(config),
-        },
-      },
-    },
-    async () => {
-      await assertWorkspaceAppAssets();
-      return {
-        contents: [
-          {
-            uri: WORKSPACE_APP_URI,
-            mimeType: RESOURCE_MIME_TYPE,
-            text: workspaceAppHtml(config),
-            _meta: {
-              ui: {
-                csp: appCsp(config),
-              },
-            },
-          },
-        ],
-      };
-    },
-  );
+  registerWorkspaceAppResources(server, config);
 
   registerAppTool(
     server,
@@ -671,9 +730,15 @@ export function createMcpServer(
     config,
     workspaces,
     processSessions,
+    executionBoundary,
+    candidateExecutionCoordinator,
   });
   registerProjectTools({ server, config, workspaces, processSessions });
-  registerNativeProcessTools({ server, config, workspaces, processSessions });
+  registerNativeProcessTools({
+    server, config, workspaces, processSessions, executionBoundary, candidateExecutionCoordinator,
+  });
+  registerContextFabricTool(server, config, workspaces, contextFabricStore);
+  registerControlHubTool(server, config, { productVersion: readProductVersion() });
 
   registerAppTool(
     server,
@@ -725,6 +790,12 @@ export function createMcpServer(
             workspaceId,
             summary: review.summary,
             files: review.files,
+            preview: {
+              complete: !review.patchTruncated,
+              includedFiles: review.patchFileCount,
+              totalFiles: review.summary.files,
+              omittedFiles: Math.max(0, review.summary.files - review.patchFileCount),
+            },
             payload: {
               patch: review.patch,
             },
@@ -748,7 +819,9 @@ export function createMcpServer(
   }
 
   if (codexBridge) registerCodexBridgeTools(server, workspaces, codexBridge);
-  if (approvals && config.uiEnabled) registerApprovalTools(server, config, approvals, workspaces);
+  if (approvals && config.uiEnabled) {
+    registerApprovalTools(server, config, approvals, workspaces, executionBoundary?.profile);
+  }
   return server;
 }
 
@@ -756,7 +829,12 @@ export interface CreateServerOptions {
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
   codexBridgeFactory?: (config: ServerConfig) => CodexBridge;
   executorReadiness?: () => ExecutorReadiness;
+  runtimeBuildIdentity?: () => RuntimeBuildIdentity;
   mcpSessions?: { maxSessions?: number; now?: () => number; idleTimeoutMs?: number; cleanupIntervalMs?: number };
+  executionBoundary?: WorkspaceExecutionBoundary | null;
+  workspaceExecutionBoundaryVerifier?: WorkspaceExecutionBoundaryVerifier;
+  workspaceExecutionBoundaryVerificationTtlMs?: number;
+  candidateWorkspaceProvider?: CandidateWorkspaceProvider | null;
 }
 
 export function createServer(
@@ -806,7 +884,55 @@ function initializeServer(
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
+  const executionBoundary = options.executionBoundary === undefined
+    ? createWorkspaceExecutionBoundary()
+    : options.executionBoundary ?? undefined;
+  const boundaryVerificationCache = new WorkspaceExecutionBoundaryVerificationCache(
+    executionBoundary,
+    {
+      verify: options.workspaceExecutionBoundaryVerifier,
+      ttlMs: options.workspaceExecutionBoundaryVerificationTtlMs,
+    },
+  );
+  let lastBoundaryVerificationLog = "";
+  const currentBoundaryVerification = (force = false): WorkspaceExecutionBoundaryVerification => {
+    const receipt = boundaryVerificationCache.current(force);
+    const signature = JSON.stringify(receipt);
+    if (signature !== lastBoundaryVerificationLog) {
+      lastBoundaryVerificationLog = signature;
+      logEvent(
+        config.logging,
+        receipt.verified ? "info" : "warn",
+        "workspace_execution_boundary_verification",
+        {
+          verified: receipt.verified,
+          profile: receipt.profile,
+          reason: receipt.reason,
+          ...receipt.checks,
+        },
+      );
+    }
+    return receipt;
+  };
+  currentBoundaryVerification(true);
+  const workspaceLeaseStore = new WorkspaceLeaseStore(config.stateDir);
+  rollback.push(() => workspaceLeaseStore.close());
+  const workspaceLeaseRuntime = new WorkspaceLeaseRuntime(workspaceLeaseStore, {
+    boundaryVerified: () => currentBoundaryVerification().verified,
+  });
+  const candidateWorkspaceProvider = options.candidateWorkspaceProvider === undefined
+    ? new FilesystemCandidateWorkspaceProvider(join(config.stateDir, "candidate-workspaces"))
+    : options.candidateWorkspaceProvider ?? undefined;
+  const candidateExecutionCoordinator = candidateWorkspaceProvider
+    ? new CandidateExecutionCoordinator(
+        workspaceLeaseRuntime,
+        candidateWorkspaceProvider,
+        executionBoundary?.profile,
+      )
+    : undefined;
   const executorReadiness = options.executorReadiness ?? createExecutorReadiness();
+  const runtimeBuildIdentity = (options.runtimeBuildIdentity ?? readRuntimeBuildIdentity)();
+  const contextFabricStore = new ContextFabricStore();
   let shuttingDown = false;
   const approvals = config.toolAuthorization === 'owner_approval'
     ? new OwnerApprovals(undefined, (config.approvalTtlSeconds ?? APPROVAL_TTL_SECONDS.default) * 1000) : undefined;
@@ -923,6 +1049,12 @@ function initializeServer(
     res.json({ ok: true, name: "devspace" });
   });
 
+  app.get("/runtimez", (_req, res) => {
+    const ok = runtimeBuildIdentity.freshness !== "mismatch";
+    res.setHeader("Cache-Control", "no-store");
+    res.status(ok ? 200 : 503).json({ ok, name: "devspace", ...runtimeBuildIdentity });
+  });
+
   app.get("/readyz", (_req, res) => {
     const checks: Record<string, boolean> = { lifecycle: !shuttingDown };
     for (const [name, check] of [
@@ -938,11 +1070,19 @@ function initializeServer(
     catch { executors = { native: false, shell: false, pty: false }; }
     checks.nativeExecutor = executors.native;
     checks.shellExecutor = executors.shell;
+    const executionBoundaryVerification = currentBoundaryVerification();
+    checks.workspaceExecutionBoundary = executionBoundaryVerification.verified;
+    if (runtimeBuildIdentity.freshness !== "unverified") {
+      checks.buildFreshness = runtimeBuildIdentity.freshness === "verified";
+    }
     const ok = Object.values(checks).every(Boolean);
     res.setHeader("Cache-Control", "no-store");
     res.status(ok ? 200 : 503).json({
       ok, name: "devspace", status: ok ? "ready" : "degraded", checks,
-      capabilities: { pty: executors.pty },
+      capabilities: {
+        pty: executors.pty,
+        executionBoundary: executionBoundaryVerification,
+      },
       // Independent agent daemons cannot be counted here without querying/starting them.
       // Unknown activity must never be interpreted as permission to restart their work.
       activityKnown: !config.subagents.enabled && !config.bridge?.enabled,
@@ -1011,6 +1151,8 @@ function initializeServer(
         // example, whitespace must not route the reviewed and actual models differently).
         let executionArgs: Record<string, unknown>;
         let assessment: { reason?: string; context: unknown };
+        let a2WorkspaceLease: WorkspaceLeaseRuntimeObservation | undefined;
+        let a2CandidateGrant: string | undefined;
         try {
           try {
             executionArgs = automatic ? parseCodexSubmission(tool, args) : args;
@@ -1020,7 +1162,67 @@ function initializeServer(
           }
           assessment = isApprovalUiTool(tool)
             ? { reason: undefined, context: {} }
-            : classifyMcpOperation(config, workspaces, tool, executionArgs);
+            : classifyMcpOperation(config, workspaces, tool, executionArgs, executionBoundary?.profile);
+          if (["exec_command", "bash", "run_process"].includes(tool) &&
+              typeof executionArgs.workspaceId === "string") {
+            const workspace = workspaces.getWorkspace(executionArgs.workspaceId);
+            try {
+              if (candidateExecutionCoordinator) {
+                const authorization = await candidateExecutionCoordinator.authorizeRequest({
+                  clientId: req.auth!.clientId,
+                  conversationScopeId: openAiConversationScopeId(req.body.params?._meta),
+                  workspaceId: executionArgs.workspaceId,
+                  stableRoot: workspace.root,
+                  tool: tool as "exec_command" | "bash" | "run_process",
+                });
+                a2WorkspaceLease = authorization.observation;
+                a2CandidateGrant = authorization.grantToken;
+                if (a2CandidateGrant) {
+                  const metadata = req.body.params?._meta;
+                  req.body.params._meta = {
+                    ...(metadata && typeof metadata === "object" && !Array.isArray(metadata)
+                      ? metadata as Record<string, unknown>
+                      : {}),
+                    [A2_CANDIDATE_GRANT_META_KEY]: a2CandidateGrant,
+                  };
+                }
+              } else {
+                a2WorkspaceLease = workspaceLeaseRuntime.observe({
+                  clientId: req.auth!.clientId,
+                  conversationScopeId: openAiConversationScopeId(req.body.params?._meta),
+                  workspaceRoot: workspace.root,
+                  boundaryProfile: executionBoundary?.profile,
+                });
+              }
+            } catch (error) {
+              if (!(error instanceof WorkspaceLeaseIntegrityError)) throw error;
+              logEvent(config.logging, "error", "workspace_lease_integrity_failed", {
+                tool,
+                requestId,
+                workspaceId: executionArgs.workspaceId,
+              });
+              const detail = {
+                code: "WORKSPACE_LEASE_INTEGRITY_FAILED",
+                instruction: "Persisted A2 workspace lease integrity verification failed. Execution is blocked until the lease state is inspected or revoked; a legacy approval does not override corrupted lease state.",
+              };
+              res.json({ jsonrpc: "2.0", id: req.body.id, result: {
+                isError: true,
+                content: [textBlock(JSON.stringify(detail))],
+              } });
+              return;
+            }
+            if (a2WorkspaceLease.lease) {
+              logEvent(config.logging, "info", "workspace_lease_runtime_observed", {
+                tool,
+                requestId,
+                workspaceId: executionArgs.workspaceId,
+                state: a2WorkspaceLease.lease.state,
+                reason: a2WorkspaceLease.reason,
+                authorityActive: a2WorkspaceLease.authorityActive,
+                executionEligible: a2WorkspaceLease.executionEligible,
+              });
+            }
+          }
         } catch (error) {
           if (error instanceof WorkspaceUnavailableError || error instanceof InvalidToolArgumentsError || error instanceof InvalidPatchError) {
             const detail = error instanceof WorkspaceUnavailableError
@@ -1043,7 +1245,7 @@ function initializeServer(
         if (!assessment.reason && !isApprovalUiTool(tool) && config.approvalProfile === 'high_risk_only') {
           logEvent(config.logging, 'info', 'tool_authorization_auto', { tool, requestId });
         }
-        if (assessment.reason) {
+        if (assessment.reason && !a2CandidateGrant) {
           // Transport sessions can reconnect while the user approves in a browser.
           // Retain the authenticated client and optional logical conversation scope.
           const principal = approvalPrincipal(req.auth!.clientId, req.body.params?._meta);
@@ -1054,7 +1256,9 @@ function initializeServer(
             // under a stale token, changed root, changed file or rerouted model.
             try {
               await oauthProvider.verifyAccessToken(accessToken);
-              if (JSON.stringify(classifyMcpOperation(config, workspaces, tool, snapshot)) !== originalAssessment) {
+              if (JSON.stringify(classifyMcpOperation(
+                config, workspaces, tool, snapshot, executionBoundary?.profile,
+              )) !== originalAssessment) {
                 throw new Error('Approval context changed before dispatch.');
               }
               const result = await submitCodexTool(codexBridge, workspaces, tool, snapshot);
@@ -1078,12 +1282,29 @@ function initializeServer(
               approvalProfile: config.approvalProfile ?? 'conservative',
               approvalUrl: new URL(`/owner/approvals/${entry.id}`, config.publicBaseUrl).href, expiresAt: new Date(entry.expires).toISOString(),
               reason: entry.reason, executionMode: automatic ? 'submit_on_approval' : 'retry_after_approval',
+              ...(a2WorkspaceLease?.lease ? { a2WorkspaceLease: {
+                state: a2WorkspaceLease.lease.state,
+                reason: a2WorkspaceLease.reason,
+                expiresAt: a2WorkspaceLease.lease.expiresAt,
+                executionEligible: a2WorkspaceLease.executionEligible,
+              } } : {}),
               ...(config.uiEnabled ? { chatApproval: { ...chatApprovalMode(config, req.auth!.clientId, req.body.params?._meta), clientId: req.auth!.clientId,
-                reviewTool: REVIEW_APPROVAL_TOOL, instruction: 'When enabled, call review_approval to present the user decision card instead of asking for an Owner password. Never call the UI decision tool on the user behalf.' } } : {}),
-              instruction: `${chatApprovalEnabled(config, req.auth!.clientId, req.body.params?._meta) ? 'Call review_approval with this approvalId to show the user an inline decision card, then wait for their action. If the host cannot show the card, use approvalUrl as fallback.' : 'Ask the user to open approvalUrl and approve with their Owner password. Chat UI approval requires a trusted client and a non-empty host conversation context.'} Never ask for the password in Chat or approve on their behalf. ${automatic ? 'Approval automatically submits exactly this Codex turn. Afterwards use codex_tasks and codex_task_status; an identical retry only recovers the submission receipt. Do not create a new request.' : 'Retry only the exact operation after approval.'} Approval grants no additional sandbox or directory access.` };
+                reviewTool: REVIEW_APPROVAL_TOOL, singleReviewTool: REVIEW_APPROVAL_TOOL,
+                instruction: 'When enabled, call review_approval with no approvalId to present the centralized Approval Center. Pass approvalId only to reopen this specific approval. Never call the UI decision tool on the user behalf.' } } : {}),
+              instruction: `${chatApprovalEnabled(config, req.auth!.clientId, req.body.params?._meta) ? 'Call review_approval with no approvalId to show the centralized Approval Center for this Chat conversation, or pass this approvalId to reopen only this request, then wait for the user decision. If the host cannot show the center/card, use approvalUrl as fallback.' : 'Ask the user to open approvalUrl and approve with their Owner password. Chat UI approval requires a trusted client and a non-empty host conversation context.'} Never ask for the password in Chat or approve on their behalf. ${automatic ? 'Approval automatically submits exactly this Codex turn. Afterwards use codex_tasks and codex_task_status; an identical retry only recovers the submission receipt. Do not create a new request.' : 'Retry only the exact operation after approval.'} Approval grants no additional sandbox or directory access.` };
             res.json({ jsonrpc: '2.0', id: req.body.id, result: { isError: true, content: [textBlock(JSON.stringify(detail))] } }); return;
           }
-          logEvent(config.logging, 'info', 'owner_approval_consumed', { tool, requestId });
+          logEvent(config.logging, 'info', decision.source === 'conversation_lease' ? 'owner_conversation_lease_used' : 'owner_approval_consumed', {
+            tool, requestId, ...(decision.leaseExpiresAt ? { leaseExpiresAt: decision.leaseExpiresAt } : {}),
+          });
+        } else if (assessment.reason && a2CandidateGrant) {
+          logEvent(config.logging, "info", "workspace_lease_candidate_execution_authorized", {
+            tool,
+            requestId,
+            workspaceId: executionArgs.workspaceId,
+            leaseState: a2WorkspaceLease?.lease?.state,
+            leaseExpiresAt: a2WorkspaceLease?.lease?.expiresAt,
+          });
         }
       }
 
@@ -1154,6 +1375,9 @@ function initializeServer(
           approvals,
           () => transport?.sessionId ? transports.beginRequest(transport.sessionId) : undefined,
           (id) => { if (transport?.sessionId) transports.settleRequest(transport.sessionId, id, true); },
+          executionBoundary,
+          contextFabricStore,
+          candidateExecutionCoordinator,
         );
         await server.connect(transport);
       } else {
@@ -1192,11 +1416,14 @@ function initializeServer(
           logSessionCloseResults("server_shutdown", results);
         },
         () => processSessions.shutdown(),
+        () => candidateExecutionCoordinator?.close(),
         () => approvals?.close(),
+        () => workspaceLeaseStore.close(),
         ...closeAuthRateLimits,
         () => oauthProvider.close(),
         () => workspaceStore.close?.(),
         () => codexBridge?.close(),
+        () => contextFabricStore.clear(),
       ]);
       return closePromise;
     },

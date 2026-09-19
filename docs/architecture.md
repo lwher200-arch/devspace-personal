@@ -17,6 +17,17 @@ DevSpace 将“对话中的协调”与“本机执行”分开。客户端负�
 
 ## 分层结构
 
+### Personal Control Plane
+
+个人增强能力与 DevSpace Core 分层。`src/control-plane/` 只放确定性的 intent、routing 和
+recovery policy，不直接拥有文件、进程或 provider runtime。Core 继续提供 workspace、文件、
+Git、process、review 和 MCP primitives；机器专用 systemd、路径、tunnel 与部署 supervisor 属于
+Local Deployment，不反向污染 Core。
+
+当前 Control Plane 将研究成果收敛为三个实际模块：Canonical Intent IR、奇美拉协议和回游模式。
+影身/镜影与 Neuron Safety 复用现有 dry-run、hash、worktree、review checkpoint、候选构建与晋升
+流程，不另建重复状态。完整映射及未实现边界见 [研究成果工程映射](research-architecture.md)。
+
 ### 协议入口
 
 `src/server.ts` 组合 HTTP、OAuth、MCP 会话和工具注册。认证发现端点用于建立
@@ -76,6 +87,7 @@ SQLite 就自动获得重启恢复能力。Owner 身份 Cookie、操作批准与
 4. 参数、文件或模型上下文变化使旧审批失效；审批窗口不限制已提交任务的运行时间。
 5. 用量可缺失，但不能伪装成零、完整账单或确定的费用节省。
 6. 缓存、日志和 UI 显示均不能提升目录或执行权限。
+7. 路由结果不等于授权；候选态不等于真实态；不确定交付不等于可安全重试。
 
 ## 生命周期与回收
 

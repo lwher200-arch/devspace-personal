@@ -1,0 +1,39 @@
+{
+  "$schema": "https://developers.cloudflare.com/workers/wrangler/config-schema.json",
+  "name": "devspace-control-hub",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-19",
+  "workers_dev": true,
+  "routes": [
+    {
+      "pattern": "hub.coldhao.win",
+      "custom_domain": true
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CONTROL_HUB",
+        "class_name": "ControlHub"
+      }
+    ]
+  },
+  "exports": {
+    "ControlHub": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+  "r2_buckets": [
+    {
+      "binding": "CONTEXT_BLOBS",
+      "bucket_name": "devspace-control-hub-context"
+    }
+  ],
+  "vars": {
+    "HUB_NAME": "coldhao-primary"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

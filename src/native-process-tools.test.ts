@@ -12,8 +12,9 @@ import { registerNativeProcessTools } from "./native-process-tools.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 import { WorkspaceRegistry } from "./workspaces.js";
+import type { WorkspaceExecutionBoundary } from "./workspace-execution-boundary.js";
 
-async function fixture(t: TestContext, logging = false) {
+async function fixture(t: TestContext, logging = false, executionBoundary?: WorkspaceExecutionBoundary) {
   const root = await mkdtemp(join(tmpdir(), "devspace-native-tools-"));
   const project = join(root, "project");
   const agentDir = join(root, "agent");
@@ -29,7 +30,7 @@ async function fixture(t: TestContext, logging = false) {
   const workspaceId = (await workspaces.openWorkspace(project)).workspace.id;
   const processSessions = new ProcessSessionManager();
   const server = new McpServer({ name: "native-process-test", version: "1.0.0" });
-  registerNativeProcessTools({ server, config, workspaces, processSessions });
+  registerNativeProcessTools({ server, config, workspaces, processSessions, executionBoundary });
   const client = new Client({ name: "native-process-test-client", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
@@ -50,7 +51,7 @@ async function fixture(t: TestContext, logging = false) {
 test("native tools expose literal args, bounded stdin and explicit process outcomes in actual MCP schemas", async t => {
   const { client } = await fixture(t);
   const tools = (await client.listTools()).tools;
-  assert.deepEqual(tools.map(tool => tool.name).sort(), ["process_cancel", "process_status", "run_process"]);
+  assert.deepEqual(tools.map(tool => tool.name).sort(), ["host_command", "process_cancel", "process_status", "run_process"]);
   const run = tools.find(tool => tool.name === "run_process")!;
   const properties = run.inputSchema.properties!;
   assert.deepEqual(run.inputSchema.required, ["workspaceId", "executable"]);
@@ -63,6 +64,56 @@ test("native tools expose literal args, bounded stdin and explicit process outco
   assert.equal("executionId" in run.outputSchema!.properties!, true);
   assert.equal("timedOut" in run.outputSchema!.properties!, true);
   assert.equal("spawnError" in run.outputSchema!.properties!, true);
+  assert.equal("boundaryProfile" in run.outputSchema!.properties!, true);
+  assert.equal("networkProfile" in run.outputSchema!.properties!, true);
+});
+
+test("run_process applies an injected workspace execution boundary and reports its profile", async t => {
+  const seen: Array<{ workspaceRoot: string; cwd: string; executable: string; args: string[]; networkProfile?: "inherit" | "none" }> = [];
+  const boundary: WorkspaceExecutionBoundary = {
+    profile: "fixture-boundary-v1",
+    prepare(input) {
+      seen.push(input);
+      return { executable: input.executable, args: input.args, boundaryProfile: this.profile };
+    },
+  };
+  const { invoke, project } = await fixture(t, false, boundary);
+  const result = await invoke("run_process", {
+    executable: process.execPath,
+    args: ["-e", "console.log('bounded')"],
+    workingDirectory: "nested",
+    yieldTimeMs: 3_000,
+  });
+  assert.equal(result.isError, false);
+  assert.equal(result.structuredContent!.boundaryProfile, "fixture-boundary-v1");
+  assert.deepEqual(seen, [{
+    workspaceRoot: project,
+    cwd: join(project, "nested"),
+    executable: process.execPath,
+    args: ["-e", "console.log('bounded')"],
+    networkProfile: undefined,
+  }]);
+});
+
+test("host_command uses the host shell with bounded native-process lifecycle", async t => {
+  const { invoke, project } = await fixture(t);
+  const result = await invoke("host_command", {
+    command: "printf 'host-ok\\n'; pwd",
+    workingDirectory: "nested",
+    timeoutMs: 3_000,
+    yieldTimeMs: 3_000,
+  });
+  assert.equal(result.isError, false);
+  assert.equal(result.structuredContent!.exitCode, 0);
+  assert.match(result.structuredContent!.output as string, /host-ok/);
+  assert.equal((result.structuredContent!.output as string).includes(join(project, "nested")), true);
+
+  const escaped = await invoke("host_command", {
+    command: "printf bad",
+    workingDirectory: "..",
+    yieldTimeMs: 3_000,
+  });
+  assert.equal(escaped.isError, true);
 });
 
 test("native MCP invocation preserves argv/stdin and enforces working directory containment before spawn", async t => {
@@ -83,17 +134,22 @@ test("native MCP invocation preserves argv/stdin and enforces working directory 
 });
 
 test("MCP distinguishes launch failure, nonzero exit and timeout without reporting success", async t => {
-  const { invoke, project } = await fixture(t);
+  const logs: string[] = [];
+  t.mock.method(console, "log", (...values: unknown[]) => logs.push(values.map(String).join(" ")));
+  t.mock.method(console, "warn", (...values: unknown[]) => logs.push(values.map(String).join(" ")));
+  const { invoke, project } = await fixture(t, true);
   const missing = await invoke("run_process", { executable: join(project, "missing.exe"), yieldTimeMs: 3_000 });
   assert.equal(missing.isError, true);
   assert.equal(missing.structuredContent!.spawnError, "ENOENT");
   const failure = await invoke("run_process", { executable: process.execPath, args: ["-e", "process.exit(7)"], yieldTimeMs: 3_000 });
   assert.equal(failure.isError, true);
   assert.equal(failure.structuredContent!.exitCode, 7);
+  assert.ok(logs.some(line => line.includes('"tool":"run_process"') && line.includes('"exitCode":7') && line.includes('"success":false')));
   const timeout = await invoke("run_process", { executable: process.execPath, args: ["-e", "setInterval(()=>{},1000)"], timeoutMs: 250, yieldTimeMs: 3_000 });
   assert.equal(timeout.isError, true);
   assert.equal(timeout.structuredContent!.running, false);
   assert.equal(timeout.structuredContent!.timedOut, true);
+  assert.ok(logs.some(line => line.includes('"tool":"run_process"') && line.includes('"success":false') && line.includes("Total runtime timeout reached")));
 });
 
 test("MCP polls and cancels the same session while keeping args and stdin out of operation logs", async t => {

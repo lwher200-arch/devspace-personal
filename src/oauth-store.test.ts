@@ -48,6 +48,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 5, name: "local-agent-structured-errors" },
       { version: 6, name: "local-agent-effort-rename" },
       { version: 7, name: "local-agent-execution-contract" },
+      { version: 8, name: "workspace-leases" },
     ]);
   } finally {
     database.close();

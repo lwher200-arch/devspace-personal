@@ -16,6 +16,17 @@ import { ProcessSessionManager } from "./process-sessions.js";
 import { createMcpServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
+import type { WorkspaceExecutionBoundary } from "./workspace-execution-boundary.js";
+import {
+  A2_CANDIDATE_GRANT_META_KEY,
+  CandidateExecutionCoordinator,
+} from "./candidate-workspace/candidate-execution-coordinator.js";
+import { FilesystemCandidateWorkspaceProvider } from "./candidate-workspace/candidate-workspace.js";
+import {
+  A2_WORKSPACE_LEASE_POLICY_VERSION,
+  WorkspaceLeaseRuntime,
+} from "./workspace-lease/workspace-lease-runtime.js";
+import { WorkspaceLeaseStore } from "./workspace-lease/workspace-lease.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 
 const execFileAsync = promisify(execFile);
@@ -28,11 +39,11 @@ test("tool modes expose the expected host-facing tool surface", async (t) => {
   }> = [
     {
       mode: "claude",
-      expected: ["open_workspace", "read", "write", "edit", "bash", "show_changes", "project_files", "project_search", "project_read", "project_read_batch", "run_process", "process_status", "process_cancel"],
+      expected: ["open_workspace", "read", "write", "edit", "bash", "host_command", "show_changes", "project_files", "project_search", "project_read", "project_read_batch", "context_fabric", "control_hub", "run_process", "process_status", "process_cancel"],
     },
     {
       mode: "codex",
-      expected: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin", "show_changes", "project_files", "project_search", "project_read", "project_read_batch", "run_process", "process_status", "process_cancel"],
+      expected: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin", "host_command", "show_changes", "project_files", "project_search", "project_read", "project_read_batch", "context_fabric", "control_hub", "run_process", "process_status", "process_cancel"],
     },
   ];
 
@@ -48,6 +59,130 @@ test("tool modes expose the expected host-facing tool surface", async (t) => {
       for (const tool of tools.tools) assert.ok(reference.includes(`\`${tool.name}\``), `Document registered tool ${tool.name}`);
     });
   }
+});
+
+test("project shell surfaces receive the configured execution boundary", async (t) => {
+  for (const mode of ["codex", "claude"] as const) {
+    await t.test(mode, async (nested) => {
+      const seen: Array<{ workspaceRoot: string; cwd: string; executable: string; args: string[] }> = [];
+      const boundary: WorkspaceExecutionBoundary = {
+        profile: "fixture-shell-boundary-v1",
+        prepare(input) {
+          seen.push(input);
+          return { executable: input.executable, args: input.args, boundaryProfile: this.profile };
+        },
+      };
+      const context = await fixture(nested, { toolMode: mode, executionBoundary: boundary });
+      const { workspaceId } = structuredContent(await callOpen(context.client, context.project));
+      const result = await context.client.callTool({
+        name: mode === "codex" ? "exec_command" : "bash",
+        arguments: mode === "codex"
+          ? { workspaceId, cmd: "printf bounded" }
+          : { workspaceId, command: "printf bounded", timeout: 2 },
+      });
+      assert.notEqual(result.isError, true);
+      assert.equal(structuredContent(result).boundaryProfile, boundary.profile);
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0]!.workspaceRoot, context.project);
+      assert.equal(seen[0]!.cwd, context.project);
+      assert.ok(seen[0]!.args.some(arg => arg.includes("printf bounded")));
+      if (process.platform !== "win32") assert.equal(seen[0]!.args[0], "-c");
+    });
+  }
+});
+
+test("exec_command with a private A2 grant executes in Candidate and returns mutation evidence", async (t) => {
+  const seenNetworkProfiles: Array<unknown> = [];
+  const boundary: WorkspaceExecutionBoundary = {
+    profile: "fixture-boundary-v2",
+    prepare(input) {
+      seenNetworkProfiles.push(input.networkProfile);
+      return { executable: input.executable, args: input.args, boundaryProfile: this.profile,
+        networkProfile: input.networkProfile };
+    },
+  };
+  const context = await fixture(t, {
+    toolMode: "codex",
+    executionBoundary: boundary,
+    candidateExecution: true,
+  });
+  const { workspaceId } = structuredContent(await callOpen(context.client, context.project));
+  const authorization = await context.candidateExecutionCoordinator!.authorizeRequest({
+    clientId: "fixture-client",
+    conversationScopeId: "fixture-chat",
+    workspaceId: String(workspaceId),
+    stableRoot: context.project,
+    tool: "exec_command",
+  });
+  assert.ok(authorization.grantToken);
+  const result = await context.client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId,
+      cmd: "node -e \"require('node:fs').writeFileSync('candidate-only.txt','candidate')\"",
+    },
+    _meta: { [A2_CANDIDATE_GRANT_META_KEY]: authorization.grantToken },
+  } as Parameters<Client["callTool"]>[0]);
+  assert.notEqual(result.isError, true);
+  assert.deepEqual(seenNetworkProfiles, ["none"]);
+  assert.equal(structuredContent(result).networkProfile, "none");
+  assert.equal(await readFile(join(context.project, "candidate-only.txt"), "utf8").then(() => true, () => false), false);
+  const candidate = structuredContent(result).candidateExecution as Record<string, unknown>;
+  assert.equal(candidate.state, "completed");
+  assert.equal(candidate.networkProfile, "none");
+  assert.deepEqual((candidate.mutation as { created: string[] }).created, ["candidate-only.txt"]);
+});
+
+test("run_process Candidate survives process_status until completion and then emits mutation evidence", async (t) => {
+  const seenNetworkProfiles: Array<unknown> = [];
+  const boundary: WorkspaceExecutionBoundary = {
+    profile: "fixture-boundary-v2",
+    prepare(input) {
+      seenNetworkProfiles.push(input.networkProfile);
+      return { executable: input.executable, args: input.args, boundaryProfile: this.profile,
+        networkProfile: input.networkProfile };
+    },
+  };
+  const context = await fixture(t, {
+    toolMode: "codex",
+    executionBoundary: boundary,
+    candidateExecution: true,
+  });
+  const { workspaceId } = structuredContent(await callOpen(context.client, context.project));
+  const authorization = await context.candidateExecutionCoordinator!.authorizeRequest({
+    clientId: "fixture-client",
+    conversationScopeId: "fixture-chat",
+    workspaceId: String(workspaceId),
+    stableRoot: context.project,
+    tool: "run_process",
+  });
+  const started = await context.client.callTool({
+    name: "run_process",
+    arguments: {
+      workspaceId,
+      executable: process.execPath,
+      args: ["-e", "require('node:fs').writeFileSync('native-candidate.txt','candidate');setTimeout(()=>{},150)"],
+      yieldTimeMs: 0,
+      timeoutMs: 2_000,
+    },
+    _meta: { [A2_CANDIDATE_GRANT_META_KEY]: authorization.grantToken },
+  } as Parameters<Client["callTool"]>[0]);
+  const initial = structuredContent(started);
+  assert.deepEqual(seenNetworkProfiles, ["none"]);
+  assert.equal(initial.networkProfile, "none");
+  assert.equal((initial.candidateExecution as Record<string, unknown>).state, "running");
+  assert.equal((initial.candidateExecution as Record<string, unknown>).networkProfile, "none");
+  assert.equal(typeof initial.sessionId, "number");
+  assert.equal(await readFile(join(context.project, "native-candidate.txt"), "utf8").then(() => true, () => false), false);
+  const finished = await context.client.callTool({
+    name: "process_status",
+    arguments: { workspaceId, sessionId: initial.sessionId, yieldTimeMs: 1_000 },
+  });
+  const final = structuredContent(finished);
+  assert.equal(final.networkProfile, "none");
+  assert.equal((final.candidateExecution as Record<string, unknown>).state, "completed");
+  assert.equal((final.candidateExecution as Record<string, unknown>).networkProfile, "none");
+  assert.deepEqual(((final.candidateExecution as Record<string, unknown>).mutation as { created: string[] }).created, ["native-candidate.txt"]);
 });
 
 test("UI metadata is limited to workspace and aggregate review", async (t) => {
@@ -98,6 +233,25 @@ test("project access and guarded patches work through the actual MCP schema", as
   assert.equal(escaped.isError, true);
 });
 
+test("context_fabric stores bounded workspace state and materializes a current capsule", async (t) => {
+  const context = await fixture(t, { toolMode: "codex" });
+  const workspaceId = structuredContent(await callOpen(context.client, context.project, "context-fabric")).workspaceId;
+  const digest = "c".repeat(64);
+  const ref = (evidenceId: string) => ({ version: 1, evidenceId, kind: "test", locator: `test://${evidenceId}`, digest });
+  const anchor = { version: 1, anchorId: "runtime-anchor", createdAt: "2026-09-19T00:00:00.000+00:00", stateDigest: digest,
+    evidenceRefs: [ref("old"), ref("new")], statements: [{ statementId: "old", role: "state", text: "Old state", evidenceIds: ["old"], supersedes: [], estimatedTokens: 3, priority: 10, required: false }] };
+  const delta = { version: 1, deltaId: "d1", baseAnchorId: "runtime-anchor", sequence: 1, createdAt: "2026-09-19T00:01:00.000+00:00",
+    evidenceRefs: [ref("new")], changes: [{ statementId: "new", role: "change", text: "Current state", evidenceIds: ["new"], supersedes: ["old"], estimatedTokens: 3, priority: 90, required: false }], exceptions: [] };
+  const call = (arguments_: Record<string, unknown>) => context.client.callTool({ name: "context_fabric", arguments: { workspaceId, ...arguments_ } });
+  assert.notEqual((await call({ action: "put_anchor", anchorJson: JSON.stringify(anchor) })).isError, true);
+  assert.notEqual((await call({ action: "append_delta", deltaJson: JSON.stringify(delta) })).isError, true);
+  const result = await call({ action: "capsule", anchorId: "runtime-anchor", objective: "Continue", objectiveEstimatedTokens: 2, maxTokens: 20, reserveTokens: 2, maxStatements: 4 });
+  assert.notEqual(result.isError, true);
+  const capsule = JSON.parse(structuredContent(result).result as string);
+  assert.deepEqual(capsule.statements.map((statement: { statementId: string }) => statement.statementId), ["new"]);
+  assert.deepEqual(capsule.evidenceRefs.map((evidence: { evidenceId: string }) => evidence.evidenceId), ["new"]);
+});
+
 test("open_workspace reports aggregate review availability", async (t) => {
   const plain = await fixture(t);
   const gitWorkspace = await fixture(t, { git: true });
@@ -145,6 +299,12 @@ test("show_changes keeps model output compact and preserves the rich review card
       removals: 1,
     },
   ]);
+  assert.deepEqual(card.preview, {
+    complete: true,
+    includedFiles: 1,
+    totalFiles: 1,
+    omittedFiles: 0,
+  });
   assert.match(
     ((card.payload as { patch?: string } | undefined)?.patch) ?? "",
     /-hello\n\+goodbye/,
@@ -161,6 +321,36 @@ test("show_changes keeps model output compact and preserves the rich review card
   const inputProperties = tools.tools.find((tool) => tool.name === "show_changes")
     ?.inputSchema?.properties;
   assert.equal(inputProperties && "reviewRef" in inputProperties, false);
+});
+
+test("show_changes returns a bounded preview instead of failing on an oversized changed file", async (t) => {
+  const context = await fixture(t, { git: true, uiEnabled: false });
+  const workspaceId = structuredContent(
+    await callOpen(context.client, context.project, "large-review"),
+  ).workspaceId;
+  assert.equal(typeof workspaceId, "string");
+
+  await writeFile(join(context.project, "00-huge.txt"), "x\n".repeat(350_000));
+  await writeFile(join(context.project, "01-small.txt"), "small\n");
+  const review = await context.client.callTool({
+    name: "show_changes",
+    arguments: { workspaceId },
+  });
+
+  assert.notEqual(review.isError, true);
+  assert.match(String(structuredContent(review).result), /bounded to 1 of 2 changed files/);
+  const card = responseCard(review);
+  assert.equal((card.summary as { files?: number } | undefined)?.files, 2);
+  assert.equal((card.files as unknown[] | undefined)?.length, 2);
+  assert.deepEqual(card.preview, {
+    complete: false,
+    includedFiles: 1,
+    totalFiles: 2,
+    omittedFiles: 1,
+  });
+  const patch = ((card.payload as { patch?: string } | undefined)?.patch) ?? "";
+  assert.match(patch, /01-small\.txt/);
+  assert.doesNotMatch(patch, /x{1000}/);
 });
 
 test("show_changes can reopen a historical review without advancing the checkpoint", async (t) => {
@@ -337,6 +527,26 @@ test("legacy process polling cannot consume a native execution's final evidence"
   assert.equal(structuredContent(finished).running, false);
 });
 
+test("run_process treats a fast no-input process as successful", async (t) => {
+  const context = await fixture(t, { toolMode: "codex" });
+  const { workspaceId } = structuredContent(await callOpen(context.client, context.project));
+  const result = await context.client.callTool({
+    name: "run_process",
+    arguments: {
+      workspaceId,
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      timeoutMs: 2_000,
+      yieldTimeMs: 2_000,
+    },
+  });
+  assert.notEqual(result.isError, true);
+  const snapshot = structuredContent(result);
+  assert.equal(snapshot.exitCode, 0);
+  assert.equal(snapshot.stdinError, undefined);
+  assert.equal(snapshot.running, false);
+});
+
 test("open_workspace omits providers disabled by configuration", async (t) => {
   const context = await fixture(t, {
     localAgentProviders: [
@@ -377,6 +587,7 @@ test("open_workspace scopes checkout reuse to OpenAI session metadata", async (t
 interface ServerFixture {
   client: Client;
   project: string;
+  candidateExecutionCoordinator?: CandidateExecutionCoordinator;
 }
 
 async function fixture(
@@ -387,6 +598,8 @@ async function fixture(
     subagents?: SubagentsConfig;
     toolMode?: ToolMode;
     uiEnabled?: boolean;
+    executionBoundary?: WorkspaceExecutionBoundary;
+    candidateExecution?: boolean;
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -452,6 +665,24 @@ async function fixture(
   );
   const store = new SqliteWorkspaceStore(stateDir);
   const workspaces = new WorkspaceRegistry(config, store);
+  let candidateExecutionCoordinator: CandidateExecutionCoordinator | undefined;
+  let candidateLeaseStore: WorkspaceLeaseStore | undefined;
+  if (options.candidateExecution) {
+    candidateLeaseStore = new WorkspaceLeaseStore(join(root, ".candidate-state"));
+    candidateLeaseStore.activate(candidateLeaseStore.request({
+      clientId: "fixture-client",
+      conversationScopeId: "fixture-chat",
+      workspaceRoot: project,
+      durationSeconds: 14_400,
+      policyVersion: A2_WORKSPACE_LEASE_POLICY_VERSION,
+      boundaryProfile: options.executionBoundary?.profile ?? "fixture-boundary-v2",
+    }).id, { boundaryVerified: true });
+    candidateExecutionCoordinator = new CandidateExecutionCoordinator(
+      new WorkspaceLeaseRuntime(candidateLeaseStore, { boundaryVerified: true }),
+      new FilesystemCandidateWorkspaceProvider(join(root, ".candidates")),
+      options.executionBoundary?.profile ?? "fixture-boundary-v2",
+    );
+  }
   const server = createMcpServer(
     config,
     workspaces,
@@ -459,6 +690,13 @@ async function fixture(
     new ProcessSessionManager(),
     resolveLocalAgentProviders,
     [],
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    options.executionBoundary,
+    undefined,
+    candidateExecutionCoordinator,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });
@@ -473,6 +711,8 @@ async function fixture(
     closed = true;
     await client.close();
     await server.close();
+    await candidateExecutionCoordinator?.close();
+    candidateLeaseStore?.close();
     store.close();
   };
 
@@ -481,7 +721,7 @@ async function fixture(
     await rm(root, { recursive: true, force: true });
   });
 
-  return { client, project };
+  return { client, project, candidateExecutionCoordinator };
 }
 
 async function git(cwd: string, args: string[]): Promise<void> {

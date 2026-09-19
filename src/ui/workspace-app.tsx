@@ -8,6 +8,8 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   isExpandableCard,
   isInitiallyExpandedCard,
+  reviewPreviewFileCount,
+  reviewPreviewMessage,
   summaryNumber,
   type HostContext,
   type ToolResultCard,
@@ -30,7 +32,8 @@ import {
 } from "./tool-result.js";
 import "./workspace-app.css";
 import { mountApprovalCard } from './approval-card.js';
-import type { ApprovalView } from '../approval-protocol.js';
+import { mountApprovalCenter } from './approval-center.js';
+import type { ApprovalCenterView, ApprovalView } from '../approval-protocol.js';
 import { createApprovalBridge } from './approval-bridge.js';
 
 interface CardDisplay {
@@ -65,6 +68,7 @@ let showAvailableWorkspaceInstructions = false;
 let pendingToolResult: CallToolResult | null = null;
 let pendingReviewKey: string | null = null;
 let approval: ApprovalView | null = null;
+let approvalCenter: ApprovalCenterView | null = null;
 let unmountApproval: (() => void) | undefined;
 
 const maybeAppRoot = document.querySelector<HTMLElement>("#app");
@@ -81,7 +85,7 @@ async function boot(): Promise<void> {
   render();
 
   app = new App(
-    { name: "devspace-tool-cards", version: "0.4.0" },
+    { name: "devspace-workspace-app", version: "0.6.0" },
     {},
   );
 
@@ -149,10 +153,13 @@ async function boot(): Promise<void> {
 
 async function applyToolResult(result: CallToolResult): Promise<void> {
   const decoded = decodeToolResult(result);
-  if (decoded.kind === 'approval') {
-    pendingReviewKey = null; approval = decoded.approval; card = null; render(); return;
+  if (decoded.kind === 'approval-center') {
+    pendingReviewKey = null; approvalCenter = decoded.center; approval = null; card = null; render(); return;
   }
-  approval = null;
+  if (decoded.kind === 'approval') {
+    pendingReviewKey = null; approval = decoded.approval; approvalCenter = null; card = null; render(); return;
+  }
+  approval = null; approvalCenter = null;
   if (decoded.kind === "card") {
     setCard(decoded.card);
     return;
@@ -238,7 +245,7 @@ function handleChatGptGlobalsChanged(event: Event): void {
   const customEvent = event as CustomEvent<{ globals?: ChatGptToolGlobals }>;
   const theme = customEvent.detail?.globals?.theme;
   if (connected && !app && theme) { hostContext = { ...hostContext, theme }; applyHostContext(); }
-  if (!connected || card || approval) return;
+  if (!connected || card || approval || approvalCenter) return;
   const restored = toolResultFromChatGptGlobals(customEvent.detail?.globals)
     ?? chatGptRestoredResult();
   if (restored) void applyToolResult(restored);
@@ -273,7 +280,17 @@ function render(): void {
   }
 
   if (approval) {
-    unmountApproval = mountApprovalCard(appRoot, approval, createApprovalBridge(() => app, () => window.openai));
+    const bridge = createApprovalBridge(() => app, () => window.openai);
+    unmountApproval = mountApprovalCard(appRoot, approval, bridge, { onOpenCenter: () => {
+      void bridge.center().then(center => { approvalCenter = center; approval = null; render(); }, error => {
+        errorMessage = error instanceof Error ? error.message : String(error); render();
+      });
+    } });
+    return;
+  }
+
+  if (approvalCenter) {
+    unmountApproval = mountApprovalCenter(appRoot, approvalCenter, createApprovalBridge(() => app, () => window.openai));
     return;
   }
 
@@ -362,7 +379,7 @@ async function renderPayloadIfNeeded(): Promise<void> {
   }
 
   const visibleFileCount = !reviewFilesExpanded
-    ? Math.max(3, (card.files ?? []).slice(0, 3).length)
+    ? Math.min(3, reviewPreviewFileCount(card))
     : undefined;
 
   if (currentPayload) {
@@ -436,8 +453,9 @@ function renderReviewCard(card: ToolResultCard, display: CardDisplay): void {
   unmountPayload();
 
   const files = card.files ?? [];
-  const visibleFiles = reviewFilesExpanded ? files : files.slice(0, 3);
-  const hiddenCount = Math.max(0, files.length - visibleFiles.length);
+  const previewFileCount = reviewPreviewFileCount(card);
+  const visiblePreviewFileCount = reviewFilesExpanded ? previewFileCount : Math.min(3, previewFileCount);
+  const hiddenCount = Math.max(0, previewFileCount - visiblePreviewFileCount);
   const expandable = isExpandableCard(card);
   const main = element("main", { className: "shell" });
   const section = element("section", { className: toolCardClassName(display) });
@@ -479,6 +497,10 @@ function renderReviewCard(card: ToolResultCard, display: CardDisplay): void {
     const body = element("div", { className: "review-summary" });
     const payload = element("div", { className: "review-payload" });
     currentPayloadContainer = payload;
+    const previewMessage = reviewPreviewMessage(card);
+    if (previewMessage) {
+      body.append(element("div", { className: "status muted", text: previewMessage }));
+    }
     body.append(payload);
 
     if (hiddenCount > 0) {

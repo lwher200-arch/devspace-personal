@@ -13,46 +13,47 @@ function journal(sqlite: Database.Database) {
   return sqlite.prepare("select version, name, applied_at from devspace_schema_migrations order by version").all();
 }
 
-function useVersionSix(sqlite: Database.Database) {
+function useVersionSeven(sqlite: Database.Database) {
   migrateDatabase(sqlite);
-  sqlite.exec("alter table local_agent_sessions drop column execution_json");
-  sqlite.exec("delete from devspace_schema_migrations where version = 7");
+  sqlite.exec("drop table workspace_leases");
+  sqlite.exec("delete from devspace_schema_migrations where version = 8");
 }
 
-test("fresh migration and repeat startup retain the personal v7 contract", () => {
+test("fresh migration and repeat startup retain the personal v8 contract", () => {
   const sqlite = new Database(":memory:");
   try {
     migrateDatabase(sqlite);
     const before = journal(sqlite);
-    assert.equal(before.length, 7);
-    assert.deepEqual(sqlite.prepare("select version, name from devspace_schema_migrations where version = 7").get(),
-      { version: 7, name: "local-agent-execution-contract" });
+    assert.equal(before.length, 8);
+    assert.deepEqual(sqlite.prepare("select version, name from devspace_schema_migrations where version = 8").get(),
+      { version: 8, name: "workspace-leases" });
     migrateDatabase(sqlite);
     assert.deepEqual(journal(sqlite), before);
-    assert.equal(sqlite.prepare("select execution_json from local_agent_sessions").all().length, 0);
+    assert.equal(sqlite.prepare("select * from workspace_leases").all().length, 0);
   } finally { sqlite.close(); }
 });
 
-test("a recognized v6 database upgrades without replacing stored agent data", () => {
+test("a recognized v7 database upgrades without replacing stored agent data", () => {
   const sqlite = new Database(":memory:");
   try {
-    useVersionSix(sqlite);
+    useVersionSeven(sqlite);
     sqlite.exec(`insert into local_agent_sessions
       (id, workspace_root, profile_name, provider, status, created_at, updated_at)
       values ('agt_fixture', 'fixture-root', 'reviewer', 'codex', 'completed', 'before', 'before')`);
     const before = journal(sqlite);
     migrateDatabase(sqlite);
-    assert.deepEqual(journal(sqlite).slice(0, 6), before);
+    assert.deepEqual(journal(sqlite).slice(0, 7), before);
     assert.deepEqual(sqlite.prepare("select id, status, execution_json from local_agent_sessions").get(),
       { id: "agt_fixture", status: "completed", execution_json: null });
+    assert.equal(sqlite.prepare("select count(*) from workspace_leases").pluck().get(), 0);
   } finally { sqlite.close(); }
 });
 
 for (const scenario of ["unknown-version", "unknown-low-version", "wrong-name"] as const) {
-  test(`migration rejects ${scenario} before applying pending v7`, () => {
+  test(`migration rejects ${scenario} before applying pending v8`, () => {
     const sqlite = new Database(":memory:");
     try {
-      useVersionSix(sqlite);
+      useVersionSeven(sqlite);
       if (scenario === "wrong-name") {
         sqlite.prepare("update devspace_schema_migrations set name = ? where version = 1").run("fixture-other-branch");
       } else {
@@ -72,15 +73,15 @@ test("a failed migration rolls back all pending schema and journal writes", () =
   try {
     sqlite.exec(`create table devspace_schema_migrations
       (version integer primary key, name text not null, applied_at text not null);
-      create trigger reject_fixture_v7 before insert on devspace_schema_migrations
-      when new.version = 7 begin select raise(abort, 'fixture migration failure'); end;`);
+      create trigger reject_fixture_v8 before insert on devspace_schema_migrations
+      when new.version = 8 begin select raise(abort, 'fixture migration failure'); end;`);
     const before = sqlite.serialize();
     assert.throws(() => migrateDatabase(sqlite), /fixture migration failure/);
     assert.deepEqual(sqlite.serialize(), before);
     assert.equal(sqlite.inTransaction, false);
-    sqlite.exec("drop trigger reject_fixture_v7");
+    sqlite.exec("drop trigger reject_fixture_v8");
     migrateDatabase(sqlite);
-    assert.equal(journal(sqlite).length, 7);
+    assert.equal(journal(sqlite).length, 8);
   } finally { sqlite.close(); }
 });
 
@@ -133,7 +134,7 @@ test("concurrent process startup upgrades an existing WAL database once", async 
   const root = mkdtempSync(join(tmpdir(), "devspace-db-concurrent-"));
   const fixture = new Database(databasePath(root));
   fixture.pragma("journal_mode = WAL");
-  useVersionSix(fixture);
+  useVersionSeven(fixture);
   fixture.close();
   const source = `import { openDatabase } from ${JSON.stringify(new URL("./db/client.ts", import.meta.url).href)};
     const handle = openDatabase(process.argv[1]);
@@ -145,7 +146,7 @@ test("concurrent process startup upgrades an existing WAL database once", async 
       { timeout: 30000, windowsHide: true })));
     for (const result of results) {
       if (result.status === "rejected") throw result.reason;
-      assert.deepEqual(JSON.parse(result.value.stdout), [1, 2, 3, 4, 5, 6, 7]);
+      assert.deepEqual(JSON.parse(result.value.stdout), [1, 2, 3, 4, 5, 6, 7, 8]);
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

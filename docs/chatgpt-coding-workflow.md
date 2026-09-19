@@ -220,6 +220,26 @@ review point.
 For local inspection, run `devspace show-changes <review-ref>`. Add `--json` to
 include the parsed summary, file list, and patch.
 
+## Finish With a Work Summary
+
+After final verification and `show_changes`, give a short evidence-backed summary
+before the traffic/token footer. Use the user's language. Do not force a fixed
+six-field template: merge related facts and omit fields that add no information.
+
+For a normal small task, prefer something like:
+
+```text
+完成/修复：<what changed and the problem fixed>
+验证：<tests/checks that actually ran>
+状态：<only if source/build/deploy/runtime distinction matters>
+剩余：<only if a material issue or next step remains>
+```
+
+For partial, blocked or failed work, state the status and stopping point. Do not
+imply deployment from source tests or a fix from diagnosis alone. Avoid repeating
+diff counts, tool transcripts, approval history or other process detail already
+obvious from the conversation.
+
 ## Shell Use
 
 The shell tool is for commands that belong in a terminal:

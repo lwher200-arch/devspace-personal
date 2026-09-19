@@ -1,9 +1,7 @@
 import {
-  createBashTool,
   createEditTool,
   createReadTool,
   createWriteTool,
-  type BashToolInput,
   type EditToolInput,
   type EditToolDetails,
   type ReadToolInput,
@@ -119,15 +117,5 @@ export async function editFileTool(input: EditToolInput, context: ToolContext): 
   return runTool((params) => tool.execute("edit_file", params), {
     path,
     edits: input.edits,
-  }, context);
-}
-
-export async function runShellTool(input: BashToolInput, context: ToolContext): Promise<ToolResponse> {
-  const tool = createBashTool(context.cwd);
-  const timeout = input.timeout === undefined ? 30 : Math.min(input.timeout, 300);
-
-  return runTool((params) => tool.execute("run_shell", params), {
-    command: input.command,
-    timeout,
   }, context);
 }

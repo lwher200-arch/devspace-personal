@@ -2,6 +2,11 @@ import * as z from "zod/v4";
 import { applyPatch } from "../apply-patch.js";
 import type { ProcessSnapshot } from "../process-sessions.js";
 import {
+  candidateGrantFromMetadata,
+  type CandidateExecutionEvidence,
+  type CandidateExecutionPlan,
+} from "../candidate-workspace/candidate-execution-coordinator.js";
+import {
   EDIT_TOOL_ANNOTATIONS,
   SHELL_TOOL_ANNOTATIONS,
   toolNames,
@@ -17,7 +22,7 @@ import {
 
 type CodexRegistration = (context: ToolRegistrationContext) => void;
 
-const CODEX_INSTRUCTIONS = `Use project_files and project_search for bounded project discovery, ${toolNames.read} for direct file reads, and project_read for exact paginated text with SHA-256. Follow continuation cursors and report coverage exclusions. Use apply_patch for all file modifications; prefer dryRun and expectedHashes covering every affected source and destination when editing shared files. Use exec_command for tests, builds, and other commands, and write_stdin to poll or interact with running processes. Commands run with the local user's authority and are not sandboxed; workspace validation only selects their initial working directory. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.`;
+const CODEX_INSTRUCTIONS = `Use project_files and project_search for bounded project discovery, ${toolNames.read} for direct file reads, and project_read for exact paginated text with SHA-256. Follow continuation cursors and report coverage exclusions. Use apply_patch for all file modifications; prefer dryRun and expectedHashes covering every affected source and destination when editing shared files. Use exec_command for tests, builds, and other project commands, and write_stdin to poll or interact with running processes. Project shell commands use the configured workspace execution boundary when one is available; host maintenance remains a separate host_command capability. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.`;
 
 export function codexInstructions(): string {
   return CODEX_INSTRUCTIONS;
@@ -51,12 +56,35 @@ function processOutputSchema(): z.ZodRawShape {
     running: z.boolean(),
     exitCode: z.number().int().optional(),
     signal: z.string().optional(),
+    boundaryProfile: z.string().optional(),
+    networkProfile: z.enum(["inherit", "none"]).optional(),
     wallTimeMs: z.number().nonnegative(),
     outputTruncated: z.boolean(),
+    candidateExecution: candidateExecutionSchema().optional(),
   });
 }
 
-function processToolResponse(snapshot: ProcessSnapshot) {
+function candidateExecutionSchema() {
+  return z.object({
+    candidateId: z.string(),
+    profile: z.string(),
+    networkProfile: z.literal("none"),
+    state: z.enum(["running", "completed"]),
+    mutation: z.object({
+      created: z.array(z.string()),
+      modified: z.array(z.string()),
+      deleted: z.array(z.string()),
+      createdCount: z.number().int().nonnegative(),
+      modifiedCount: z.number().int().nonnegative(),
+      deletedCount: z.number().int().nonnegative(),
+      changedBytes: z.number().nonnegative(),
+      stableChanged: z.boolean(),
+      pathListTruncated: z.boolean(),
+    }).optional(),
+  });
+}
+
+function processToolResponse(snapshot: ProcessSnapshot, candidateExecution?: CandidateExecutionEvidence) {
   const result = processResult(snapshot);
   const content = [textBlock(result)];
   return {
@@ -67,9 +95,29 @@ function processToolResponse(snapshot: ProcessSnapshot) {
       running: snapshot.running,
       exitCode: snapshot.exitCode,
       signal: snapshot.signal,
+      boundaryProfile: snapshot.boundaryProfile,
+      networkProfile: snapshot.networkProfile,
       wallTimeMs: snapshot.wallTimeMs,
       outputTruncated: snapshot.outputTruncated,
+      ...(candidateExecution ? { candidateExecution } : {}),
     },
+  };
+}
+
+function processLogFields(snapshot: ProcessSnapshot) {
+  const failed = !snapshot.running && (snapshot.signal !== undefined || snapshot.exitCode !== 0);
+  return {
+    sessionId: snapshot.sessionId,
+    running: snapshot.running,
+    exitCode: snapshot.exitCode,
+    signal: snapshot.signal,
+    boundaryProfile: snapshot.boundaryProfile,
+    success: !failed,
+    error: failed
+      ? snapshot.signal
+        ? `Process exited after signal ${snapshot.signal}.`
+        : `Process exited with code ${snapshot.exitCode ?? "unknown"}.`
+      : undefined,
   };
 }
 
@@ -137,14 +185,15 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
 }
 
 function registerCodexProcessTools(context: ToolRegistrationContext): void {
-  const { server, config, workspaces, processSessions } = context;
+  const { server, config, workspaces, processSessions, executionBoundary, candidateExecutionCoordinator } = context;
 
   server.registerTool(
     "exec_command",
     {
       title: "Execute command",
-      description:
-        "Run a command with the local user's authority. Commands are not sandboxed; workspace validation only selects the initial working directory. Returns the result when it exits during the yield window, otherwise returns a sessionId for write_stdin. Use this for file inspection, tests, builds, package scripts, and long-running processes.",
+      description: executionBoundary
+        ? `Run a project shell command through workspace boundary ${executionBoundary.profile}. The host filesystem is read-only and only the selected workspace is writable; PID/UTS/IPC are isolated. Legacy approved execution inherits network; A2 Candidate execution uses the no-network profile. Common credential/control environment variables are filtered when supported by the boundary. Returns the result when it exits during the yield window, otherwise returns a sessionId for write_stdin.`
+        : "Run a project shell command. No workspace execution boundary is configured for this server instance, so the shell uses the service OS account authority. Returns the result when it exits during the yield window, otherwise returns a sessionId for write_stdin.",
       inputSchema: {
         workspaceId: z.string().describe(workspaceIdDescription),
         cmd: z.string().min(1).describe("Shell command to execute."),
@@ -203,7 +252,7 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       workingDirectory,
       yieldTimeMs,
       maxOutputTokens,
-    }) => {
+    }, extra) => {
       const startedAt = performance.now();
       const snapshot = await runLoggedToolOperation(
         config,
@@ -217,25 +266,45 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
         startedAt,
         async () => {
           const workspace = workspaces.getWorkspace(workspaceId);
-          const cwd = workspaces.resolveWorkingDirectory(
+          const stableCwd = workspaces.resolveWorkingDirectory(
             workspace,
             workingDirectory,
           );
-          return processSessions.start({
-            workspaceId,
-            command: cmd,
-            cwd,
-            workspaceRoot: workspace.root,
-            tty,
-            columns,
-            rows,
-            yieldTimeMs,
-            maxOutputTokens,
-          });
+          let plan: CandidateExecutionPlan | undefined;
+          try {
+            plan = await candidateExecutionCoordinator?.beginGrantedExecution({
+              grantToken: candidateGrantFromMetadata(extra._meta),
+              workspaceId,
+              stableRoot: workspace.root,
+              stableCwd,
+              tool: "exec_command",
+            });
+            const snapshot = await processSessions.start({
+              workspaceId,
+              command: cmd,
+              cwd: plan?.cwd ?? stableCwd,
+              workspaceRoot: plan?.workspaceRoot ?? workspace.root,
+              tty,
+              columns,
+              rows,
+              yieldTimeMs,
+              maxOutputTokens,
+              networkProfile: plan?.networkProfile,
+              ...(executionBoundary ? { executionBoundary } : {}),
+            });
+            const candidateExecution = plan
+              ? await candidateExecutionCoordinator!.observeSnapshot(plan, snapshot)
+              : undefined;
+            return { snapshot, candidateExecution };
+          } catch (error) {
+            if (plan) await candidateExecutionCoordinator?.abandon(plan);
+            throw error;
+          }
         },
+        (value) => processLogFields(value.snapshot),
       );
 
-      return processToolResponse(snapshot);
+      return processToolResponse(snapshot.snapshot, snapshot.candidateExecution);
     },
   );
 
@@ -302,13 +371,13 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       maxOutputTokens,
     }) => {
       const startedAt = performance.now();
-      const snapshot = await runLoggedToolOperation(
+      const value = await runLoggedToolOperation(
         config,
         { tool: "write_stdin", workspaceId },
         startedAt,
         async () => {
           workspaces.getWorkspace(workspaceId);
-          return processSessions.write({
+          const snapshot = await processSessions.write({
             workspaceId,
             sessionId,
             chars,
@@ -317,10 +386,17 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
             yieldTimeMs,
             maxOutputTokens,
           });
+          const candidateExecution = await candidateExecutionCoordinator?.observeSession(
+            workspaceId,
+            sessionId,
+            snapshot,
+          );
+          return { snapshot, candidateExecution };
         },
+        (item) => processLogFields(item.snapshot),
       );
 
-      return processToolResponse(snapshot);
+      return processToolResponse(value.snapshot, value.candidateExecution);
     },
   );
 }

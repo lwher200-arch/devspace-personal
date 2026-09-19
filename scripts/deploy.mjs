@@ -15,9 +15,9 @@ function configDirectory(value) {
 }
 
 export function parseOptions(args, env = process.env) {
-  const options = { help: false, check: false, yes: false, rebuild: false, prepareOnly: false, noStart: false,
+  const options = { help: false, check: false, yes: false, rebuild: false, candidateOnly: false, prepareOnly: false, noStart: false,
     configDir: configDirectory(env.DEVSPACE_CONFIG_DIR ?? join(homedir(), '.devspace')) };
-  const flags = { '--help': 'help', '--check': 'check', '--yes': 'yes', '--rebuild': 'rebuild', '--prepare-only': 'prepareOnly', '--no-start': 'noStart' };
+  const flags = { '--help': 'help', '--check': 'check', '--yes': 'yes', '--rebuild': 'rebuild', '--candidate-only': 'candidateOnly', '--prepare-only': 'prepareOnly', '--no-start': 'noStart' };
   const seen = new Set();
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -29,8 +29,10 @@ export function parseOptions(args, env = process.env) {
     } else if (flags[arg]) options[flags[arg]] = true;
     else throw new Error(`Unknown option: ${arg}. See docs/setup.md.`);
   }
-  if (options.check && (options.rebuild || options.prepareOnly || options.noStart)) throw new Error('--check cannot be combined with deployment actions.');
-  if (options.prepareOnly && options.noStart) throw new Error('Choose --prepare-only or --no-start, not both.');
+  if (options.check && (options.rebuild || options.candidateOnly || options.prepareOnly || options.noStart)) throw new Error('--check cannot be combined with deployment actions.');
+  if ([options.candidateOnly, options.prepareOnly, options.noStart].filter(Boolean).length > 1) {
+    throw new Error('Choose only one of --candidate-only, --prepare-only or --no-start.');
+  }
   return options;
 }
 
@@ -132,17 +134,22 @@ async function confirmPreparation() {
   finally { prompt.close(); }
 }
 
-export async function buildCandidate(root, packageManager, env, run = runCommand, verify = checkDependencies, beforePromote = async () => {}) {
+export async function buildCandidate(root, packageManager, env, run = runCommand, verify = checkDependencies, beforePromote = async () => {}, { promote = true } = {}) {
   const fingerprint = sourceFingerprint(root);
   const runtime = join(root, '.runtime');
   if (existsSync(runtime) && lstatSync(runtime).isSymbolicLink()) throw new Error('Build staging directory must not be a link.');
   mkdirSync(runtime, { recursive: true });
+  const pnpmStore = join(runtime, 'pnpm-store');
+  if (existsSync(pnpmStore) && lstatSync(pnpmStore).isSymbolicLink()) throw new Error('Build pnpm store must not be a link.');
+  mkdirSync(pnpmStore, { recursive: true });
   const stage = join(runtime, `deploy-stage-${randomUUID()}`);
   mkdirSync(stage);
   const result = spawnSync(process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm', ['--version'], { encoding: 'utf8', windowsHide: true, shell: process.platform === 'win32', timeout: 10000 });
   const pnpmVersion = packageManager.slice('pnpm@'.length);
   const command = result.status === 0 && result.stdout.trim() === pnpmVersion ? (process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm') : (process.platform === 'win32' ? 'npm.cmd' : 'npm');
-  const args = command.startsWith('pnpm') ? ['install', '--frozen-lockfile'] : ['exec', '--yes', `--package=${packageManager}`, '--', 'pnpm', 'install', '--frozen-lockfile'];
+  const args = command.startsWith('pnpm')
+    ? ['install', '--frozen-lockfile', '--store-dir', pnpmStore]
+    : ['exec', '--yes', `--package=${packageManager}`, '--', 'pnpm', 'install', '--frozen-lockfile', '--store-dir', pnpmStore];
   await run(command, args, { cwd: root, env, shell: process.platform === 'win32' });
   await run(process.execPath, [join(root, 'node_modules/typescript/bin/tsc'), '--noEmit', '-p', 'tsconfig.json'], { cwd: root, env });
   await run(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), 'build', '--outDir', join(stage, 'ui')], { cwd: root, env });
@@ -151,6 +158,7 @@ export async function buildCandidate(root, packageManager, env, run = runCommand
   await verify(root, env, stage);
   if (sourceFingerprint(root) !== fingerprint) throw new Error('Sources changed during preparation; candidate was not promoted.');
   writeFileSync(join(stage, '.deploy-manifest.json'), JSON.stringify({ version: 1, fingerprint, node: process.versions.node, packageManager }), { mode: 0o600 });
+  if (!promote) return { candidate: stage };
   const dist = join(root, 'dist');
   if (existsSync(dist) && lstatSync(dist).isSymbolicLink()) throw new Error('Existing dist must not be a link.');
   await beforePromote();
@@ -204,6 +212,15 @@ export async function startOwnedService(root, env, config, { say = console.log, 
     const response = await fetch(`${localOrigin(config)}/healthz`, { signal: AbortSignal.timeout(5000), redirect: 'error' });
     const body = await response.json();
     if (exited || !response.ok || body.ok !== true || body.name !== 'devspace') throw new Error('Local health verification failed.');
+    const expectedFingerprint = env.DEVSPACE_SOURCE_FINGERPRINT;
+    if (expectedFingerprint) {
+      const runtimeResponse = await fetch(`${localOrigin(config)}/runtimez`, { signal: AbortSignal.timeout(5000), redirect: 'error' });
+      const runtime = await runtimeResponse.json();
+      if (exited || !runtimeResponse.ok || runtime.ok !== true || runtime.name !== 'devspace' || runtime.freshness !== 'verified' ||
+          runtime.buildFingerprint !== expectedFingerprint || runtime.startupSourceFingerprint !== expectedFingerprint) {
+        throw new Error('Local runtime build identity verification failed.');
+      }
+    }
     say(`[5/5] Ready: ${localOrigin(config)}/mcp`);
     say('Keep this terminal open. Ctrl+C stops this service. Remote ChatGPT access needs your own HTTPS endpoint.');
     const result = await completion;
@@ -226,6 +243,28 @@ export async function deploy(options, { root = repository, env = process.env, sa
   if (!supportedNode(process.versions.node, pkg.engines?.node)) throw new Error(`Node ${pkg.engines?.node} is required; see https://nodejs.org/.`);
   if (!/^pnpm@\d+\.\d+\.\d+$/.test(pkg.packageManager)) throw new Error('Expected an exact pnpm version in package.json.');
   const effectiveEnv = { ...env, DEVSPACE_CONFIG_DIR: options.configDir };
+  if (options.candidateOnly) {
+    const lockPath = join(root, '.devspace-deploy.lock');
+    let lock;
+    try { lock = openSync(lockPath, 'wx', 0o600); }
+    catch (error) { throw new Error(`Deployment lock unavailable. Inspect any previous deployment before retrying: ${error.code}`); }
+    const identity = statSync(lockPath);
+    try {
+      writeFileSync(lock, String(process.pid));
+      if (!options.yes && !await confirm()) throw new Error('Preparation cancelled; no candidate was built.');
+      say('[candidate] Installing locked dependencies and preparing an isolated build.');
+      const result = await prepare(root, pkg.packageManager, effectiveEnv, run, checkDependencies, async () => {}, { promote: false });
+      if (!result?.candidate) throw new Error('Candidate preparation did not return an isolated candidate directory.');
+      say(`Candidate ready at ${result.candidate}. dist, configuration and running services were not replaced or started.`);
+      return { status: 'candidate', candidate: result.candidate };
+    } finally {
+      closeSync(lock);
+      if (existsSync(lockPath)) {
+        const current = lstatSync(lockPath);
+        if (current.dev === identity.dev && current.ino === identity.ino) unlinkSync(lockPath);
+      }
+    }
+  }
   const state = configState(options.configDir);
   const fingerprint = sourceFingerprint(root);
   const build = buildState(root, fingerprint, process.versions.node, pkg.packageManager);
@@ -284,7 +323,8 @@ export async function deploy(options, { root = repository, env = process.env, sa
     if (options.noStart) { say('Configuration ready. Run the launcher again to start.'); return { status: 'configured' }; }
     if (await busy(config)) throw new Error('Configured port is occupied. No other process was stopped.');
     say('[4/5] Starting the owned local service and verifying health.');
-    return await start(root, effectiveEnv, config, { say });
+    const launchFingerprint = sourceFingerprint(root);
+    return await start(root, { ...effectiveEnv, DEVSPACE_SOURCE_FINGERPRINT: launchFingerprint }, config, { say });
   } finally {
     closeSync(lock);
     if (existsSync(lockPath)) {
@@ -298,7 +338,7 @@ if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.me
   Promise.resolve().then(() => {
     const options = parseOptions(process.argv.slice(2));
     if (options.help) {
-      console.log('Usage: node scripts/deploy.mjs [--check | --prepare-only | --no-start] [--config-dir PATH] [--rebuild] [--yes]');
+      console.log('Usage: node scripts/deploy.mjs [--check | --candidate-only | --prepare-only | --no-start] [--config-dir PATH] [--rebuild] [--yes]');
       console.log('Default: prepare once, guide local setup, verify and serve in this terminal. --yes only approves dependency preparation.');
       console.log('No system packages, global PATH, startup tasks, tunnels or model permissions are changed. See docs/setup.md.');
       return;

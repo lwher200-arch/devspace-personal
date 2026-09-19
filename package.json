@@ -32,6 +32,7 @@
     "dev": "tsx watch --clear-screen=false src/cli.ts serve",
     "postinstall": "node scripts/fix-node-pty-permissions.mjs",
     "prepack": "pnpm build",
+    "benchmark:project-access": "tsx scripts/project-access-benchmark.ts",
     "schema:config": "tsx scripts/generate-config-schema.ts",
     "start": "node dist/cli.js serve",
     "test": "tsx --test --test-concurrency=1 \"src/**/*.test.ts\"",
@@ -39,7 +40,7 @@
     "test:docs": "node --test scripts/check-documentation.test.mjs && node scripts/check-documentation.mjs",
     "deploy:local": "node scripts/deploy.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "verify": "pnpm typecheck && pnpm test:docs && pnpm test && pnpm test:deploy && pnpm build"
+    "verify": "pnpm typecheck && pnpm test:docs && pnpm build && pnpm test && pnpm test:deploy"
   },
   "keywords": [],
   "author": "",
@@ -79,7 +80,8 @@
     "@vitejs/plugin-react": "^6.0.2",
     "tsx": "^4.22.3",
     "typescript": "^6.0.3",
-    "vite": "^8.0.14"
+    "vite": "^8.0.14",
+    "wrangler": "^4.135.0"
   },
   "overrides": {
     "protobufjs": "7.6.6",

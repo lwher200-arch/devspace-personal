@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { spawn } from "node:child_process";
 import {
   existsSync,
@@ -74,6 +76,35 @@ withConfigDir((configDir, env) => {
 
   const nextLoad = loadDevspaceFiles(env);
   assert.equal(nextLoad.migratedLegacyConfig, false);
+});
+
+// Publish a real migration after the other caller observes the legacy file.
+// This makes the first-start race deterministic without changing filesystem results.
+withConfigDir((configDir, env) => {
+  const legacyPath = join(configDir, "config.json");
+  const legacy = JSON.stringify({ port: 8787 });
+  writeFileSync(legacyPath, legacy);
+  const originalExists = fs.existsSync;
+  let peerPublished = false;
+  fs.existsSync = (path) => {
+    const exists = originalExists(path);
+    if (path === legacyPath && exists && !peerPublished) {
+      peerPublished = true;
+      assert.equal(loadDevspaceFiles(env).migratedLegacyConfig, true);
+    }
+    return exists;
+  };
+  syncBuiltinESMExports();
+  try {
+    const files = loadDevspaceFiles(env);
+    assert.equal(files.migratedLegacyConfig, false);
+    assert.equal(files.config.server.port, 8787);
+    assert.equal(readFileSync(join(configDir, "config.json.v1.0.bak"), "utf8"), legacy);
+    assert.equal(existsSync(legacyPath), false);
+  } finally {
+    fs.existsSync = originalExists;
+    syncBuiltinESMExports();
+  }
 });
 
 await withConfigDirAsync(async (configDir) => {

@@ -5,16 +5,32 @@ import {
   decodeToolResult,
   toolResultFromChatGptGlobals,
 } from "./tool-result.js";
-import { APPROVAL_META_KEY } from '../approval-protocol.js';
+import { APPROVAL_CENTER_META_KEY, APPROVAL_META_KEY } from '../approval-protocol.js';
 
 test('approval UI restores only private metadata, never model-visible capability claims', () => {
   const view = { version: 1, id: 'approval-fixture', state: 'pending', tool: 'exec_command', reason: 'Review fixture',
-    args: { cmd: 'echo fixture' }, context: {}, expiresAt: '2099-01-01T00:00:00Z', automatic: false, decisionToken: 'x'.repeat(43) };
+    args: { cmd: 'echo fixture' }, context: {}, expiresAt: '2099-01-01T00:00:00Z', automatic: false, decisionToken: 'x'.repeat(43),
+    conversationLease: { eligible: true, scope: 'fixture scope' } };
   assert.equal(decodeToolResult({ content: [], structuredContent: { [APPROVAL_META_KEY]: view } }).kind, 'invalid');
   assert.equal(decodeToolResult({ content: [], _meta: { [APPROVAL_META_KEY]: view } }).kind, 'approval');
+  const normalized = decodeToolResult({ content: [], _meta: { [APPROVAL_META_KEY]: view } });
+  assert.equal(normalized.kind, 'approval');
+  if (normalized.kind === 'approval') assert.deepEqual(normalized.approval.conversationLease?.scopes, ['fixture scope']);
   assert.equal(decodeToolResult({ content: [], _meta: { [APPROVAL_META_KEY]: { ...view, decisionToken: undefined } } }).kind, 'invalid');
   const restored = toolResultFromChatGptGlobals({ toolOutput: { result: 'Waiting for user' }, toolResponseMetadata: { [APPROVAL_META_KEY]: view } });
   assert.ok(restored); assert.equal(decodeToolResult(restored).kind, 'approval');
+  assert.equal(decodeToolResult({ content: [], _meta: { [APPROVAL_META_KEY]: { ...view, conversationLease: { eligible: true } } } }).kind, 'invalid');
+  assert.equal(decodeToolResult({ content: [], _meta: { [APPROVAL_META_KEY]: { ...view, conversationLease: { eligible: true, scope: 'fixture', scopes: [] } } } }).kind, 'invalid');
+  assert.equal(decodeToolResult({ content: [], _meta: { [APPROVAL_META_KEY]: { ...view, recyclable: 'yes' } } }).kind, 'invalid');
+});
+
+test('approval center is restored only from private metadata and validates every embedded approval', () => {
+  const view = { version: 1, id: 'center-fixture', state: 'pending', tool: 'exec_command', reason: 'Review fixture',
+    args: { cmd: 'echo fixture' }, context: {}, expiresAt: '2099-01-01T00:00:00Z', automatic: false, decisionToken: 'x'.repeat(43) };
+  const center = { version: 1, approvals: [view], leases: [{ scope: 'fixture lease', expiresAt: '2099-01-01T00:00:00Z' }] };
+  assert.equal(decodeToolResult({ content: [], structuredContent: { [APPROVAL_CENTER_META_KEY]: center } }).kind, 'invalid');
+  assert.equal(decodeToolResult({ content: [], _meta: { [APPROVAL_CENTER_META_KEY]: center } }).kind, 'approval-center');
+  assert.equal(decodeToolResult({ content: [], _meta: { [APPROVAL_CENTER_META_KEY]: { ...center, approvals: [{ ...view, decisionToken: undefined }] } } }).kind, 'invalid');
 });
 
 test("workspace cards can be rebuilt from structured content without result metadata", () => {

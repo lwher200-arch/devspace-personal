@@ -28,7 +28,13 @@ async function fixture(t: TestContext, authorization: 'owner_approval' | 'legacy
     storage: { stateDir: join(root, 'state') }, tools: { authorization },
     skills: { enabled: false, agentDir: join(root, 'agents') }, logging: { level: 'silent' },
   }), DEVSPACE_OAUTH_OWNER_TOKEN: owner });
-  const application = createServer(config, { mcpSessions: { maxSessions: 1 } });
+  const application = createServer(config, {
+    mcpSessions: { maxSessions: 1 },
+    // This fixture exercises MCP session/cancellation lifecycle. Boundary behavior
+    // has dedicated coverage and nesting bwrap inside the outer DevSpace boundary
+    // is not supported on every Linux kernel/runner.
+    executionBoundary: null,
+  });
   const listener = application.app.listen(port, '127.0.0.1');
   await new Promise<void>(r => listener.once('listening', r));
   t.after(async () => { await application.close(); listener.closeAllConnections(); await new Promise<void>(r => listener.close(() => r())); await rm(root, { recursive: true, force: true }); });

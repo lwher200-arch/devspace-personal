@@ -71,6 +71,10 @@ Install locked dependencies and prepare a local build? [y/N]
 执行器、文件工具 API 和 SQLite 原生模块。候选产物先写入私有 `.runtime`
 目录，通过检查后才替换 `dist`，已有 `dist` 会保留为备份。
 
+需要在仍有旧服务运行时先验证新源码，可使用 `--candidate-only`。它执行同样的
+依赖、类型、构建和运行依赖核验，但把通过验证的候选保留在 `.runtime`，不提升
+为 `dist`，也不加载运行配置、检查配置端口或启动第二个服务。
+
 构建没有通过时不会把候选目录当作成功部署。下载与原生模块安装可能耗时，
 以退出码和最后的就绪提示判断结果，不把普通构建警告当作必然失败。
 
@@ -122,7 +126,10 @@ Install locked dependencies and prepare a local build? [y/N]
 # 只读检查：不安装、不初始化、不迁移、不启动
 node scripts/deploy.mjs --check
 
-# 只准备依赖与构建，不碰配置或启动服务
+# 只生成并验证隔离候选；不替换 dist、不加载配置或检查/启动服务
+node scripts/deploy.mjs --candidate-only --yes
+
+# 构建并提升为 dist，但不创建配置或启动服务；共享运行目录需先停止服务
 node scripts/deploy.mjs --prepare-only --yes
 
 # 完成构建与交互配置后退出
@@ -138,7 +145,8 @@ node scripts/deploy.mjs --help
 ```
 
 `--yes` 只同意依赖准备，不能代替项目访问授权。首次配置需要交互终端；
-自动化准备可用 `--prepare-only --yes`。配置目录可使用环境变量
+自动化的非提升验证可用 `--candidate-only --yes`，确认候选后再在维护窗口使用
+`--prepare-only --rebuild --yes` 提升到 `dist`。配置目录可使用环境变量
 `DEVSPACE_CONFIG_DIR`，命令参数优先。自定义配置目录应位于仓库外，或明确
 被忽略的 `.runtime` 内。
 
@@ -164,9 +172,10 @@ node scripts/deploy.mjs --help
   源码目录同时热更新多个运行服务。
 
 如果从新的源码目录复用旧配置，而新目录还没有可检查配置的构建，部署器会
-先停止。可在这个独立新目录中，用一个未使用的私有配置目录执行
-`--prepare-only --yes --config-dir <unused-directory>`，只准备构建，不创建配置；
-然后再用原配置目录运行。不要在仍被服务使用的源码目录上这样绕过升级检查。
+先停止。可先在新目录执行 `--candidate-only --yes` 验证候选而不碰 `dist`；确认后，
+停止旧服务，再用一个未使用的私有配置目录执行
+`--prepare-only --rebuild --yes --config-dir <unused-directory>` 提升构建但不创建配置，
+然后再用原配置目录运行。不要在仍被服务使用的源码目录上绕过升级检查。
 
 ## 接入 ChatGPT 网页
 

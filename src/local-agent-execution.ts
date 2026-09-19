@@ -5,6 +5,8 @@ import { createInterface } from "node:readline";
 import { gte, valid } from "semver";
 import * as z from "zod/v4";
 import { assertAllowedPath, canonicalAllowedPath } from "./roots.js";
+import { canonicalizeIntent } from "./control-plane/intent.js";
+import { selectChimeraRoute } from "./control-plane/chimera.js";
 
 export const executionPolicySchema = z.object({
   requiredModel: z.string().min(1).max(128).regex(/^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/),
@@ -44,9 +46,10 @@ export function selectExecutionModel(policy: CodexExecutionPolicy, requested: st
     return { model: requested, reason: 'explicit' };
   }
   if (!policy.routing) throw new Error(`Supply explicit model ${policy.requiredModel}; inherited models are not allowed.`);
-  // This is a deterministic dispatch hint, never an authority or failure-retry decision.
-  const complex = prompt.length > 4000 || /architect|refactor|security|concurren|migrat|root cause|架构|重构|安全|并发|迁移|根因/i.test(prompt);
-  return { model: complex ? policy.routing.complexModel : policy.routing.routineModel, reason: complex ? 'complex-task' : 'routine-task' };
+  // Chimera routing consumes a canonical intent signal but remains a dispatch
+  // hint only; allowlists, sandbox/write authority and retry policy stay outside it.
+  const routed = selectChimeraRoute(canonicalizeIntent(prompt), policy.routing);
+  return { model: routed.model, reason: routed.reason };
 }
 
 export function sameExecutionPolicy(left: CodexExecutionPolicy, right: CodexExecutionPolicy): boolean {

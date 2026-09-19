@@ -1,8 +1,9 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { ReviewFileType, ToolResultCard } from "./card-types.js";
-import { APPROVAL_META_KEY, type ApprovalView, type ApprovalState } from '../approval-protocol.js';
+import { APPROVAL_CENTER_META_KEY, APPROVAL_META_KEY, type ApprovalCenterView, type ApprovalView, type ApprovalState } from '../approval-protocol.js';
 
 export type DecodedToolResult =
+  | { kind: 'approval-center'; center: ApprovalCenterView }
   | { kind: 'approval'; approval: ApprovalView }
   | { kind: "card"; card: ToolResultCard }
   | { kind: "review-reference"; workspaceId: string; reviewRef: string }
@@ -15,6 +16,8 @@ export interface ChatGptToolGlobals {
 }
 
 export function decodeToolResult(result: CallToolResult): DecodedToolResult {
+  const center = approvalCenterFields(asRecord(asRecord(result._meta)?.[APPROVAL_CENTER_META_KEY]));
+  if (center) return { kind: 'approval-center', center };
   const approval = approvalFields(asRecord(asRecord(result._meta)?.[APPROVAL_META_KEY]));
   if (approval) return { kind: 'approval', approval };
   const structured = asRecord(result.structuredContent);
@@ -117,7 +120,16 @@ function directResultMeta(
   metadata: Record<string, unknown> | undefined,
 ): Record<string, unknown> | undefined {
   if (!metadata) return undefined;
-  return "card" in metadata || APPROVAL_META_KEY in metadata ? metadata : undefined;
+  return "card" in metadata || APPROVAL_META_KEY in metadata || APPROVAL_CENTER_META_KEY in metadata ? metadata : undefined;
+}
+
+function approvalCenterFields(value: Record<string, unknown> | undefined): ApprovalCenterView | undefined {
+  if (!value || value.version !== 1 || !Array.isArray(value.approvals) || !Array.isArray(value.leases)) return undefined;
+  const approvals = value.approvals.map(item => approvalFields(asRecord(item)));
+  if (approvals.some(item => !item)) return undefined;
+  const leases = value.leases.map(item => asRecord(item));
+  if (leases.some(item => !item || typeof item.scope !== 'string' || !item.scope || typeof item.expiresAt !== 'string' || !Number.isFinite(Date.parse(item.expiresAt)))) return undefined;
+  return { version: 1, approvals: approvals as ApprovalView[], leases: leases.map(item => ({ scope: item!.scope as string, expiresAt: item!.expiresAt as string })) };
 }
 
 function approvalFields(value: Record<string, unknown> | undefined): ApprovalView | undefined {
@@ -125,11 +137,23 @@ function approvalFields(value: Record<string, unknown> | undefined): ApprovalVie
   if (!value || value.version !== 1 || typeof value.id !== 'string' || typeof value.tool !== 'string' ||
       typeof value.reason !== 'string' || typeof value.expiresAt !== 'string' || !Number.isFinite(Date.parse(value.expiresAt)) ||
       !states.includes(value.state as ApprovalState) || !asRecord(value.args) || typeof value.automatic !== 'boolean' ||
+      (value.recyclable !== undefined && typeof value.recyclable !== 'boolean') ||
       value.state === 'pending' && (typeof value.decisionToken !== 'string' || value.decisionToken.length < 32)) return undefined;
   const submission = asRecord(value.submission);
+  const conversationLease = asRecord(value.conversationLease);
   if (value.state === 'submitted' && !submission) return undefined;
   if (submission && (typeof submission.agentId !== 'string' || !submission.agentId || typeof submission.workspaceId !== 'string' || !submission.workspaceId)) return undefined;
-  return value as unknown as ApprovalView;
+  if (conversationLease && (conversationLease.eligible !== true || typeof conversationLease.scope !== 'string' || !conversationLease.scope ||
+      conversationLease.expiresAt !== undefined && (typeof conversationLease.expiresAt !== 'string' || !Number.isFinite(Date.parse(conversationLease.expiresAt))))) return undefined;
+  const scopes = conversationLease?.scopes;
+  if (scopes !== undefined && (!Array.isArray(scopes) || scopes.length === 0 || scopes.some(scope => typeof scope !== 'string' || !scope))) return undefined;
+  return {
+    ...value,
+    ...(conversationLease ? { conversationLease: {
+      ...conversationLease,
+      scopes: Array.isArray(scopes) ? scopes as string[] : [conversationLease.scope as string],
+    } } : {}),
+  } as unknown as ApprovalView;
 }
 
 function mcpToolResult(value: unknown): CallToolResult | undefined {

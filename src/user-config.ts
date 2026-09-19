@@ -88,9 +88,18 @@ export function loadDevspaceFiles(env: NodeJS.ProcessEnv = process.env): Devspac
   const configPath = devspaceConfigPath(env);
   const legacyConfigPath = devspaceLegacyConfigPath(env);
   const authPath = devspaceAuthPath(env);
-  const migratedLegacyConfig = !existsSync(configPath) && existsSync(legacyConfigPath)
-    ? migrateLegacyConfigFile(legacyConfigPath, configPath, devspaceLegacyConfigBackupPath(env))
-    : false;
+  let migratedLegacyConfig = false;
+  if (!existsSync(configPath) && existsSync(legacyConfigPath)) {
+    try {
+      migratedLegacyConfig = migrateLegacyConfigFile(legacyConfigPath, configPath, devspaceLegacyConfigBackupPath(env));
+    } catch (error) {
+      // Another first-start process can publish config.jsonc and move the legacy
+      // file after our existence checks. Accept only its complete, valid config;
+      // a backup collision without a published config must still fail.
+      if (!existsSync(configPath)) throw error;
+      readJsoncConfig(configPath);
+    }
+  }
   const configExists = existsSync(configPath);
   const authExists = existsSync(authPath);
 

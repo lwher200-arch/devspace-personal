@@ -33,9 +33,10 @@
 pnpm verify
 ```
 
-它依次执行类型检查、文档契约、源码测试、部署/打包契约和构建。需要定位失败时，
+它依次执行类型检查、文档契约、构建、源码测试和部署/打包契约。需要定位失败时，
 再单独运行 `pnpm typecheck`、`pnpm test:docs`、`pnpm test`、`pnpm test:deploy`
-或 `pnpm build`，不要用局部通过替代完整候选验证。
+或 `pnpm build`，不要用局部通过替代完整候选验证。源码测试会读取构建后的 MCP 页面资源，
+首次检出或界面变更后应先构建。
 
 浏览器授权回归仍需显式提供 `DEVSPACE_TEST_BROWSER`；GitHub CI 会在 Windows runner
 上独立执行源码与构建后的审批 UI 回归。仓库声明支持 Node `>=22.19 <27`，CI 除三平台
